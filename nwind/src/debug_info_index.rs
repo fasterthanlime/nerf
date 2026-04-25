@@ -158,7 +158,18 @@ impl DebugInfoIndex {
         debuglink: Option<&[u8]>,
         build_id: &[u8],
     ) -> Option<Arc<BinaryData>> {
-        if !self.auto_load || !path.starts_with("/") {
+        trace!(
+            "try_auto_load(path={:?}, build_id={:?}): auto_load={}",
+            path,
+            HexString(build_id),
+            self.auto_load
+        );
+        if !self.auto_load {
+            trace!("try_auto_load({:?}): skipped — auto_load disabled", path);
+            return None;
+        }
+        if !path.starts_with("/") {
+            trace!("try_auto_load({:?}): skipped — path is not absolute", path);
             return None;
         }
 
@@ -169,16 +180,39 @@ impl DebugInfoIndex {
         // separate debug file is found.
         let mut result: Option<Arc<BinaryData>> = None;
         if original_path.exists() {
-            if let Ok(binary) = BinaryData::load_from_fs(original_path) {
-                if binary.build_id().map_or(false, |id| id == build_id) {
-                    let binary = Arc::new(binary);
-                    self.by_build_id
-                        .entry(build_id.to_vec())
-                        .or_default()
-                        .push(binary.clone());
-                    result = Some(binary);
+            match BinaryData::load_from_fs(original_path) {
+                Ok(binary) => {
+                    let actual = binary.build_id();
+                    if actual.map_or(false, |id| id == build_id) {
+                        trace!(
+                            "try_auto_load({:?}): loaded original binary, build_id matches",
+                            path
+                        );
+                        let binary = Arc::new(binary);
+                        self.by_build_id
+                            .entry(build_id.to_vec())
+                            .or_default()
+                            .push(binary.clone());
+                        result = Some(binary);
+                    } else {
+                        trace!(
+                            "try_auto_load({:?}): build_id mismatch — got {:?}, expected {:?}",
+                            path,
+                            actual.map(HexString),
+                            HexString(build_id)
+                        );
+                    }
+                }
+                Err(error) => {
+                    trace!(
+                        "try_auto_load({:?}): BinaryData::load_from_fs failed: {}",
+                        path,
+                        error
+                    );
                 }
             }
+        } else {
+            trace!("try_auto_load({:?}): original path does not exist", path);
         }
 
         // Try the standard .build-id/ debug-file path used by Debian /
@@ -186,18 +220,40 @@ impl DebugInfoIndex {
         //   /usr/lib/debug/.build-id/<2-char-prefix>/<rest>.debug
         let debug_path = Self::build_id_debug_path(build_id);
         if debug_path.exists() && debug_path != original_path {
-            if let Ok(debug_binary) = BinaryData::load_from_fs(&debug_path) {
-                if debug_binary.build_id().map_or(false, |id| id == build_id) {
-                    let debug_binary = Arc::new(debug_binary);
-                    debug!("Loaded debug symbols from .build-id path: {:?}", debug_path);
-                    self.by_build_id
-                        .entry(build_id.to_vec())
-                        .or_default()
-                        .push(debug_binary.clone());
-                    // Prefer the debug file (it has DWARF sections)
-                    result = Some(debug_binary);
+            match BinaryData::load_from_fs(&debug_path) {
+                Ok(debug_binary) => {
+                    if debug_binary.build_id().map_or(false, |id| id == build_id) {
+                        let debug_binary = Arc::new(debug_binary);
+                        debug!("Loaded debug symbols from .build-id path: {:?}", debug_path);
+                        self.by_build_id
+                            .entry(build_id.to_vec())
+                            .or_default()
+                            .push(debug_binary.clone());
+                        // Prefer the debug file (it has DWARF sections)
+                        result = Some(debug_binary);
+                    } else {
+                        trace!(
+                            "try_auto_load({:?}): {:?} build_id mismatch",
+                            path,
+                            debug_path
+                        );
+                    }
+                }
+                Err(error) => {
+                    trace!(
+                        "try_auto_load({:?}): failed to load {:?}: {}",
+                        path,
+                        debug_path,
+                        error
+                    );
                 }
             }
+        } else {
+            trace!(
+                "try_auto_load({:?}): {:?} does not exist on disk",
+                path,
+                debug_path
+            );
         }
 
         // Also try the debuglink path under /usr/lib/debug if we have one.
@@ -208,24 +264,51 @@ impl DebugInfoIndex {
                     && debuglink_path != original_path
                     && debuglink_path != debug_path
                 {
-                    if let Ok(debug_binary) = BinaryData::load_from_fs(&debuglink_path) {
-                        if debug_binary.build_id().map_or(false, |id| id == build_id) {
-                            let debug_binary = Arc::new(debug_binary);
-                            debug!(
-                                "Loaded debug symbols from debuglink path: {:?}",
-                                debuglink_path
+                    match BinaryData::load_from_fs(&debuglink_path) {
+                        Ok(debug_binary) => {
+                            if debug_binary.build_id().map_or(false, |id| id == build_id) {
+                                let debug_binary = Arc::new(debug_binary);
+                                debug!(
+                                    "Loaded debug symbols from debuglink path: {:?}",
+                                    debuglink_path
+                                );
+                                self.by_build_id
+                                    .entry(build_id.to_vec())
+                                    .or_default()
+                                    .push(debug_binary.clone());
+                                result = Some(debug_binary);
+                            } else {
+                                trace!(
+                                    "try_auto_load({:?}): {:?} build_id mismatch",
+                                    path,
+                                    debuglink_path
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            trace!(
+                                "try_auto_load({:?}): failed to load {:?}: {}",
+                                path,
+                                debuglink_path,
+                                error
                             );
-                            self.by_build_id
-                                .entry(build_id.to_vec())
-                                .or_default()
-                                .push(debug_binary.clone());
-                            result = Some(debug_binary);
                         }
                     }
                 }
+            } else {
+                trace!(
+                    "try_auto_load({:?}): debuglink is not valid UTF-8: {:?}",
+                    path,
+                    debuglink
+                );
             }
         }
 
+        trace!(
+            "try_auto_load({:?}): result = {}",
+            path,
+            if result.is_some() { "loaded" } else { "no debug info found" }
+        );
         result
     }
 

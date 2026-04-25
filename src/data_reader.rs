@@ -97,12 +97,14 @@ impl Process {
         }
 
         self.address_space_needs_reload = false;
-        let regions = self.memory_regions.values().cloned().collect();
+        let regions: Vec< _ > = self.memory_regions.values().cloned().collect();
+        trace!( "Reloading address space for PID {}: {} regions", self.pid, regions.len() );
         let base_address_for_binary = &mut self.base_address_for_binary;
 
         self.address_space.reload( regions, &mut |region, handle| {
             let binary_id = region.into();
             if let Some( binary ) = binary_by_id.get_mut( &binary_id ) {
+                trace!( "address_space.reload cb: region {:?} bound to binary '{}'", region.name, binary.path );
                 if let Some( ref data ) = binary.data {
                     handle.set_binary( data.clone() );
                 } else {
@@ -137,6 +139,8 @@ impl Process {
                 if let Some( ref data ) = binary.debug_data {
                     handle.set_debug_binary( data.clone() );
                 }
+            } else {
+                trace!( "address_space.reload cb: region {:?} has no binary entry in binary_by_id", region.name );
             }
 
             handle.should_use_eh_frame_hdr( fde_hints.use_eh_frame_hdr );
@@ -182,6 +186,12 @@ impl Binary {
         if let Some( debug_data ) = debug_info_index.get( &self.path, self.debuglink(), self.build_id() ) {
             debug!( "Found debug symbols for '{}': '{}'", self.path, debug_data.name() );
             self.debug_data = Some( debug_data.clone() );
+        } else {
+            trace!( "load_debug_info: no debug data for '{}' (build_id={:?}, debuglink={:?})",
+                self.path,
+                self.build_id().map( nwind::utils::HexString ),
+                self.debuglink().map( |d| String::from_utf8_lossy( d ).into_owned() )
+            );
         }
     }
 }
@@ -602,8 +612,29 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
         true
     };
 
+    // Tally packet kinds so we can answer "did the recorder ship samples /
+    // build-ids / binaries?" without re-running with a finer log level.
+    // Logged once at end-of-stream as `debug!`; cheap, useful for sanity
+    // checks ("0 samples" usually means the recorder attached to the wrong
+    // PID).
+    let mut packet_kinds: HashMap< &'static str, usize > = HashMap::new();
+
     while let Some( packet ) = reader.next() {
         let packet = packet.unwrap();
+        let kind = match &packet {
+            Packet::MachineInfo { .. } => "MachineInfo",
+            Packet::ProcessInfo { .. } => "ProcessInfo",
+            Packet::BinaryInfo { .. } => "BinaryInfo",
+            Packet::BuildId { .. } => "BuildId",
+            Packet::MemoryRegionMap { .. } => "MemoryRegionMap",
+            Packet::MemoryRegionUnmap { .. } => "MemoryRegionUnmap",
+            Packet::StringTable { .. } => "StringTable",
+            Packet::SymbolTable { .. } => "SymbolTable",
+            Packet::Sample { .. } => "Sample",
+            Packet::RawSample { .. } => "RawSample",
+            _ => "other"
+        };
+        *packet_kinds.entry( kind ).or_insert( 0 ) += 1;
         match packet {
             Packet::MachineInfo { architecture, bitness, endianness, cpu_count, .. } => {
                 machine_architecture = architecture.into_owned();
@@ -676,11 +707,6 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
                 };
 
                 debug!( "New binary: {:?}", binary.path );
-                if let Some( ref debuglink ) = binary.debuglink {
-                    if debug_info_index.get( &binary.path, binary.debuglink(), binary.build_id() ).is_none() {
-                        warn!( "Missing external debug symbols for '{}': '{}'", binary.path, String::from_utf8_lossy( debuglink ) );
-                    }
-                }
 
                 state.binary_by_id.insert( binary_id, binary );
             },
@@ -955,6 +981,10 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
     }
 
     state.unfiltered_first_timestamp = first_timestamp;
+    let mut kinds: Vec< _ > = packet_kinds.iter().collect();
+    kinds.sort_by( |a, b| b.1.cmp( a.1 ) );
+    debug!( "Packet kinds consumed: {:?}", kinds );
+
     Ok( state )
 }
 
