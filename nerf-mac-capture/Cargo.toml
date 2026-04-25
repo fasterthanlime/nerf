@@ -1,0 +1,20 @@
+[package]
+name = "nerf-mac-capture"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "macOS sampling backend for nerf, vendored from samply."
+
+# Vendored from https://github.com/mstange/samply at commit
+# 1920bd32c569de5650d1129eb035f43bd28ace27 (samply/src/mac/*).
+# See LICENSE-MIT / LICENSE-APACHE for the original copyright.
+
+[dependencies]
+log = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+libc = "0.2"
+framehop = "0.16"
+lazy_static = "1.5"
+crossbeam-channel = "0.5"

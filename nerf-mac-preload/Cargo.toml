@@ -1,0 +1,30 @@
+[package]
+name = "nerf-mac-preload"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "DYLD_INSERT_LIBRARIES dylib that bootstraps a Mach IPC channel back to nerf-mac-capture."
+
+# Vendored from https://github.com/mstange/samply/tree/main/samply-mac-preload
+# at commit 1920bd32c569de5650d1129eb035f43bd28ace27. The bootstrap-server
+# environment variable was renamed SAMPLY_BOOTSTRAP_SERVER_NAME ->
+# NERF_BOOTSTRAP_SERVER_NAME so this dylib doesn't collide with samply.
+# See LICENSE-MIT / LICENSE-APACHE for the original copyright.
+
+[workspace]
+# Standalone workspace: this crate needs no_std + panic = "abort" settings
+# that cannot be expressed for a workspace member.
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+lto = true
+panic = 'abort'
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+spin = "0.9.8"
