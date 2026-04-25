@@ -1762,6 +1762,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nerf-mac-kperf"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "nerf-mac-capture",
+ "thiserror",
+]
+
+[[package]]
 name = "nperf"
 version = "0.1.1"
 dependencies = [
@@ -1786,6 +1796,7 @@ dependencies = [
  "log",
  "memmap2",
  "nerf-mac-capture",
+ "nerf-mac-kperf",
  "num_cpus",
  "nwind",
  "object 0.32.2",

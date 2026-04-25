@@ -1,0 +1,19 @@
+[package]
+name = "nerf-mac-kperf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "macOS sampling backend for nerf using kperf/kdebug + PET."
+
+# References:
+# - mperf (https://github.com/tmcgilchrist/mperf, MIT) for the PET driver.
+# - ibireme's kpc_demo.c (public domain).
+# - Apple's kperf/kperfdata private frameworks (loaded at runtime via dlopen).
+
+[dependencies]
+log = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nerf-mac-capture = { version = "0.1", path = "../nerf-mac-capture" }
+libc = "0.2"
+thiserror = "2"
