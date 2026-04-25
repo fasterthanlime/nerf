@@ -22,7 +22,19 @@ use crate::arch::{Architecture, Registers, Endianity};
 use crate::dwarf_regs::DwarfRegs;
 use crate::range_map::RangeMap;
 use crate::unwind_context::UnwindContext;
-use crate::binary::{BinaryData, LoadHeader, BinaryDataReader};
+use crate::binary::{BinaryData, LoadHeader};
+#[cfg(not(feature = "addr2line"))]
+use crate::binary::BinaryDataReader;
+
+/// Reader type used by the addr2line context. Distinct from the unwind
+/// path's `BinaryDataReader` because compressed-debug-section bytes live
+/// in heap-allocated `Vec`s after `object` decompresses them, not in the
+/// mmapped binary. `Arc<[u8]>` gives us a reader that's `'static` and
+/// `Send + Sync` for both compressed and uncompressed cases.
+#[cfg(feature = "addr2line")]
+type AddrCtxReader = gimli::EndianReader< gimli::RunTimeEndian, Arc< [u8] > >;
+#[cfg(not(feature = "addr2line"))]
+type AddrCtxReader = BinaryDataReader;
 use crate::symbols::Symbols;
 use crate::frame_descriptions::{DynamicFdeRegistry, FrameDescriptions, ContextCache, UnwindInfo, AddressMapping, LoadHint};
 use crate::types::{Inode, UserFrame, Endianness, BinaryId};
@@ -168,7 +180,7 @@ pub struct Binary< A: Architecture > {
     debug_data: Option< Arc< BinaryData > >,
     symbols: Vec< Symbols >,
     frame_descriptions: Option< FrameDescriptions< A::Endianity > >,
-    context: Option< Mutex< addr2line::Context< BinaryDataReader > > >,
+    context: Option< Mutex< addr2line::Context< AddrCtxReader > > >,
     symbol_decode_cache: Option< Mutex< SymbolDecodeCache > >
 }
 
@@ -179,6 +191,43 @@ fn test_binary_is_sync() {
 }
 
 pub type BinaryHandle< A > = Arc< Binary< A > >;
+
+/// Parse `binary_data` with the `object` crate, fetch each DWARF section
+/// (decompressing SHF_COMPRESSED bytes on the fly), and hand the
+/// assembled `gimli::Dwarf` to `addr2line`. Returns the constructed
+/// context, or an error string describing where it gave up.
+#[cfg(feature = "addr2line")]
+fn build_addr2line_context( binary_data: &Arc< BinaryData > ) -> Result< addr2line::Context< AddrCtxReader >, String > {
+    use object::{Object, ObjectSection};
+
+    let bytes = binary_data.as_bytes();
+    let object = object::File::parse( bytes )
+        .map_err( |err| format!( "object parse failed: {}", err ) )?;
+
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+
+    let load_section = |id: gimli::SectionId| -> Result< AddrCtxReader, String > {
+        let section_bytes: Arc< [u8] > = match object.section_by_name( id.name() ) {
+            Some( section ) => section
+                .uncompressed_data()
+                .map_err( |err| format!( "decompress {}: {}", id.name(), err ) )?
+                .into_owned()
+                .into(),
+            None => Arc::from( &[][..] )
+        };
+        Ok( gimli::EndianReader::new( section_bytes, endian ) )
+    };
+
+    let dwarf = gimli::Dwarf::load( load_section )
+        .map_err( |err| format!( "Dwarf::load: {}", err ) )?;
+
+    addr2line::Context::from_dwarf( dwarf )
+        .map_err( |err| format!( "Context::from_dwarf: {:?}", err ) )
+}
 
 pub fn lookup_binary< 'a, A: Architecture, M: MemoryReader< A > >( nth_frame: usize, memory: &'a M, regs: &A::Regs ) -> Option< &'a Binary< A > > {
     let address: u64 = regs.get( A::INSTRUCTION_POINTER_REG ).unwrap().into();
@@ -1031,7 +1080,7 @@ pub fn reload< A: Architecture >(
         load_debug_frame: bool,
         load_frame_descriptions: bool,
         is_old: bool,
-        context: Option< Mutex< addr2line::Context< BinaryDataReader > > >
+        context: Option< Mutex< addr2line::Context< AddrCtxReader > > >
     }
 
     let mut reloaded = Reloaded::default();
@@ -1233,39 +1282,18 @@ pub fn reload< A: Architecture >(
                 } else if context.is_none() {
                     debug!( "Creating addr2line context for '{}' from '{}'...", data.name, binary_data.name() );
 
-                    // Build the gimli::Dwarf struct directly so we can wire
-                    // up .debug_loclists / .debug_loc — addr2line's
-                    // from_sections shortcut leaves locations empty, which
-                    // makes DWARF 5 binaries (e.g. modern glibc dbgsym) fail
-                    // to parse with UnexpectedEof.
-                    let empty = BinaryData::get_empty_section( &binary_data );
-                    let dwarf = gimli::Dwarf {
-                        debug_abbrev:      BinaryData::get_section_or_empty( &binary_data ),
-                        debug_addr:        BinaryData::get_section_or_empty( &binary_data ),
-                        debug_aranges:     BinaryData::get_section_or_empty( &binary_data ),
-                        debug_info:        BinaryData::get_section_or_empty( &binary_data ),
-                        debug_line:        BinaryData::get_section_or_empty( &binary_data ),
-                        debug_line_str:    BinaryData::get_section_or_empty( &binary_data ),
-                        debug_str:         BinaryData::get_section_or_empty( &binary_data ),
-                        debug_str_offsets: BinaryData::get_section_or_empty( &binary_data ),
-                        debug_types:       empty.clone().into(),
-                        locations: gimli::LocationLists::new(
-                            BinaryData::get_section_or_empty( &binary_data ),
-                            BinaryData::get_section_or_empty( &binary_data ),
-                        ),
-                        ranges: gimli::RangeLists::new(
-                            BinaryData::get_section_or_empty( &binary_data ),
-                            BinaryData::get_section_or_empty( &binary_data ),
-                        ),
-                        file_type: gimli::DwarfFileType::Main,
-                        sup: None,
-                        abbreviations_cache: gimli::AbbreviationsCache::new(),
-                    };
-
-                    match addr2line::Context::from_dwarf( dwarf ) {
+                    // Use `object` to find sections and decompress them on
+                    // demand — this transparently handles SHF_COMPRESSED
+                    // (zlib/zstd) sections that ship in glibc dbgsym files
+                    // and the like. Uncompressed sections come back as a
+                    // borrowed slice into the mmap; compressed ones come
+                    // back as freshly-allocated owned bytes. Both end up
+                    // as `Arc<[u8]>` in the gimli reader so the context
+                    // doesn't depend on the mmap staying mapped.
+                    match build_addr2line_context( &binary_data ) {
                         Ok( ctx ) => context = Some( Mutex::new( ctx ) ),
                         Err( error ) => {
-                            warn!( "Failed to create addr2line context: {:?}", error );
+                            warn!( "Failed to create addr2line context: {}", error );
                         }
                     }
                 }

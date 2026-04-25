@@ -16,6 +16,7 @@ lru = "0.12"
 cpp_demangle = "0.4"
 rustc-demangle = { version = "0.1", optional = true }
 addr2line = { version = "0.21", optional = true, default-features = false, features = ["std"] }
+object = { version = "0.32", optional = true, default-features = false, features = ["std", "read_core", "elf", "compression"] }
 proc-maps = { version = "0.1", path = "../proc-maps" }
 libc = "0.2"
 thread-local-reentrant = { version = "0.1", path = "../thread-local-reentrant", optional = true }
@@ -30,3 +31,6 @@ env_logger = "0.11"
 default = ["log", "addr2line", "rustc-demangle"]
 local-unwinding = ["cc", "thread-local-reentrant"]
 debug-logs = ["log"]
+addr2line = ["dep:addr2line", "dep:object"]
+rustc-demangle = ["dep:rustc-demangle"]
+log = ["dep:log"]
