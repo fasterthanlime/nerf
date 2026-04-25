@@ -27,8 +27,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::Write as FmtWrite;
+use std::fs;
 use std::io::{self, Write};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use nwind::{BinaryData, BinaryId};
@@ -68,6 +70,17 @@ enum FuncRecord {
     }
 }
 
+/// Per-binary runtime context used to resolve relative→absolute addresses
+/// after the read pass. We hold onto one (pid, load_offset) per binary so
+/// `IAddressSpace::decode_symbol_while` (which needs an absolute address)
+/// can be called from the rendering phase. The pid is whichever process
+/// first sampled inside that binary.
+#[derive(Copy, Clone)]
+struct BinaryAnchor {
+    pid: u32,
+    load_offset: u64
+}
+
 impl FuncRecord {
     fn total( &self ) -> u64 {
         match self {
@@ -98,6 +111,35 @@ impl CodeCache {
             self.by_binary.insert( binary_id.clone(), code );
         }
         self.by_binary.get( binary_id ).and_then( |opt| opt.as_ref() )
+    }
+}
+
+/// On-demand cache of source-file contents, keyed by the path that DWARF
+/// reports. A `None` value means we already tried and the file isn't there
+/// (or isn't readable as UTF-8); we don't retry per address.
+struct SourceCache {
+    by_path: HashMap< PathBuf, Option< Vec< String > > >
+}
+
+impl SourceCache {
+    fn new() -> Self {
+        SourceCache { by_path: HashMap::new() }
+    }
+
+    fn line( &mut self, path: &str, line: u64 ) -> Option< &str > {
+        let key = PathBuf::from( path );
+        let entry = self.by_path.entry( key.clone() ).or_insert_with( || {
+            match fs::read_to_string( &key ) {
+                Ok( contents ) => Some( contents.lines().map( str::to_owned ).collect() ),
+                Err( err ) => {
+                    debug!( "annotate: could not read source '{}': {}", path, err );
+                    None
+                }
+            }
+        });
+        let lines = entry.as_ref()?;
+        let idx = (line as usize).checked_sub( 1 )?;
+        lines.get( idx ).map( |s| s.as_str() )
     }
 }
 
@@ -154,30 +196,69 @@ fn fetch_code_bytes< 'a >( data: &'a BinaryData, range: &Range< RelativeAddr > )
     None
 }
 
-fn disassemble_amd64< W: Write >(
+/// Resolved (file, line) for a single instruction, plus whether it came
+/// from an inline frame. We only care about the bottom (innermost) frame
+/// for header purposes — that's the source the user wrote that the
+/// instruction was generated from.
+#[derive(Clone, PartialEq, Eq)]
+struct LineInfo {
+    file: String,
+    line: u64
+}
+
+/// Disassemble a function's bytes and write per-instruction lines, marking
+/// hot ones and (when `resolve_line` is provided) emitting a source-line
+/// header whenever the resolved (file, line) changes.
+fn disassemble_amd64< W: Write, F >(
     decoder: &InstDecoder,
     bytes: &[u8],
     base: u64,
     counts: &BTreeMap< u64, u64 >,
+    resolve_line: Option< F >,
+    source_cache: Option< &mut SourceCache >,
     out: &mut W
-) -> io::Result< () > {
+) -> io::Result< () >
+    where F: FnMut( u64 ) -> Option< LineInfo >
+{
     let mut offset: usize = 0;
+    let mut last_line: Option< LineInfo > = None;
+    let mut resolve_line = resolve_line;
+    let mut source_cache = source_cache;
+
     while offset < bytes.len() {
         let addr = base + offset as u64;
+        let count = counts.get( &addr ).copied().unwrap_or( 0 );
+        let mark = if count > 0 { ">" } else { " " };
+
+        if let Some( resolver ) = resolve_line.as_mut() {
+            let info = resolver( addr );
+            if info != last_line {
+                if let Some( ref info ) = info {
+                    let snippet = source_cache
+                        .as_deref_mut()
+                        .and_then( |cache| cache.line( &info.file, info.line ) )
+                        .map( |s| s.trim().to_owned() )
+                        .unwrap_or_default();
+                    let basename = std::path::Path::new( &info.file )
+                        .file_name()
+                        .and_then( |n| n.to_str() )
+                        .unwrap_or( info.file.as_str() );
+                    writeln!( out, "  ; {}:{}  {}", basename, info.line, snippet )?;
+                }
+                last_line = info;
+            }
+        }
+
         match decoder.decode_slice( &bytes[ offset.. ] ) {
             Ok( instr ) => {
                 let len = instr.len().to_const() as usize;
                 let end = (offset + len).min( bytes.len() );
-                let count = counts.get( &addr ).copied().unwrap_or( 0 );
-                let mark = if count > 0 { ">" } else { " " };
                 let hex = format_hex_bytes( &bytes[ offset..end ] );
                 writeln!( out, " {} {:>8}  0x{:012x}  {:<30}  {}",
                           mark, count, addr, hex, instr )?;
                 offset = end;
             }
             Err( err ) => {
-                let count = counts.get( &addr ).copied().unwrap_or( 0 );
-                let mark = if count > 0 { ">" } else { " " };
                 writeln!( out, " {} {:>8}  0x{:012x}  {:<30}  <decode error: {}>",
                           mark, count, addr, format!( "{:02x}", bytes[ offset ] ), err )?;
                 offset += 1;
@@ -208,6 +289,9 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
     let (_, read_data_args) = repack_cli_args( &args.collation_args );
 
     let mut funcs: HashMap< FuncKey, FuncRecord > = HashMap::new();
+    // First (pid, load_offset) we observe per binary — used at render time
+    // to drive line-info lookups through the process's address_space.
+    let mut anchors: HashMap< BinaryId, BinaryAnchor > = HashMap::new();
 
     let state = read_data( read_data_args, |event| {
         let sample = match event.kind {
@@ -241,6 +325,13 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
                 start: RelativeAddr( symbol.relative_range.start ),
                 end:   RelativeAddr( symbol.relative_range.end )
             };
+
+            // Anchor this binary to a (pid, load_offset) on first sight —
+            // load_offset is `leaf.absolute - symbol.relative_address`.
+            anchors.entry( binary_id.clone() ).or_insert( BinaryAnchor {
+                pid: sample.process.pid(),
+                load_offset: leaf_va.raw().wrapping_sub( symbol.relative_address )
+            });
 
             let key: FuncKey = (FuncSourceTag::Native( binary_id ), name);
             let entry = funcs.entry( key ).or_insert_with( || FuncRecord::Native {
@@ -309,6 +400,7 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
     let mut out = stdout.lock();
     let decoder = InstDecoder::default();
     let mut code_cache = CodeCache::new();
+    let mut source_cache = SourceCache::new();
 
     for ((tag, name), record) in chosen {
         match (tag, record) {
@@ -328,7 +420,40 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
                           name, label, range.start.raw(), range.end.raw(), total )?;
                 writeln!( out, "      count   address       bytes                           asm" )?;
                 let counts_u64: BTreeMap< u64, u64 > = counts.into_iter().map( |(k, v)| (k.raw(), v) ).collect();
-                disassemble_amd64( &decoder, bytes, range.start.raw(), &counts_u64, &mut out )?;
+
+                // For --source: build a closure that maps a relative address to (file,
+                // line) by translating to absolute via the binary's anchor and then
+                // asking the process's address_space.
+                let resolver = if args.source {
+                    anchors.get( &binary_id ).and_then( |anchor| {
+                        let process = state.get_process( anchor.pid )?;
+                        Some( (process.address_space(), anchor.load_offset) )
+                    })
+                } else {
+                    None
+                };
+
+                if let Some( (address_space, load_offset) ) = resolver {
+                    let resolve = |rel_addr: u64| -> Option< LineInfo > {
+                        let abs = rel_addr.wrapping_add( load_offset );
+                        let mut info: Option< LineInfo > = None;
+                        address_space.decode_symbol_while( abs, &mut |frame| {
+                            if info.is_none() {
+                                if let (Some( file ), Some( line )) = (frame.file.as_ref(), frame.line) {
+                                    info = Some( LineInfo { file: file.clone(), line } );
+                                }
+                            }
+                            true
+                        });
+                        info
+                    };
+                    disassemble_amd64( &decoder, bytes, range.start.raw(), &counts_u64,
+                                       Some( resolve ), Some( &mut source_cache ), &mut out )?;
+                } else {
+                    let no_resolve: Option< fn(u64) -> Option< LineInfo > > = None;
+                    disassemble_amd64( &decoder, bytes, range.start.raw(), &counts_u64,
+                                       no_resolve, None, &mut out )?;
+                }
             }
             (FuncSourceTag::Jit, FuncRecord::Jit { range, counts, total }) => {
                 let bytes = match jit_code.get( &range.start ) {
@@ -343,7 +468,9 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
                           name, range.start.raw(), range.end.raw(), total )?;
                 writeln!( out, "      count   address       bytes                           asm" )?;
                 let counts_u64: BTreeMap< u64, u64 > = counts.into_iter().map( |(k, v)| (k.raw(), v) ).collect();
-                disassemble_amd64( &decoder, bytes, range.start.raw(), &counts_u64, &mut out )?;
+                let no_resolve: Option< fn(u64) -> Option< LineInfo > > = None;
+                disassemble_amd64( &decoder, bytes, range.start.raw(), &counts_u64,
+                                   no_resolve, None, &mut out )?;
             }
             // FuncSourceTag and FuncRecord are constructed in lockstep above —
             // the cross-variant cases can't occur.

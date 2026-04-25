@@ -396,7 +396,12 @@ pub struct AnnotateArgs {
 
     /// Number of hottest functions to annotate when --function is not given.
     #[structopt(long, default_value = "5")]
-    pub top: usize
+    pub top: usize,
+
+    /// Interleave source lines (read from disk via DWARF file/line info)
+    /// with the disassembly. Native functions only.
+    #[structopt(long, short = "s")]
+    pub source: bool,
 }
 
 #[derive(StructOpt, Debug)]
