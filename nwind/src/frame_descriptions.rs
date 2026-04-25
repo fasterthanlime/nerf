@@ -13,7 +13,7 @@ use gimli::{
     EhFrame,
     EhFrameHdr,
     DebugFrame,
-    UninitializedUnwindContext,
+    UnwindContext,
     UnwindSection,
     UnwindOffset,
     CfaRule,
@@ -36,14 +36,14 @@ use crate::utils::HexValue;
 type DataReader< E > = EndianSlice< 'static, E >;
 
 pub struct ContextCache< E: Endianity > {
-    cached_context: UninitializedUnwindContext< DataReader< E > >
+    cached_context: UnwindContext< DataReader< E > >
 }
 
 impl< E: Endianity > ContextCache< E > {
     #[inline]
     pub fn new() -> Self {
         ContextCache {
-            cached_context: Default::default()
+            cached_context: UnwindContext::new()
         }
     }
 }
@@ -617,6 +617,12 @@ impl< 'a, E: Endianity > UnwindInfo< 'a, E > {
                 RegisterRule::Architectural => SimpleRegisterRule::Architectural,
                 RegisterRule::Expression( _ ) |
                 RegisterRule::ValExpression( _ ) => {
+                    return;
+                }
+                // gimli marked RegisterRule #[non_exhaustive] in 0.28 and
+                // added DWARF 5's Constant rule. We don't know how to lower
+                // it, so bail like the expression cases above.
+                _ => {
                     return;
                 }
             };

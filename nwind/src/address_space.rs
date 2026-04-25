@@ -389,7 +389,7 @@ impl< A: Architecture > Binary< A > {
 
         let mut found = false;
         if let Some( context ) = self.context.as_ref() {
-            if let Ok( mut raw_frames ) = context.lock().unwrap().find_frames( relative_address ) {
+            if let Ok( mut raw_frames ) = context.lock().unwrap().find_frames( relative_address ).skip_all_loads() {
                 if let Ok( Some( raw_frame ) ) = raw_frames.next() {
                     found = true;
                     process_frame( raw_frame, &mut frame );
@@ -1232,21 +1232,37 @@ pub fn reload< A: Architecture >(
                     debug!( "Not compiled with the `addr2line` feature; skipping addr2line context creation" );
                 } else if context.is_none() {
                     debug!( "Creating addr2line context for '{}' from '{}'...", data.name, binary_data.name() );
-                    let ctx = addr2line::Context::from_sections(
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_section_or_empty( &binary_data ),
-                        BinaryData::get_empty_section( &binary_data )
-                    );
 
-                    match ctx {
+                    // Build the gimli::Dwarf struct directly so we can wire
+                    // up .debug_loclists / .debug_loc — addr2line's
+                    // from_sections shortcut leaves locations empty, which
+                    // makes DWARF 5 binaries (e.g. modern glibc dbgsym) fail
+                    // to parse with UnexpectedEof.
+                    let empty = BinaryData::get_empty_section( &binary_data );
+                    let dwarf = gimli::Dwarf {
+                        debug_abbrev:      BinaryData::get_section_or_empty( &binary_data ),
+                        debug_addr:        BinaryData::get_section_or_empty( &binary_data ),
+                        debug_aranges:     BinaryData::get_section_or_empty( &binary_data ),
+                        debug_info:        BinaryData::get_section_or_empty( &binary_data ),
+                        debug_line:        BinaryData::get_section_or_empty( &binary_data ),
+                        debug_line_str:    BinaryData::get_section_or_empty( &binary_data ),
+                        debug_str:         BinaryData::get_section_or_empty( &binary_data ),
+                        debug_str_offsets: BinaryData::get_section_or_empty( &binary_data ),
+                        debug_types:       empty.clone().into(),
+                        locations: gimli::LocationLists::new(
+                            BinaryData::get_section_or_empty( &binary_data ),
+                            BinaryData::get_section_or_empty( &binary_data ),
+                        ),
+                        ranges: gimli::RangeLists::new(
+                            BinaryData::get_section_or_empty( &binary_data ),
+                            BinaryData::get_section_or_empty( &binary_data ),
+                        ),
+                        file_type: gimli::DwarfFileType::Main,
+                        sup: None,
+                        abbreviations_cache: gimli::AbbreviationsCache::new(),
+                    };
+
+                    match addr2line::Context::from_dwarf( dwarf ) {
                         Ok( ctx ) => context = Some( Mutex::new( ctx ) ),
                         Err( error ) => {
                             warn!( "Failed to create addr2line context: {:?}", error );
