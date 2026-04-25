@@ -203,6 +203,12 @@ pub struct RecordArgs {
     #[structopt(long)]
     pub do_not_send_sigstop: bool,
 
+    /// Start a live RPC/WebSocket server on the given host:port (e.g.
+    /// 127.0.0.1:8080). When set, nperf streams sample aggregations to
+    /// connected clients in addition to (or instead of) writing the archive.
+    #[structopt(long)]
+    pub serve: Option< String >,
+
     /// Arguments to pass to the launched child process. Use `--` to
     /// separate nperf flags from the target's arguments:
     ///

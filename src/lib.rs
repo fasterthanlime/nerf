@@ -23,6 +23,7 @@ mod mount_info;
 mod profiler;
 mod interner;
 mod data_reader;
+pub mod live_sink;
 
 pub use crate::archive::{ArchiveReader, Packet};
 pub use crate::stack_reader::StackReader;

@@ -43,9 +43,14 @@ fn main_impl() -> Result< (), Box< dyn Error > > {
             }
 
             #[cfg(target_os = "macos")]
-            cmd_record_mac::main( args )?;
+            {
+                if args.serve.is_some() {
+                    return Err( "--serve is not yet supported on macOS".into() );
+                }
+                cmd_record_mac::main( args )?;
+            }
             #[cfg(not(target_os = "macos"))]
-            cmd_record::main( args )?;
+            run_record_linux( args )?;
         },
         #[cfg(feature = "inferno")]
         args::Opt::Flamegraph( args ) => {
@@ -82,5 +87,21 @@ fn main() {
     if let Err( error ) = main_impl() {
         eprintln!( "error: {}", error );
         exit( 1 );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_record_linux( args: args::RecordArgs ) -> Result< (), Box< dyn Error > > {
+    if let Some( ref addr ) = args.serve {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let (sink, _server_handle) = runtime.block_on( nperf_live::start( addr ) )?;
+        let result = cmd_record::main_with_live_sink( args, Some( Box::new( sink ) ) );
+        // runtime drops here, aborting the server task
+        drop( runtime );
+        result
+    } else {
+        cmd_record::main( args )
     }
 }

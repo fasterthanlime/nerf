@@ -53,7 +53,7 @@ addr2line = ["nwind/addr2line"]
 debug-logs = ["nwind/debug-logs"]
 
 [workspace]
-members = [".", "cli", "nwind", "proc-maps", "perf_event_open", "thread-local-reentrant", "nerf-mac-capture", "xtask"]
+members = [".", "cli", "nwind", "proc-maps", "perf_event_open", "thread-local-reentrant", "nerf-mac-capture", "xtask", "nperf-live"]
 # nerf-mac-preload is built as a standalone workspace because it requires
 # panic="abort" / no_std settings that cannot be expressed at member scope.
 exclude = ["nerf-mac-preload"]

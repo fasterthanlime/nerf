@@ -672,7 +672,8 @@ pub struct ProfilingController {
     sample_counter: u64,
     profiling_started_ts: Instant,
     maps: RangeMap< Region >,
-    output_path: PathBuf
+    output_path: PathBuf,
+    live_sink: Option< Box< dyn crate::live_sink::LiveSink > >
 }
 
 pub struct Sample< 'a > {
@@ -701,8 +702,13 @@ impl ProfilingController {
             sample_counter: 0,
             profiling_started_ts: Instant::now(),
             maps: RangeMap::new(),
-            output_path
+            output_path,
+            live_sink: None
         })
+    }
+
+    pub fn set_live_sink( &mut self, sink: Box< dyn crate::live_sink::LiveSink > ) {
+        self.live_sink = Some( sink );
     }
 
     pub fn output_path( &self ) -> &Path {
@@ -782,6 +788,17 @@ impl ProfilingController {
             let stack = (&event.stack).into();
             let reader = StackReader { stack };
             self.address_space.unwind( dwarf_regs, &reader, &mut user_backtrace );
+
+            if let Some( sink ) = self.live_sink.as_ref() {
+                sink.on_sample( &crate::live_sink::SampleEvent {
+                    timestamp: event.timestamp,
+                    pid: event.pid,
+                    tid: event.tid,
+                    cpu: event.cpu,
+                    kernel_backtrace: &event.kernel_backtrace,
+                    user_backtrace: &user_backtrace,
+                });
+            }
 
             packet = Packet::Sample {
                 timestamp: event.timestamp,

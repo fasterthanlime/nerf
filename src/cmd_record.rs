@@ -12,6 +12,7 @@ use perf_event_open::{Event, EventSource, CommEvent, Mmap2Event};
 use crate::perf_group::PerfGroup;
 use crate::perf_arch;
 use crate::archive::{ContextSwitchKind, Packet};
+use crate::live_sink::LiveSink;
 use crate::profiler::{ProfilingController, Sample};
 
 fn handle_comm_event( event: CommEvent, controller: &ProfilingController ) {
@@ -51,9 +52,16 @@ fn handle_mmap2_event( event: Mmap2Event, new_maps: &mut Vec< Region > ) {
 }
 
 pub fn main( args: args::RecordArgs ) -> Result< (), Box< dyn Error > > {
+    main_with_live_sink( args, None )
+}
+
+pub fn main_with_live_sink( args: args::RecordArgs, live_sink: Option< Box< dyn LiveSink > > ) -> Result< (), Box< dyn Error > > {
     let discard_all = args.discard_all;
 
     let mut controller = ProfilingController::new( &args.profiler_args )?;
+    if let Some( sink ) = live_sink {
+        controller.set_live_sink( sink );
+    }
     controller.write_packet( Packet::ProfilingFrequency {
         frequency: args.frequency
     });

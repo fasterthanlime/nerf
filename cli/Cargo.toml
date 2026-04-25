@@ -10,6 +10,10 @@ log = "0.4"
 env_logger = { version = "0.11", optional = true }
 nperf-core = { path = "..", default-features = false }
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nperf-live = { path = "../nperf-live" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
 [features]
 default = ["addr2line", "inferno", "env_logger"]
 addr2line = ["nperf-core/addr2line"]
