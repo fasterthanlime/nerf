@@ -13,8 +13,9 @@ description = "macOS sampling backend for nerf, vendored from samply."
 log = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mach2 = "0.4"
+mach2 = "0.6"
 libc = "0.2"
 framehop = "0.16"
 lazy_static = "1.5"
 crossbeam-channel = "0.5"
+thiserror = "2"
