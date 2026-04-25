@@ -1,5 +1,5 @@
 //! `nperf annotate` — disassembles hot functions with per-instruction sample
-//! counts (perf-annotate style). x86_64 only for now.
+//! counts (perf-annotate style). Supports x86_64 and aarch64.
 //!
 //! Address-space discipline. Two virtual-address spaces show up here and they
 //! must not be confused:
@@ -34,8 +34,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nwind::{BinaryData, BinaryId};
-use yaxpeax_arch::LengthedInstruction;
-use yaxpeax_x86::amd64::InstDecoder;
+use yaxpeax_arch::{Decoder, LengthedInstruction, U8Reader};
+use yaxpeax_arm::armv8::a64::InstDecoder as Aarch64Decoder;
+use yaxpeax_x86::amd64::InstDecoder as Amd64Decoder;
 
 use crate::args::AnnotateArgs;
 use crate::data_reader::{Binary, EventKind, read_data, repack_cli_args};
@@ -267,11 +268,43 @@ struct LineInfo {
     comp_dir: Option< String >,
 }
 
+/// Emit the source-line header (filename:line plus a trimmed snippet)
+/// whenever the resolved location changes between instructions.
+fn maybe_emit_source_header< W: Write, F >(
+    addr: u64,
+    last_line: &mut Option< LineInfo >,
+    resolve_line: &mut Option< F >,
+    source_cache: &mut Option< &mut SourceCache >,
+    out: &mut W
+) -> io::Result< () >
+    where F: FnMut( u64 ) -> Option< LineInfo >
+{
+    if let Some( resolver ) = resolve_line.as_mut() {
+        let info = resolver( addr );
+        if info != *last_line {
+            if let Some( ref info ) = info {
+                let snippet = source_cache
+                    .as_deref_mut()
+                    .and_then( |cache| cache.line( &info.file, info.comp_dir.as_deref(), info.line ) )
+                    .map( |s| s.trim().to_owned() )
+                    .unwrap_or_default();
+                let basename = std::path::Path::new( &info.file )
+                    .file_name()
+                    .and_then( |n| n.to_str() )
+                    .unwrap_or( info.file.as_str() );
+                writeln!( out, "  ; {}:{}  {}", basename, info.line, snippet )?;
+            }
+            *last_line = info;
+        }
+    }
+    Ok(())
+}
+
 /// Disassemble a function's bytes and write per-instruction lines, marking
 /// hot ones and (when `resolve_line` is provided) emitting a source-line
 /// header whenever the resolved (file, line) changes.
 fn disassemble_amd64< W: Write, F >(
-    decoder: &InstDecoder,
+    decoder: &Amd64Decoder,
     bytes: &[u8],
     base: u64,
     counts: &BTreeMap< u64, u64 >,
@@ -291,24 +324,7 @@ fn disassemble_amd64< W: Write, F >(
         let count = counts.get( &addr ).copied().unwrap_or( 0 );
         let mark = if count > 0 { ">" } else { " " };
 
-        if let Some( resolver ) = resolve_line.as_mut() {
-            let info = resolver( addr );
-            if info != last_line {
-                if let Some( ref info ) = info {
-                    let snippet = source_cache
-                        .as_deref_mut()
-                        .and_then( |cache| cache.line( &info.file, info.comp_dir.as_deref(), info.line ) )
-                        .map( |s| s.trim().to_owned() )
-                        .unwrap_or_default();
-                    let basename = std::path::Path::new( &info.file )
-                        .file_name()
-                        .and_then( |n| n.to_str() )
-                        .unwrap_or( info.file.as_str() );
-                    writeln!( out, "  ; {}:{}  {}", basename, info.line, snippet )?;
-                }
-                last_line = info;
-            }
-        }
+        maybe_emit_source_header( addr, &mut last_line, &mut resolve_line, &mut source_cache, out )?;
 
         match decoder.decode_slice( &bytes[ offset.. ] ) {
             Ok( instr ) => {
@@ -325,6 +341,49 @@ fn disassemble_amd64< W: Write, F >(
                 offset += 1;
             }
         }
+    }
+    Ok(())
+}
+
+/// aarch64 has fixed 4-byte instructions, so the loop just steps a word at
+/// a time. (yaxpeax-arm does report a length, but it's always 4.)
+fn disassemble_aarch64< W: Write, F >(
+    decoder: &Aarch64Decoder,
+    bytes: &[u8],
+    base: u64,
+    counts: &BTreeMap< u64, u64 >,
+    resolve_line: Option< F >,
+    source_cache: Option< &mut SourceCache >,
+    out: &mut W
+) -> io::Result< () >
+    where F: FnMut( u64 ) -> Option< LineInfo >
+{
+    let mut offset: usize = 0;
+    let mut last_line: Option< LineInfo > = None;
+    let mut resolve_line = resolve_line;
+    let mut source_cache = source_cache;
+
+    while offset + 4 <= bytes.len() {
+        let addr = base + offset as u64;
+        let count = counts.get( &addr ).copied().unwrap_or( 0 );
+        let mark = if count > 0 { ">" } else { " " };
+
+        maybe_emit_source_header( addr, &mut last_line, &mut resolve_line, &mut source_cache, out )?;
+
+        let inst_bytes = &bytes[ offset..offset + 4 ];
+        let hex = format_hex_bytes( inst_bytes );
+        let mut reader = U8Reader::new( inst_bytes );
+        match decoder.decode( &mut reader ) {
+            Ok( instr ) => {
+                writeln!( out, " {} {:>8}  0x{:012x}  {:<30}  {}",
+                          mark, count, addr, hex, instr )?;
+            }
+            Err( err ) => {
+                writeln!( out, " {} {:>8}  0x{:012x}  {:<30}  <decode error: {}>",
+                          mark, count, addr, hex, err )?;
+            }
+        }
+        offset += 4;
     }
     Ok(())
 }
@@ -427,13 +486,14 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
         }
     })?;
 
-    let arch = state.architecture();
-    if arch != "amd64" {
-        return Err( format!(
-            "annotate: only x86_64 (amd64) is supported in this version (got '{}')",
-            arch
-        ).into() );
-    }
+    enum Arch { Amd64, Aarch64 }
+    let arch = match state.architecture() {
+        "amd64" => Arch::Amd64,
+        "aarch64" => Arch::Aarch64,
+        other => return Err( format!(
+            "annotate: unsupported architecture '{}' (supports amd64, aarch64)", other
+        ).into() ),
+    };
 
     if funcs.is_empty() {
         eprintln!( "annotate: no samples landed in known functions" );
@@ -459,7 +519,8 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let decoder = InstDecoder::default();
+    let amd64_decoder = Amd64Decoder::default();
+    let aarch64_decoder = Aarch64Decoder::default();
     let mut code_cache = CodeCache::new();
     let mut source_cache = SourceCache::new(
         args.source_path.iter().map( PathBuf::from ).collect()
@@ -514,12 +575,20 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
                         });
                         info
                     };
-                    disassemble_amd64( &decoder, bytes, range.start.raw(), &counts_u64,
-                                       Some( resolve ), Some( &mut source_cache ), &mut out )?;
+                    match arch {
+                        Arch::Amd64 => disassemble_amd64( &amd64_decoder, bytes, range.start.raw(), &counts_u64,
+                                       Some( resolve ), Some( &mut source_cache ), &mut out )?,
+                        Arch::Aarch64 => disassemble_aarch64( &aarch64_decoder, bytes, range.start.raw(), &counts_u64,
+                                       Some( resolve ), Some( &mut source_cache ), &mut out )?,
+                    }
                 } else {
                     let no_resolve: Option< fn(u64) -> Option< LineInfo > > = None;
-                    disassemble_amd64( &decoder, bytes, range.start.raw(), &counts_u64,
-                                       no_resolve, None, &mut out )?;
+                    match arch {
+                        Arch::Amd64 => disassemble_amd64( &amd64_decoder, bytes, range.start.raw(), &counts_u64,
+                                       no_resolve, None, &mut out )?,
+                        Arch::Aarch64 => disassemble_aarch64( &aarch64_decoder, bytes, range.start.raw(), &counts_u64,
+                                       no_resolve, None, &mut out )?,
+                    }
                 }
             }
             (FuncSourceTag::Jit, FuncRecord::Jit { range, counts, total }) => {
@@ -536,8 +605,12 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
                 writeln!( out, "      count   address       bytes                           asm" )?;
                 let counts_u64: BTreeMap< u64, u64 > = counts.into_iter().map( |(k, v)| (k.raw(), v) ).collect();
                 let no_resolve: Option< fn(u64) -> Option< LineInfo > > = None;
-                disassemble_amd64( &decoder, bytes, range.start.raw(), &counts_u64,
-                                   no_resolve, None, &mut out )?;
+                match arch {
+                    Arch::Amd64 => disassemble_amd64( &amd64_decoder, bytes, range.start.raw(), &counts_u64,
+                                       no_resolve, None, &mut out )?,
+                    Arch::Aarch64 => disassemble_aarch64( &aarch64_decoder, bytes, range.start.raw(), &counts_u64,
+                                       no_resolve, None, &mut out )?,
+                }
             }
             // FuncSourceTag and FuncRecord are constructed in lockstep above —
             // the cross-variant cases can't occur.
