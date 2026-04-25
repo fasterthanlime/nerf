@@ -25,6 +25,9 @@ yaxpeax-x86 = { version = "2", default-features = false, features = ["std", "fmt
 proc-maps = { version = "0.1", path = "proc-maps" }
 perf_event_open = { version = "0.1", path = "perf_event_open" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+nerf-mac-capture = { version = "0.1", path = "nerf-mac-capture" }
+
 [dependencies.nwind]
 version = "0.1"
 path = "nwind"

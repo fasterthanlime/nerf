@@ -776,6 +776,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
+ "nerf-mac-capture",
  "num_cpus",
  "nwind",
  "parking_lot",

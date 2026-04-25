@@ -12,9 +12,13 @@ use nperf_core::{
     cmd_collate,
     cmd_csv,
     cmd_metadata,
-    cmd_record,
     cmd_trace_events
 };
+
+#[cfg(target_os = "macos")]
+use nperf_core::cmd_record_mac;
+#[cfg(not(target_os = "macos"))]
+use nperf_core::cmd_record;
 
 #[cfg(feature = "inferno")]
 use nperf_core::cmd_flamegraph;
@@ -37,6 +41,9 @@ fn main_impl() -> Result< (), Box< dyn Error > > {
                 }
             }
 
+            #[cfg(target_os = "macos")]
+            cmd_record_mac::main( args )?;
+            #[cfg(not(target_os = "macos"))]
             cmd_record::main( args )?;
         },
         #[cfg(feature = "inferno")]

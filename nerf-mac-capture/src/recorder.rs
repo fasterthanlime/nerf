@@ -9,8 +9,6 @@
 //! LICENSE-APACHE at the crate root.
 
 use std::mem;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use framehop::{CacheNative, FrameAddress, MayAllocateDuringUnwind, UnwinderNative};
@@ -64,11 +62,11 @@ impl Default for RecordOptions {
 }
 
 /// Drive a recording session against an existing PID. Blocks until the
-/// duration elapses, the task disappears, or `should_stop` becomes true.
+/// duration elapses, the task disappears, or `should_stop` returns true.
 pub fn record<S: SampleSink>(
     opts: RecordOptions,
     sink: &mut S,
-    should_stop: Arc<AtomicBool>,
+    should_stop: impl Fn() -> bool,
 ) -> Result<(), SamplingError> {
     let task = task_for_pid_existing(opts.pid)?;
 
@@ -88,7 +86,7 @@ pub fn record<S: SampleSink>(
     let mut frames_buf: Vec<FrameAddress> = Vec::with_capacity(256);
 
     loop {
-        if should_stop.load(Ordering::Relaxed) {
+        if should_stop() {
             break;
         }
         if let Some(dur) = opts.duration {
