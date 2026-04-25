@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::fmt;
 
-use memmap::Mmap;
+use memmap2::Mmap;
 use goblin::elf::header as elf_header;
 use goblin::elf::section_header::{SHT_SYMTAB, SHT_DYNSYM, SHT_STRTAB};
 use goblin::elf::program_header::PT_LOAD;
