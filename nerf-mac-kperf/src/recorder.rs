@@ -6,13 +6,15 @@
 //! the same order as mperf's `profiling_cleanup` so the host kernel
 //! is left in a clean state even on panic.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use nerf_mac_capture::SampleSink;
+use nerf_mac_capture::{SampleEvent, SampleSink};
 
 use crate::bindings::{self, sampler, Frameworks};
 use crate::error::Error;
-use crate::kdebug::{self, KdBuf, KdRegtype};
+use crate::kdebug::{self, kdbg_class, kdbg_code, kdbg_func, kdbg_subclass, KdBuf, KdRegtype, DBG_PERF};
+use crate::parser::Parser;
 
 /// Configuration for a kperf-driven recording session.
 pub struct RecordOptions {
@@ -193,7 +195,7 @@ impl Drop for Session<'_> {
 fn drain_loop<S: SampleSink>(
     _fw: &Frameworks,
     opts: &RecordOptions,
-    _sink: &mut S,
+    sink: &mut S,
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<(), Error> {
     let start = Instant::now();
@@ -216,6 +218,11 @@ fn drain_loop<S: SampleSink>(
         opts.kdebug_buf_records as usize
     ];
 
+    let mut parser = Parser::new();
+    // (subclass, code, func) -> count, for diagnostics.
+    let mut histogram: BTreeMap<(u8, u16, u32), u64> = BTreeMap::new();
+    let mut total_drained: u64 = 0;
+
     loop {
         if should_stop() {
             break;
@@ -232,23 +239,53 @@ fn drain_loop<S: SampleSink>(
         if n == 0 {
             continue;
         }
+        total_drained += n as u64;
 
-        // TODO(kperf-stack-parser): assemble SampleEvent from the
-        // sequence:
-        //   PERF_PET_SAMPLE_THREAD | DBG_FUNC_START   (sample begins)
-        //     PERF_TI_DATA                            (thread info)
-        //     PERF_CS_UHDR  arg1=flags arg2=nframes-async arg3=async_idx arg4=async_nframes
-        //     PERF_CS_UDATA arg1..arg4 = 4 frames     (repeats ceil(nframes/4) times)
-        //     PERF_CS_KHDR  + PERF_CS_KDATA  (same shape, kernel side)
-        //     PERF_CS_ERROR (optional)
-        //   PERF_PET_SAMPLE_THREAD | DBG_FUNC_END     (sample ends)
-        // tid is in kd_buf.arg5 of every record, set by the kernel
-        // when the kperf handler ran. See xnu osfmk/kperf/{buffer.h,
-        // callstack.c, pet.c}.
-        log::trace!("drained {n} kdebug records (parser TODO)");
+        for rec in &buf[..n] {
+            if kdbg_class(rec.debugid) == DBG_PERF {
+                let key = (
+                    kdbg_subclass(rec.debugid),
+                    kdbg_code(rec.debugid),
+                    kdbg_func(rec.debugid),
+                );
+                *histogram.entry(key).or_insert(0) += 1;
+            }
+            parser.feed(rec, |sample| {
+                let backtrace: Vec<u64> =
+                    sample.user_backtrace.iter().copied().collect();
+                sink.on_sample(SampleEvent {
+                    timestamp_ns: sample.timestamp_ns,
+                    pid: opts.pid,
+                    tid: sample.tid,
+                    backtrace: &backtrace,
+                });
+            });
+        }
     }
 
+    log_session_summary(total_drained, &parser, &histogram);
     Ok(())
+}
+
+fn log_session_summary(
+    total: u64,
+    parser: &Parser,
+    histogram: &BTreeMap<(u8, u16, u32), u64>,
+) {
+    let s = &parser.stats;
+    log::info!(
+        "kdebug records drained: {total}, samples \
+         started/emitted/orphaned: {}/{}/{}, walk errors u/k: {}/{}",
+        s.samples_started,
+        s.samples_emitted,
+        s.samples_orphaned,
+        s.user_walk_errors,
+        s.kernel_walk_errors,
+    );
+    log::info!("DBG_PERF histogram (subclass, code, func) -> count:");
+    for ((sc, code, func), count) in histogram {
+        log::info!("  ({sc:>2}, {code:>3}, {func}) -> {count}");
+    }
 }
 
 fn kperf_call(rc: i32, op: &'static str) -> Result<(), Error> {

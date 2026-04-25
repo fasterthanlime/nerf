@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use nerf_mac_kperf::{record, RecordOptions};
 
     if env::var_os("RUST_LOG").is_none() {
-        env::set_var("RUST_LOG", "nerf_mac_kperf=trace");
+        env::set_var("RUST_LOG", "nerf_mac_kperf=info");
     }
     env_logger::init();
 
@@ -37,10 +37,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     struct CountingSink {
         samples: u64,
+        total_frames: u64,
+        empty_samples: u64,
+        printed: u32,
     }
     impl SampleSink for CountingSink {
-        fn on_sample(&mut self, _: SampleEvent<'_>) {
+        fn on_sample(&mut self, ev: SampleEvent<'_>) {
             self.samples += 1;
+            self.total_frames += ev.backtrace.len() as u64;
+            if ev.backtrace.is_empty() {
+                self.empty_samples += 1;
+            }
+            if self.printed < 3 && !ev.backtrace.is_empty() {
+                self.printed += 1;
+                println!(
+                    "[sample] tid={} ts={} frames={}: top={:#x}",
+                    ev.tid,
+                    ev.timestamp_ns,
+                    ev.backtrace.len(),
+                    ev.backtrace[0],
+                );
+            }
         }
         fn on_binary_loaded(&mut self, _: BinaryLoadedEvent<'_>) {}
         fn on_binary_unloaded(&mut self, _: BinaryUnloadedEvent<'_>) {}
@@ -55,13 +72,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let mut sink = CountingSink { samples: 0 };
+    let mut sink = CountingSink {
+        samples: 0,
+        total_frames: 0,
+        empty_samples: 0,
+        printed: 0,
+    };
     record(opts, &mut sink, || false)?;
 
+    let avg = if sink.samples == 0 {
+        0.0
+    } else {
+        sink.total_frames as f64 / sink.samples as f64
+    };
     println!(
-        "duration={}s, samples emitted to sink: {} \
-         (parser not implemented yet -- expect 0)",
-        secs, sink.samples
+        "duration={}s, samples={}, total_frames={}, avg_frames={:.1}, empty={}",
+        secs, sink.samples, sink.total_frames, avg, sink.empty_samples,
     );
     Ok(())
 }

@@ -19,6 +19,7 @@
 pub mod bindings;
 pub mod error;
 pub mod kdebug;
+pub mod parser;
 pub mod recorder;
 
 pub use error::Error;

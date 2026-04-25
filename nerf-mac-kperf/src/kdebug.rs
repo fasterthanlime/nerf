@@ -59,6 +59,11 @@ pub const DBG_FUNC_NONE: u32 = 0;
 pub const DBG_FUNC_START: u32 = 1;
 pub const DBG_FUNC_END: u32 = 2;
 
+/// `kd_buf::timestamp` packs the 56-bit kernel mach-time value in
+/// the low bits and the cpuid in the high 8. Mask off the cpuid
+/// before treating it as time.
+pub const KDBG_TIMESTAMP_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+
 #[inline]
 pub const fn kdbg_eventid(class: u8, subclass: u8, code: u16) -> u32 {
     ((class as u32) << KDBG_CLASS_SHIFT)
