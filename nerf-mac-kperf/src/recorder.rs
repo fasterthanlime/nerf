@@ -75,7 +75,6 @@ pub fn record<S: SampleSink>(
     let _ = kdebug::reset();
 
     let mut session = Session::start(&fw, &opts)?;
-    session.attach_to_pid(opts.pid)?;
     session.enable_kdebug(&opts)?;
 
     drain_loop(&fw, &opts, sink, &mut should_stop)?;
@@ -90,12 +89,19 @@ pub fn record<S: SampleSink>(
 
 struct Session<'a> {
     fw: &'a Frameworks,
+    #[allow(dead_code)]
     actionid: u32,
     #[allow(dead_code)]
     timerid: u32,
 }
 
 impl<'a> Session<'a> {
+    /// Configure kperf actions / timers / filter, then arm sampling.
+    /// Order matches mperf's `run_with_pet` exactly: lightweight_pet
+    /// is set, then `kperf_sample_set(1)`, *before* any kdebug op.
+    /// In lightweight-PET mode kperf cooperates with the kdebug
+    /// interface rather than taking exclusive ownership, so the
+    /// subsequent `KERN_KDREMOVE` etc. are accepted.
     fn start(fw: &'a Frameworks, opts: &RecordOptions) -> Result<Self, Error> {
         // Allocate one action + one timer.
         let actionid: u32 = 1;
@@ -108,6 +114,12 @@ impl<'a> Session<'a> {
         kperf_call(
             unsafe { (fw.kperf_action_samplers_set)(actionid, STACK_SAMPLER_BITS) },
             "action_samplers_set",
+        )?;
+        kperf_call(
+            unsafe {
+                (fw.kperf_action_filter_set_by_pid)(actionid, opts.pid as i32)
+            },
+            "action_filter_set_by_pid",
         )?;
 
         let period_ns = if opts.frequency_hz == 0 {
@@ -126,29 +138,21 @@ impl<'a> Session<'a> {
         )?;
         kperf_call(unsafe { (fw.kperf_timer_pet_set)(timerid) }, "timer_pet_set")?;
 
+        // Lightweight PET + sample_set must precede kdebug setup so
+        // kdebug ops aren't blocked by an exclusive KTRACE_KPERF.
+        kdebug::set_lightweight_pet(1)?;
+        kperf_call(unsafe { (fw.kperf_sample_set)(1) }, "sample_set")?;
+
         Ok(Self { fw, actionid, timerid })
     }
 
-    fn attach_to_pid(&mut self, pid: u32) -> Result<(), Error> {
-        kperf_call(
-            unsafe {
-                (self.fw.kperf_action_filter_set_by_pid)(self.actionid, pid as i32)
-            },
-            "action_filter_set_by_pid",
-        )?;
-        Ok(())
-    }
-
     fn enable_kdebug(&mut self, opts: &RecordOptions) -> Result<(), Error> {
-        // Wipe any leftover state.
         kdebug::reset()?;
         kdebug::set_buf_size(opts.kdebug_buf_records)?;
         kdebug::setup()?;
 
         // Range-filter to the DBG_PERF class so we don't drown in
-        // unrelated kernel events. We'll narrow further to the
-        // specific PERF_STK_* codes once those are wired up; for
-        // now class-level keeps the parser simple.
+        // unrelated kernel events.
         let mut filter = KdRegtype {
             ty: kdebug::KDBG_RANGETYPE,
             value1: kdebug::kdbg_eventid(kdebug::DBG_PERF, 0, 0),
@@ -157,8 +161,6 @@ impl<'a> Session<'a> {
             value4: 0,
         };
         kdebug::set_filter(&mut filter)?;
-
-        kperf_call(unsafe { (self.fw.kperf_sample_set)(1) }, "sample_set")?;
         kdebug::enable(true)?;
         Ok(())
     }

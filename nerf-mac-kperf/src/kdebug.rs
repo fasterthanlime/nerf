@@ -17,7 +17,11 @@ use crate::error::Error;
 // ---------------------------------------------------------------------------
 
 pub const CTL_KERN: c_int = 1;
-pub const KERN_KDEBUG: c_int = 38;
+/// `KERN_KDEBUG` — value confirmed against the macOS 26.4 SDK at
+/// `/Applications/Xcode.app/.../usr/include/sys/sysctl.h`. xnu's
+/// open-source mirror sometimes lists 38 in older or out-of-tree
+/// docs; the deployed value is 24.
+pub const KERN_KDEBUG: c_int = 24;
 
 pub const KERN_KDEFLAGS: c_int = 1;
 pub const KERN_KDDFLAGS: c_int = 2;
