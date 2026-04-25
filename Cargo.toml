@@ -44,8 +44,9 @@ criterion = "0.5"
 env_logger = "0.11"
 
 [profile.release]
-lto = true
-panic = "abort"
+# lto = true
+# panic = "abort"
+debug = 1
 
 [features]
 default = ["addr2line", "inferno"]

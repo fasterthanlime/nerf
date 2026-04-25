@@ -95,11 +95,24 @@ fn install() -> Result<(), Box<dyn Error>> {
 
 #[cfg(target_os = "macos")]
 fn codesign_macos(binary: &Path) -> Result<(), Box<dyn Error>> {
+    // - cs.debugger: lets nperf attach to other processes
+    // - get-task-allow: lets debuggers attach to nperf itself
+    // - cs.allow-jit: required for any JIT mmap (kept for completeness)
+    // - cs.allow-unsigned-executable-memory: cranelift-jit (used by vox)
+    //   uses plain mprotect-PROT_EXEC rather than MAP_JIT, which the
+    //   kernel rejects under hardened runtime + allow-jit alone. The
+    //   broader entitlement accepts non-MAP_JIT executable pages.
     const ENTITLEMENTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>com.apple.security.cs.debugger</key>
+	<true/>
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
 	<true/>
 </dict>
 </plist>
