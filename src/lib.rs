@@ -27,6 +27,9 @@ mod mount_info;
 mod profiler;
 mod interner;
 mod data_reader;
+
+pub use crate::archive::{ArchiveReader, Packet};
+pub use crate::stack_reader::StackReader;
 pub mod cmd_record;
 #[cfg(feature = "inferno")]
 pub mod cmd_flamegraph;

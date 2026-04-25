@@ -1,18 +1,11 @@
-#[macro_use]
-extern crate criterion;
-
-extern crate nperf;
-extern crate nwind;
-extern crate proc_maps;
-
 use std::fs;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::Path;
 
-use criterion::{Criterion, Bencher};
+use criterion::{criterion_group, criterion_main, Criterion, Bencher};
 
-use nperf::{Packet, ArchiveReader, StackReader};
+use nperf_core::{Packet, ArchiveReader, StackReader};
 use nwind::arch::{self, Registers};
 use nwind::{AddressSpace, IAddressSpace, BinaryData, DwarfRegs, RangeMap};
 use proc_maps::Region;
@@ -81,7 +74,7 @@ fn benchmark_unwind( b: &mut Bencher, filename: &str ) {
                 dwarf_regs.append( reg.register, reg.value );
             }
 
-            let mut stack = &stack.as_slice()[..];
+            let stack = &stack.as_slice()[..];
             let reader = StackReader { stack: stack.into() };
 
             address_space.unwind( &mut dwarf_regs, &reader, &mut user_backtrace );
