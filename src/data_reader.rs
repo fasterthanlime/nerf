@@ -286,6 +286,7 @@ pub(crate) struct State {
     cpu_count: u32,
     frequency: Option< u32 >,
     jitdump_names: RangeMap< String >,
+    architecture: String,
 }
 
 impl State {
@@ -319,6 +320,26 @@ impl State {
 
     pub(crate) fn unfiltered_first_timestamp( &self ) -> Option< u64 > {
         self.unfiltered_first_timestamp.clone()
+    }
+
+    pub(crate) fn architecture( &self ) -> &str {
+        &self.architecture
+    }
+
+    pub(crate) fn jitdump_names( &self ) -> &RangeMap< String > {
+        &self.jitdump_names
+    }
+}
+
+impl Process {
+    pub(crate) fn memory_regions( &self ) -> &RangeMap< Region > {
+        &self.memory_regions
+    }
+}
+
+impl Binary {
+    pub(crate) fn data( &self ) -> Option< &Arc< BinaryData > > {
+        self.data.as_ref()
     }
 }
 
@@ -513,7 +534,8 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
         unfiltered_first_timestamp: None,
         cpu_count: 1,
         frequency: None,
-        jitdump_names: RangeMap::new()
+        jitdump_names: RangeMap::new(),
+        architecture: String::new()
     };
 
     let mut machine_architecture = String::new();
@@ -641,6 +663,7 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
                 machine_bitness = bitness;
                 machine_endianness = endianness;
                 state.cpu_count = cpu_count;
+                state.architecture = machine_architecture.clone();
 
                 if machine_architecture == arch::native::Arch::NAME &&
                    machine_endianness == Endianness::NATIVE &&

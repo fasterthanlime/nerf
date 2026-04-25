@@ -8,6 +8,7 @@ use structopt::StructOpt;
 
 use nperf_core::{
     args,
+    cmd_annotate,
     cmd_collate,
     cmd_csv,
     cmd_metadata,
@@ -47,6 +48,9 @@ fn main_impl() -> Result< (), Box< dyn Error > > {
         },
         args::Opt::Collate( args ) => {
             cmd_collate::main( args )?;
+        },
+        args::Opt::Annotate( args ) => {
+            cmd_annotate::main( args )?;
         },
         args::Opt::Metadata( args ) => {
             cmd_metadata::main( args )?;

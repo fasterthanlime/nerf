@@ -340,6 +340,23 @@ pub struct CollateArgs {
 
 #[derive(StructOpt, Debug)]
 #[structopt(rename_all = "kebab-case")]
+pub struct AnnotateArgs {
+    #[structopt(flatten)]
+    pub collation_args: SharedCollationArgs,
+
+    /// Only annotate functions whose (demangled) name contains this substring.
+    /// May be specified multiple times; matches if ANY pattern matches.
+    /// If omitted, the top --top functions by leaf-sample count are annotated.
+    #[structopt(long, short = "f")]
+    pub function: Vec< String >,
+
+    /// Number of hottest functions to annotate when --function is not given.
+    #[structopt(long, default_value = "5")]
+    pub top: usize
+}
+
+#[derive(StructOpt, Debug)]
+#[structopt(rename_all = "kebab-case")]
 pub struct MetadataArgs {
     /// The input file to use; record it with the `record` subcommand
     #[structopt(parse(from_os_str))]
@@ -372,6 +389,10 @@ pub enum Opt {
     /// Emits collated stack traces for use with Brendan Gregg's flamegraph script
     #[structopt(name = "collate")]
     Collate( CollateArgs ),
+
+    /// Disassembles hot functions and shows per-instruction sample counts
+    #[structopt(name = "annotate")]
+    Annotate( AnnotateArgs ),
 
     /// Outputs rudimentary JSON-formatted metadata
     #[structopt(name = "metadata")]
