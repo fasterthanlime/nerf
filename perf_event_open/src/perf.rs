@@ -919,7 +919,11 @@ pub struct EventIter< 'a > {
 impl< 'a > EventIter< 'a > {
     #[inline]
     fn new( perf: &'a mut Perf ) -> Self {
-        let mut locations: [RawEventLocation; 32] = unsafe { mem::uninitialized() };
+        let mut locations: [RawEventLocation; 32] = std::array::from_fn( |_| RawEventLocation {
+            kind: 0,
+            misc: 0,
+            data_location: SliceLocation::Single( 0..0 )
+        });
         let mut count = 0;
 
         {
@@ -933,7 +937,7 @@ impl< 'a > EventIter< 'a > {
                     None => break
                 };
 
-                mem::forget( mem::replace( &mut locations[ count ], raw_event_location ) );
+                locations[ count ] = raw_event_location;
                 count += 1;
             }
 
