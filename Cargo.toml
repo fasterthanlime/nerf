@@ -25,7 +25,8 @@ yaxpeax-arm = { version = "0.4.0", default-features = false, features = ["std", 
 
 proc-maps = { version = "0.1", path = "proc-maps" }
 perf_event_open = { version = "0.1", path = "perf_event_open" }
-object = { version = "0.39.1", default-features = false, features = ["std", "read_core", "elf", "macho", "compression"] }
+object = { version = "0.32", default-features = false, features = ["std", "read_core", "elf", "macho", "compression"] }
+memmap2 = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nerf-mac-capture = { version = "0.1", path = "nerf-mac-capture" }

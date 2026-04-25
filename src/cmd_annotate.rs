@@ -135,27 +135,204 @@ impl CodeImage {
     }
 }
 
-/// Per-binary code-bytes cache. Looks up the embedded archive blob
-/// first, then falls back to the on-disk path. Both ELF and Mach-O are
-/// supported via `object::File`. (Symbol lookup goes through
-/// `IAddressSpace`; this cache is purely about *bytes to disassemble*.)
+/// Per-binary code-bytes cache. Tries (1) the embedded archive blob,
+/// (2) the binary at its recorded path on disk, (3) the local macOS
+/// dyld shared cache for system dylibs. ELF and Mach-O both work
+/// through `object::File`; (3) is what makes
+/// `libsystem_malloc.dylib`-style entries annotate even though no
+/// real file exists at their install path.
+///
+/// Symbol lookup goes through `IAddressSpace`; this cache is purely
+/// about *bytes to disassemble*.
 struct CodeCache {
-    by_binary: HashMap< BinaryId, Option< Arc< CodeImage > > >
+    by_binary: HashMap< BinaryId, Option< Arc< CodeImage > > >,
+    dyld: DyldCacheRegistry
 }
 
 impl CodeCache {
-    fn new() -> Self {
-        CodeCache { by_binary: HashMap::new() }
+    fn new( arch: &str ) -> Self {
+        CodeCache {
+            by_binary: HashMap::new(),
+            dyld: DyldCacheRegistry::new( arch.to_owned() )
+        }
     }
 
     fn get( &mut self, binary_id: &BinaryId, binary: &Binary ) -> Option< &Arc< CodeImage > > {
         if !self.by_binary.contains_key( binary_id ) {
             let image = build_image_from_archive( binary )
-                .or_else( || build_image_from_disk( binary ) );
+                .or_else( || build_image_from_disk( binary ) )
+                .or_else( || self.dyld.image_for( binary.path() ).map( Arc::new ) );
             self.by_binary.insert( binary_id.clone(), image );
         }
         self.by_binary.get( binary_id ).and_then( |opt| opt.as_ref() )
     }
+}
+
+/// Lazy holder for the local macOS dyld shared cache.
+///
+/// The shared cache is a single (large) file plus a numbered chain of
+/// `.1`, `.2`, … subcaches and an optional `.symbols` subcache. We mmap
+/// each, then ask `object::read::macho::DyldCache` to assemble them so
+/// `image.parse_object()` returns a Mach-O view whose segments yield
+/// real bytes via `seg.data()` (already split across the right
+/// subcache for us).
+///
+/// The first lookup probes a few well-known paths; failure is cached
+/// so we don't keep stat'ing missing files for every binary.
+struct DyldCacheRegistry {
+    arch: String,
+    /// `None` = not tried yet, `Some(None)` = tried and failed,
+    /// `Some(Some(_))` = open.
+    bundle: Option< Option< Arc< DyldCacheBundle > > >
+}
+
+struct DyldCacheBundle {
+    main: memmap2::Mmap,
+    subcaches: Vec< memmap2::Mmap >
+}
+
+impl DyldCacheRegistry {
+    fn new( arch: String ) -> Self {
+        DyldCacheRegistry { arch, bundle: None }
+    }
+
+    fn bundle( &mut self ) -> Option< Arc< DyldCacheBundle > > {
+        if self.bundle.is_none() {
+            self.bundle = Some( open_local_dyld_cache( &self.arch ).map( Arc::new ) );
+        }
+        self.bundle.as_ref().and_then( |opt| opt.clone() )
+    }
+
+    fn image_for( &mut self, install_path: &str ) -> Option< CodeImage > {
+        let bundle = self.bundle()?;
+        let main_data: &[u8] = &bundle.main;
+        let sub_data: Vec< &[u8] > = bundle.subcaches.iter().map( |m| &m[..] ).collect();
+        let cache = match object::read::macho::DyldCache::< object::Endianness >::parse( main_data, &sub_data ) {
+            Ok( c ) => c,
+            Err( err ) => {
+                debug!( "annotate: failed to parse local dyld shared cache: {}", err );
+                return None;
+            }
+        };
+
+        for image in cache.images() {
+            let path = match image.path() {
+                Ok( p ) => p,
+                Err( _ ) => continue
+            };
+            if path != install_path {
+                continue;
+            }
+            let parsed = match image.parse_object() {
+                Ok( f ) => f,
+                Err( err ) => {
+                    debug!( "annotate: dyld cache image '{}' parse_object failed: {}", install_path, err );
+                    return None;
+                }
+            };
+            debug!( "annotate: extracted '{}' from local dyld shared cache", install_path );
+            return Some( macho_to_code_image( &parsed ) );
+        }
+        debug!( "annotate: install path '{}' not present in local dyld shared cache", install_path );
+        None
+    }
+}
+
+/// Probe the standard macOS install locations for the shared cache
+/// file matching `arch` and mmap it (plus its `.N` and `.symbols`
+/// subcaches, in the order the parser expects).
+fn open_local_dyld_cache( arch: &str ) -> Option< DyldCacheBundle > {
+    // arm64e is the actual Apple-Silicon variant; arm64 is a
+    // backward-compat naming. Try the more specific one first.
+    let suffixes: &[&str] = match arch {
+        "aarch64" => &["arm64e", "arm64"],
+        "amd64"   => &["x86_64h", "x86_64"],
+        _ => return None,
+    };
+    let prefixes: &[&str] = &[
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
+        "/System/Cryptexes/OS/System/Library/dyld",
+        "/System/Library/dyld",
+    ];
+
+    for prefix in prefixes {
+        for suffix in suffixes {
+            let main_path = std::path::Path::new( prefix )
+                .join( format!( "dyld_shared_cache_{}", suffix ) );
+            if !main_path.exists() {
+                continue;
+            }
+            match open_dyld_bundle( &main_path ) {
+                Ok( bundle ) => {
+                    debug!( "annotate: opened dyld shared cache at {:?} (+{} subcaches)",
+                            main_path, bundle.subcaches.len() );
+                    return Some( bundle );
+                }
+                Err( err ) => {
+                    debug!( "annotate: failed to open dyld cache at {:?}: {}", main_path, err );
+                }
+            }
+        }
+    }
+    None
+}
+
+fn open_dyld_bundle( main_path: &std::path::Path ) -> io::Result< DyldCacheBundle > {
+    let main_file = std::fs::File::open( main_path )?;
+    let main = unsafe { memmap2::Mmap::map( &main_file )? };
+
+    let parent = main_path.parent().ok_or_else( || io::Error::new(
+        io::ErrorKind::Other, "dyld cache path has no parent" ) )?;
+    let stem = main_path.file_name().ok_or_else( || io::Error::new(
+        io::ErrorKind::Other, "dyld cache path has no file name" ) )?
+        .to_string_lossy().into_owned();
+
+    let mut subcaches = Vec::new();
+    // Numbered subcaches first, in order, then `.symbols` last.
+    for i in 1.. {
+        let p = parent.join( format!( "{}.{}", stem, i ) );
+        if !p.exists() {
+            break;
+        }
+        let f = std::fs::File::open( &p )?;
+        subcaches.push( unsafe { memmap2::Mmap::map( &f )? } );
+    }
+    let symbols = parent.join( format!( "{}.symbols", stem ) );
+    if symbols.exists() {
+        let f = std::fs::File::open( &symbols )?;
+        subcaches.push( unsafe { memmap2::Mmap::map( &f )? } );
+    }
+
+    Ok( DyldCacheBundle { main, subcaches } )
+}
+
+/// Copy each Mach-O segment's bytes into one packed buffer, producing
+/// a `CodeImage` whose synthetic `file_offset`s point into that
+/// buffer. We do this so a `CodeImage` always speaks the same shape
+/// regardless of whether it was sourced from a regular file or from
+/// a dyld cache (whose segments aren't contiguous in any one file).
+fn macho_to_code_image( file: &object::File ) -> CodeImage {
+    use object::{Object, ObjectSegment};
+    let mut combined: Vec< u8 > = Vec::new();
+    let mut segments: Vec< CodeSegment > = Vec::new();
+    for seg in file.segments() {
+        let data = match seg.data() {
+            Ok( d ) => d,
+            Err( _ ) => continue
+        };
+        if data.is_empty() {
+            continue;
+        }
+        let file_offset = combined.len() as u64;
+        combined.extend_from_slice( data );
+        segments.push( CodeSegment {
+            address: seg.address(),
+            size: seg.size(),
+            file_offset,
+            file_size: data.len() as u64
+        });
+    }
+    CodeImage { bytes: Arc::new( combined ), segments }
 }
 
 /// On-demand cache of source-file contents.
@@ -577,7 +754,7 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
     let mut out = stdout.lock();
     let amd64_decoder = Amd64Decoder::default();
     let aarch64_decoder = Aarch64Decoder::default();
-    let mut code_cache = CodeCache::new();
+    let mut code_cache = CodeCache::new( state.architecture() );
     let mut source_cache = SourceCache::new(
         args.source_path.iter().map( PathBuf::from ).collect()
     );
