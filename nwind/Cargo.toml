@@ -14,7 +14,7 @@ lru = "0.12"
 cpp_demangle = "0.4"
 rustc-demangle = { version = "0.1", optional = true }
 addr2line = { version = "0.21", optional = true, default-features = false, features = ["std"] }
-object = { version = "0.32", default-features = false, features = ["std", "read_core", "elf", "compression"] }
+object = { version = "0.32", default-features = false, features = ["std", "read_core", "elf", "macho", "compression"] }
 proc-maps = { version = "0.1", path = "../proc-maps" }
 libc = "0.2"
 thread-local-reentrant = { version = "0.1", path = "../thread-local-reentrant", optional = true }

@@ -168,10 +168,16 @@ impl BinaryData {
     }
 
     fn load( path: &str, blob: Blob ) -> io::Result< Self > {
-        if !blob.starts_with( b"\x7FELF" ) {
-            return Err( io::Error::new( io::ErrorKind::InvalidData, "not an ELF file" ) );
+        if blob.starts_with( b"\x7FELF" ) {
+            return Self::load_elf( path, blob );
         }
+        if crate::macho::is_macho( &blob ) {
+            return Self::load_macho( path, blob );
+        }
+        Err( io::Error::new( io::ErrorKind::InvalidData, "not an ELF or Mach-O file" ) )
+    }
 
+    fn load_elf( path: &str, blob: Blob ) -> io::Result< Self > {
         let mut data_range = None;
         let mut text_range = None;
         let mut eh_frame_range = None;
@@ -337,6 +343,51 @@ impl BinaryData {
         };
 
         Ok( binary )
+    }
+
+    /// Build a `BinaryData` from a Mach-O blob. Mach-O has no native
+    /// concept of the ELF-only fields (`eh_frame`, `gnu_debuglink`,
+    /// `.ARM.extab` …) and the macOS recorder pre-resolves symbols into
+    /// archive-side `MachOSymbolTable` packets, so `symbol_tables` is left
+    /// empty. We only populate what `cmd_annotate`'s code-bytes path
+    /// actually reads: `architecture`, `endianness`, `bitness`,
+    /// `is_shared_object`, `load_headers`, and `build_id` (LC_UUID).
+    fn load_macho( path: &str, blob: Blob ) -> io::Result< Self > {
+        let parsed = crate::macho::parse( &blob )?;
+        let load_headers = parsed.segments.iter().map( |seg| LoadHeader {
+            address: seg.vmaddr,
+            file_offset: seg.fileoff,
+            file_size: seg.filesize,
+            memory_size: seg.vmsize,
+            // Page size on the host: 16K on aarch64-apple-darwin, 4K on
+            // x86_64. Annotate doesn't depend on alignment, so 0x4000 is
+            // a safe default that matches what the recorder synthesizes.
+            alignment: 0x4000,
+            is_readable: seg.is_readable,
+            is_writable: seg.is_writable,
+            is_executable: seg.is_executable,
+        }).collect();
+
+        Ok( BinaryData {
+            inode: None,
+            name: path.to_string(),
+            blob,
+            data_range: None,
+            text_range: None,
+            eh_frame_range: None,
+            eh_frame_hdr_range: None,
+            debug_frame_range: None,
+            gnu_debuglink_range: None,
+            arm_extab_range: None,
+            arm_exidx_range: None,
+            is_shared_object: parsed.is_shared_object,
+            symbol_tables: Vec::new(),
+            load_headers,
+            architecture: parsed.architecture,
+            endianness: parsed.endianness,
+            bitness: parsed.bitness,
+            build_id: parsed.uuid.map( |u| u.to_vec() ),
+        })
     }
 
     #[inline]

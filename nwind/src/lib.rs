@@ -54,6 +54,8 @@ extern crate thread_local_reentrant;
 #[macro_use]
 mod elf;
 
+mod macho;
+
 mod address_space;
 pub mod arch;
 mod arm_extab;
