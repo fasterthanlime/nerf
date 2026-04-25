@@ -92,17 +92,21 @@ mod addr2line {
 }
 
 fn strip_isra( string: &str ) -> &str {
-    let mut bytes = string.as_bytes();
-    while bytes.last().map( |&byte| byte >= b'0' && byte <= b'9' ).unwrap_or( false ) {
-        bytes = &bytes[ ..bytes.len() - 1 ];
+    // Strip a trailing `.isra.<digits>` suffix (a GCC IPA-SRA marker that
+    // `cpp_demangle` doesn't accept) — but only if it's actually present.
+    // The previous implementation stripped trailing digits first and then
+    // checked for `.isra.`, which silently mutilated any symbol that just
+    // happened to end in a digit (e.g. Rust v0 names like `…from_utf8`).
+    let bytes = string.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[ end - 1 ] >= b'0' && bytes[ end - 1 ] <= b'9' {
+        end -= 1;
     }
-    if bytes.ends_with( b".isra." ) {
-        bytes = &bytes[ ..bytes.len() - b".isra.".len() ];
+    let suffix = b".isra.";
+    if end >= suffix.len() && end < bytes.len() && &bytes[ end - suffix.len()..end ] == suffix {
+        return unsafe { str::from_utf8_unchecked( &bytes[ ..end - suffix.len() ] ) };
     }
-
-    unsafe {
-        str::from_utf8_unchecked( bytes )
-    }
+    string
 }
 
 fn strip_global( string: &str ) -> Option< &str > {
@@ -119,6 +123,16 @@ fn test_strip_isra() {
     let expected = "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag";
 
     assert_eq!( strip_isra( symbol ), expected );
+
+    // Symbols that simply end in a digit must be left untouched; only an
+    // actual `.isra.<digits>` suffix is meaningful here.
+    assert_eq!(
+        strip_isra( "_RNvNtNtCsgEmfK2I1SDS_4core3str8converts9from_utf8" ),
+        "_RNvNtNtCsgEmfK2I1SDS_4core3str8converts9from_utf8"
+    );
+    assert_eq!( strip_isra( "foo123" ), "foo123" );
+    assert_eq!( strip_isra( "foo.isra." ), "foo.isra." );
+    assert_eq!( strip_isra( "foo.isra.0" ), "foo" );
 }
 
 #[test]
@@ -308,7 +322,15 @@ fn test_demangle() {
         demangle( "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag.isra.90" ).unwrap(),
         "void std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_construct<char*>(char*, char*, std::forward_iterator_tag)"
     );
+
+    // Rust v0 mangling. rustc-demangle 0.1.21+ supports it; the current
+    // pick_symbol heuristics do not.
+    assert_eq!(
+        demangle( "_RNvNtNtCsgEmfK2I1SDS_4core3str8converts9from_utf8" ).unwrap(),
+        "core::str::converts::from_utf8"
+    );
 }
+
 
 struct SymbolDecodeCache {
     cache: Option< LruCache< u64, (String, Option< String >) > >
