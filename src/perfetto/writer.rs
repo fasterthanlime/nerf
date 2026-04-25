@@ -97,11 +97,23 @@ pub fn write_trace<W: Write>(
     // ProcessDescriptor (own packet, gives the timeline a labelled track).
     write_process_descriptor(w, process_pid, process_name)?;
 
-    // Build the InternedData payload once; we'll attach it to the first
-    // sample's TracePacket. Perfetto's stack-profile parser only finds
-    // interned ids in the same packet sequence's incremental state, and
-    // sequencing it with the first user packet (rather than as a standalone
-    // bootstrap packet) matches the structure traced_perf actually emits.
+    // Standalone CLEARED packet on the sample sequence. This matches the
+    // working `callstack_sampling.pftrace` shape: it puts CLEARED on a
+    // packet with no InternedData, then InternedData arrives on the
+    // first NEEDS_INCREMENTAL_STATE packet. Putting CLEARED + InternedData
+    // on the same packet doesn't reliably populate interned_data_ for
+    // subsequent lookups in trace_processor v54.
+    write_message(w, FIELD_TRACE_PACKET, |buf| {
+        write_uint64(buf, tp::TIMESTAMP, anchor_ns)?;
+        write_uint32(buf, tp::TRUSTED_PACKET_SEQUENCE_ID, SEQUENCE_ID)?;
+        write_uint64(buf, tp::SEQUENCE_FLAGS, SEQ_FLAG_INCREMENTAL_STATE_CLEARED)?;
+        write_uint64(buf, tp::FIRST_PACKET_ON_SEQUENCE, 1)?;
+        Ok(())
+    })?;
+
+    // Build the InternedData payload once; we attach it to the first sample's
+    // TracePacket (with NEEDS_INCREMENTAL_STATE only) -- by that point CLEARED
+    // has already established the incremental-state generation.
     let interned_payload = interner.encode_interned_data()?;
 
     for (idx, (tid, pid, sample, cs_iid)) in sample_streams.iter().enumerate() {
@@ -109,22 +121,14 @@ pub fn write_trace<W: Write>(
         write_message(w, FIELD_TRACE_PACKET, |buf| {
             write_uint64(buf, tp::TIMESTAMP, sample.timestamp_ns)?;
             write_uint32(buf, tp::TRUSTED_PACKET_SEQUENCE_ID, SEQUENCE_ID)?;
-            // First packet on the sample sequence: clear + needs incremental
-            // state, plus the global InternedData. Subsequent packets just
-            // need to declare they consume incremental state.
-            let flags = if is_first {
-                SEQ_FLAG_INCREMENTAL_STATE_CLEARED | SEQ_FLAG_NEEDS_INCREMENTAL_STATE
-            } else {
-                SEQ_FLAG_NEEDS_INCREMENTAL_STATE
-            };
-            write_uint64(buf, tp::SEQUENCE_FLAGS, flags)?;
+            write_uint64(buf, tp::SEQUENCE_FLAGS, SEQ_FLAG_NEEDS_INCREMENTAL_STATE)?;
+            // Attach the global InternedData to the first sample's
+            // packet only -- subsequent samples inherit it via
+            // NEEDS_INCREMENTAL_STATE on the same sequence.
             if is_first {
-                write_uint64(buf, tp::FIRST_PACKET_ON_SEQUENCE, 1)?;
                 write_bytes(buf, tp::INTERNED_DATA, &interned_payload)?;
             }
             write_message(buf, tp::PERF_SAMPLE, |ps| {
-                // PerfSample: cpu=1, pid=2, tid=3, callstack_iid=4,
-                // cpu_mode=5, timebase_count=6.
                 write_uint32(ps, 1, 0)?;
                 write_uint32(ps, 2, *pid)?;
                 write_uint32(ps, 3, *tid)?;
@@ -332,12 +336,18 @@ impl Interner {
             })?;
         }
 
-        // callstacks
+        // callstacks. `frame_ids` is `repeated uint64` in a proto2 schema,
+        // which defaults to NON-PACKED -- emit each id as its own field-2
+        // entry. Perfetto's parser doesn't accept packed for this field;
+        // sending packed silently broke iid lookup with no schema-level
+        // error reported.
         for (idx, frame_ids) in self.callstack_order.iter().enumerate() {
             let cs_iid = (idx as u64) + 1;
             write_message(&mut out, 7 /* callstacks */, |c| {
                 write_uint64(c, 1 /* iid */, cs_iid)?;
-                write_packed_uint64(c, 2 /* frame_ids */, frame_ids)?;
+                for &fid in frame_ids {
+                    write_uint64(c, 2 /* frame_ids */, fid)?;
+                }
                 Ok(())
             })?;
         }
