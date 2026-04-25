@@ -107,9 +107,41 @@ Mac records, analysis pipeline reads the result.
 
 Stop and review before M3.
 
-## M3 — Hybrid: offline mode on mac
+## M3a — Child-launch + preload-dylib + JIT auto-discovery
 
-Raw-stack capture for deferred unwinding.
+Brings up the `nperf record --process <cmd>` path on macOS so that:
+
+- We can spawn a target with `DYLD_INSERT_LIBRARIES` pointing at our
+  preload dylib, which Mach-IPC's its task port back to us. This is
+  symmetric with samply's existing flow.
+- The preload dylib's hooked `open()` / `fopen()` reports
+  `jit-<pid>.dump` paths back over the same channel, so JIT runtimes
+  (Cranelift / wasmtime / V8 / JVM) get auto-discovered without the
+  user having to pass `--jitdump <path>` to `collate`.
+
+Steps:
+
+1. Build pipeline: `nerf-mac-capture/build.rs` invokes `cargo build`
+   on `nerf-mac-preload` for the host target, gzips the resulting
+   cdylib, places the bytes in `$OUT_DIR/libnerf_mac_preload.dylib.gz`.
+   `nerf-mac-capture` then `include_bytes!`s the blob and drops it to
+   a tempfile at runtime. (Multi-arch / `lipo` come later; host-only
+   for v1.)
+2. Vendor + strip `samply/src/mac/process_launcher.rs` into
+   `nerf-mac-capture/src/process_launcher.rs`. Replace
+   `crate::shared::ctrl_c::CtrlC` with a small inline equivalent.
+   Drop the `__XPC_*` env-var double-set unless we actually need it.
+3. Surface `JitdumpPath` events on `SampleSink`. The on-disk
+   embedding of the jitdump file (so `collate` can find it without
+   `--jitdump`) goes via a `FileBlob` packet keyed off the path.
+4. Teach `cmd_collate` to recognise embedded jitdump `FileBlob`s
+   (alternative path to the existing `--jitdump` flag).
+5. Wire `cmd_record_mac.rs` to dispatch `--process` to a new
+   child-launch path that uses `TaskLauncher` + `TaskAccepter`.
+
+## M3b — Hybrid: offline mode on mac
+
+Raw-stack capture for deferred unwinding. Independent of M3a.
 
 - Capture raw stack pages via `mach_vm_read_overwrite` (SP region, ~256 KiB)
   plus `ARM_THREAD_STATE64` / `x86_THREAD_STATE64` registers. Emit

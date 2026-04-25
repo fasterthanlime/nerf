@@ -22,6 +22,7 @@ pub mod dyld_bindings;
 pub mod error;
 pub mod kernel_error;
 pub mod mach_ipc;
+pub mod preload;
 pub mod proc_maps;
 pub mod recorder;
 pub mod sample_sink;
