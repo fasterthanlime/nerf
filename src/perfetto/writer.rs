@@ -14,7 +14,11 @@ mod tp {
     pub const PROCESS_DESCRIPTOR: u32 = 43;
     pub const THREAD_DESCRIPTOR: u32 = 44;
     pub const FIRST_PACKET_ON_SEQUENCE: u32 = 87;
-    pub const STREAMING_PROFILE_PACKET: u32 = 91;
+    /// Field 54 in the current Perfetto trace_packet.proto. (Earlier I
+    /// guessed 91 -- that turned out to be an Android-only field, which
+    /// is why ui.perfetto.dev reported `energy_descriptor_invalid` /
+    /// `entity_state_residency_lookup_failed` errors per sample.)
+    pub const STREAMING_PROFILE_PACKET: u32 = 54;
 }
 
 /// `Trace.packet` field number.
