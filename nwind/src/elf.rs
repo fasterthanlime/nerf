@@ -1,349 +1,563 @@
+//! Thin ELF parser that the rest of nwind layers on top of `byteorder`.
+//!
+//! `binary.rs` and `symbols.rs` care about a small subset of the ELF
+//! format: section/program headers, symbol tables, the gnu build-id note,
+//! and a few well-known section names. We collapse 32-bit and 64-bit
+//! headers into a single `SectionHeader`/`ProgramHeader`/`Sym` type
+//! (with everything widened to `u64`) and expose two parsers that yield
+//! the same `Elf` trait — same shape we used to get out of `goblin`.
+//!
+//! `byteorder` is used directly because input slices (e.g. `include_bytes!`
+//! in tests) aren't guaranteed to be 8-byte aligned, which rules out the
+//! `object::pod::from_bytes` fast-cast path.
+//!
+//! ELF constants come from the `object::elf` module.
+
 use std::ops::Range;
 
-use scroll;
-use scroll::ctx::TryFromCtx;
-use goblin::elf::header::{EI_DATA, EI_CLASS, ELFDATA2LSB, ELFDATA2MSB, ELFCLASS32, ELFCLASS64, SIZEOF_IDENT};
-use goblin::elf::section_header::SHT_STRTAB;
-use goblin::elf32::header::Header as Header32;
-use goblin::elf64::header::Header as Header64;
-use goblin::elf32::section_header::SectionHeader as SectionHeader32;
-use goblin::elf64::section_header::SectionHeader as SectionHeader64;
-use goblin::elf32::program_header::ProgramHeader as ProgramHeader32;
-use goblin::elf64::program_header::ProgramHeader as ProgramHeader64;
-use goblin::elf32::sym::Sym as Sym32;
-use goblin::elf64::sym::Sym as Sym64;
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
+use object::elf::{
+    self, ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, SHT_STRTAB,
+};
 
-pub use scroll::Endian;
-pub use goblin::elf::header::Header;
-pub use goblin::elf::section_header::SectionHeader;
-pub use goblin::elf::program_header::ProgramHeader;
-pub use goblin::elf::sym::Sym;
-pub use goblin::elf::note::Note;
-pub use goblin::strtab::Strtab;
-
-pub trait Elf< 'a > {
-    type SectionHeaderIter: Iterator< Item = SectionHeader >;
-    type ProgramHeaderIter: Iterator< Item = ProgramHeader >;
-
-    fn is_64_bit( &self ) -> bool;
-    fn endianness( &self ) -> Endian;
-    fn header( &self ) -> &Header;
-    fn section_headers( &self ) -> Self::SectionHeaderIter;
-    fn program_headers( &self ) -> Self::ProgramHeaderIter;
-    fn get_section_header( &self, index: usize ) -> Option< SectionHeader >;
-    fn get_section_body( &self, section_header: &SectionHeader ) -> &'a [u8];
-    fn get_section_body_range( &self, section_header: &SectionHeader ) -> Range< u64 >;
-    fn get_strtab( &self, section_header: &SectionHeader ) -> Option< Strtab< 'a > >;
-    fn parse_note( &self, data: &'a [u8] ) -> Option< Note< 'a > >;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Endian {
+    Little,
+    Big,
 }
 
-macro_rules! define_elf {
-    ($name:ident, $section_header_iter:ident, $program_header_iter:ident, $is_64:expr) => {
-        pub struct $name< 'a > {
-            bytes: &'a [u8],
-            header: Header,
-            endianness: Endian
-        }
+#[allow(dead_code)] // every field is parsed for completeness; only some are read.
+#[derive(Debug)]
+pub struct Header {
+    pub e_ident: [u8; 16],
+    pub e_type: u16,
+    pub e_machine: u16,
+    pub e_version: u32,
+    pub e_entry: u64,
+    pub e_phoff: u64,
+    pub e_shoff: u64,
+    pub e_flags: u32,
+    pub e_ehsize: u16,
+    pub e_phentsize: u16,
+    pub e_phnum: u16,
+    pub e_shentsize: u16,
+    pub e_shnum: u16,
+    pub e_shstrndx: u16,
+}
 
-        impl< 'a > Elf< 'a > for $name< 'a > {
-            type SectionHeaderIter = $section_header_iter< 'a >;
-            type ProgramHeaderIter = $program_header_iter< 'a >;
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct SectionHeader {
+    pub sh_name: usize,
+    pub sh_type: u32,
+    pub sh_flags: u64,
+    pub sh_addr: u64,
+    pub sh_offset: u64,
+    pub sh_size: u64,
+    pub sh_link: u32,
+    pub sh_info: u32,
+    pub sh_addralign: u64,
+    pub sh_entsize: u64,
+}
 
-            #[inline]
-            fn is_64_bit( &self ) -> bool {
-                $is_64
-            }
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct ProgramHeader {
+    pub p_type: u32,
+    pub p_flags: u32,
+    pub p_offset: u64,
+    pub p_vaddr: u64,
+    pub p_paddr: u64,
+    pub p_filesz: u64,
+    pub p_memsz: u64,
+    pub p_align: u64,
+}
 
-            #[inline]
-            fn endianness( &self ) -> Endian {
-                self.endianness
-            }
-
-            #[inline]
-            fn header( &self ) -> &Header {
-                &self.header
-            }
-
-            #[inline]
-            fn section_headers( &self ) -> Self::SectionHeaderIter {
-                let header = &self.header;
-                let bytes = &self.bytes[ header.e_shoff as usize..header.e_shoff as usize + (header.e_shnum as usize * header.e_shentsize as usize) ];
-
-                Self::SectionHeaderIter::new( bytes, self.endianness )
-            }
-
-            #[inline]
-            fn program_headers( &self ) -> Self::ProgramHeaderIter {
-                let header = &self.header;
-                let bytes = &self.bytes[ header.e_phoff as usize..header.e_phoff as usize + (header.e_phnum as usize * header.e_phentsize as usize) ];
-
-                Self::ProgramHeaderIter::new( bytes, self.endianness )
-            }
-
-            #[inline]
-            fn get_section_header( &self, index: usize ) -> Option< SectionHeader > {
-                let header = &self.header;
-                let start = header.e_shoff as usize + (index * header.e_shentsize as usize);
-                let end = header.e_shoff as usize + (header.e_shnum as usize * header.e_shentsize as usize);
-                if start >= end {
-                    return None;
-                }
-
-                let bytes = &self.bytes[ start..end ];
-                Self::SectionHeaderIter::new( bytes, self.endianness ).next()
-            }
-
-            #[inline]
-            fn get_section_body( &self, section_header: &SectionHeader ) -> &'a [u8] {
-                &self.bytes[ section_header.sh_offset as usize..section_header.sh_offset as usize + section_header.sh_size as usize ]
-            }
-
-            #[inline]
-            fn get_section_body_range( &self, section_header: &SectionHeader ) -> Range< u64 > {
-                section_header.sh_offset as u64..section_header.sh_offset as u64 + section_header.sh_size as u64
-            }
-
-            #[inline]
-            fn get_strtab( &self, section_header: &SectionHeader ) -> Option< Strtab< 'a > > {
-                if section_header.sh_type as u32 != SHT_STRTAB {
-                    return None;
-                }
-
-                let bytes = self.get_section_body( &section_header );
-                let strtab = Strtab::new( bytes, 0x0 );
-
-                Some( strtab )
-            }
-
-            #[inline]
-            fn parse_note( &self, data: &'a [u8] ) -> Option< Note< 'a > > {
-                use goblin::container::Ctx;
-                use goblin::container::Container;
-
-                let ctx = Ctx {
-                    container: if self.is_64_bit() { Container::Big } else { Container::Little },
-                    le: self.endianness
-                };
-
-                let (value, _) = TryFromCtx::try_from_ctx( data, (4, ctx) ).ok()?;
-                Some( value )
-            }
-        }
+impl ProgramHeader {
+    #[inline]
+    pub fn is_read(&self) -> bool {
+        self.p_flags & elf::PF_R != 0
+    }
+    #[inline]
+    pub fn is_write(&self) -> bool {
+        self.p_flags & elf::PF_W != 0
+    }
+    #[inline]
+    pub fn is_executable(&self) -> bool {
+        self.p_flags & elf::PF_X != 0
     }
 }
 
-define_elf!( Elf32, Elf32SectionHeaderIter, Elf32ProgramHeaderIter, false );
-define_elf!( Elf64, Elf64SectionHeaderIter, Elf64ProgramHeaderIter, true );
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Sym {
+    pub st_name: usize,
+    pub st_info: u8,
+    pub st_other: u8,
+    pub st_shndx: usize,
+    pub st_value: u64,
+    pub st_size: u64,
+}
 
-macro_rules! define_iter {
-    ($name:ident, $output_ty:ty, $converter:expr) => {
-        pub struct $name< 'a > {
-            bytes: &'a [u8],
-            position: usize,
-            endianness: Endian
-        }
-
-        impl< 'a > Iterator for $name< 'a > {
-            type Item = $output_ty;
-
-            #[inline]
-            fn next( &mut self ) -> Option< Self::Item > {
-                let (value, next_position) = TryFromCtx::try_from_ctx( &self.bytes[ self.position.. ], self.endianness ).ok()?;
-                self.position += next_position;
-                Some( $converter( value ) )
-            }
-        }
-
-        impl< 'a > $name< 'a > {
-            #[inline]
-            pub fn new( bytes: &'a [u8], endianness: Endian ) -> Self {
-                $name {
-                    bytes,
-                    position: 0,
-                    endianness
-                }
-            }
-        }
+impl Sym {
+    /// Mirrors goblin's `Sym::is_function` — STT_FUNC in the lower 4 bits.
+    #[inline]
+    pub fn is_function(&self) -> bool {
+        (self.st_info & 0x0f) == elf::STT_FUNC
     }
 }
 
-define_iter! {
-    Elf32SectionHeaderIter, SectionHeader, |header: SectionHeader32| {
-        SectionHeader {
-            sh_name: header.sh_name as usize,
-            sh_type: header.sh_type,
-            sh_flags: header.sh_flags as u64,
-            sh_addr: header.sh_addr as u64,
-            sh_offset: header.sh_offset as u64,
-            sh_size: header.sh_size as u64,
-            sh_link: header.sh_link,
-            sh_info: header.sh_info,
-            sh_addralign: header.sh_addralign as u64,
-            sh_entsize: header.sh_entsize as u64
+/// Thin string-table view over the bytes of a SHT_STRTAB section.
+#[derive(Clone, Copy)]
+pub struct Strtab<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Strtab<'a> {
+    #[inline]
+    pub fn new(bytes: &'a [u8], _: u8) -> Self {
+        Strtab { bytes }
+    }
+
+    #[inline]
+    pub fn get(&self, offset: usize) -> Option<Result<&'a str, std::str::Utf8Error>> {
+        if offset >= self.bytes.len() {
+            return None;
         }
+        let tail = &self.bytes[offset..];
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        Some(std::str::from_utf8(&tail[..end]))
     }
 }
 
-define_iter! {
-    Elf64SectionHeaderIter, SectionHeader, |header: SectionHeader64| {
-        SectionHeader {
-            sh_name: header.sh_name as usize,
-            sh_type: header.sh_type,
-            sh_flags: header.sh_flags,
-            sh_addr: header.sh_addr,
-            sh_offset: header.sh_offset,
-            sh_size: header.sh_size,
-            sh_link: header.sh_link,
-            sh_info: header.sh_info,
-            sh_addralign: header.sh_addralign,
-            sh_entsize: header.sh_entsize
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Note<'a> {
+    pub name: &'a [u8],
+    pub n_type: u32,
+    pub desc: &'a [u8],
+}
+
+pub trait Elf<'a> {
+    type SectionHeaderIter: Iterator<Item = SectionHeader>;
+    type ProgramHeaderIter: Iterator<Item = ProgramHeader>;
+
+    fn is_64_bit(&self) -> bool;
+    fn endianness(&self) -> Endian;
+    fn header(&self) -> &Header;
+    fn section_headers(&self) -> Self::SectionHeaderIter;
+    fn program_headers(&self) -> Self::ProgramHeaderIter;
+    fn get_section_header(&self, index: usize) -> Option<SectionHeader>;
+    fn get_section_body(&self, header: &SectionHeader) -> &'a [u8];
+    fn get_section_body_range(&self, header: &SectionHeader) -> Range<u64>;
+    fn get_strtab(&self, header: &SectionHeader) -> Option<Strtab<'a>>;
+    fn parse_note(&self, data: &'a [u8]) -> Option<Note<'a>>;
+}
+
+pub struct ElfImpl<'a> {
+    bytes: &'a [u8],
+    header: Header,
+    endianness: Endian,
+    is_64: bool,
+}
+
+impl<'a> Elf<'a> for ElfImpl<'a> {
+    type SectionHeaderIter = SectionHeaderIter<'a>;
+    type ProgramHeaderIter = ProgramHeaderIter<'a>;
+
+    #[inline]
+    fn is_64_bit(&self) -> bool {
+        self.is_64
+    }
+
+    #[inline]
+    fn endianness(&self) -> Endian {
+        self.endianness
+    }
+
+    #[inline]
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    #[inline]
+    fn section_headers(&self) -> Self::SectionHeaderIter {
+        let header = &self.header;
+        SectionHeaderIter {
+            bytes: self.bytes,
+            offset: header.e_shoff as usize,
+            stride: header.e_shentsize as usize,
+            remaining: header.e_shnum as usize,
+            endianness: self.endianness,
+            is_64: self.is_64,
         }
     }
-}
 
-define_iter! {
-    Elf32ProgramHeaderIter, ProgramHeader, |header: ProgramHeader32| {
-        ProgramHeader {
-            p_type: header.p_type,
-            p_flags: header.p_flags,
-            p_offset: header.p_offset as u64,
-            p_vaddr: header.p_vaddr as u64,
-            p_paddr: header.p_paddr as u64,
-            p_filesz: header.p_filesz as u64,
-            p_memsz: header.p_memsz as u64,
-            p_align: header.p_align as u64
+    #[inline]
+    fn program_headers(&self) -> Self::ProgramHeaderIter {
+        let header = &self.header;
+        ProgramHeaderIter {
+            bytes: self.bytes,
+            offset: header.e_phoff as usize,
+            stride: header.e_phentsize as usize,
+            remaining: header.e_phnum as usize,
+            endianness: self.endianness,
+            is_64: self.is_64,
         }
     }
-}
 
-define_iter! {
-    Elf64ProgramHeaderIter, ProgramHeader, |header: ProgramHeader64| {
-        ProgramHeader {
-            p_type: header.p_type,
-            p_flags: header.p_flags,
-            p_offset: header.p_offset,
-            p_vaddr: header.p_vaddr,
-            p_paddr: header.p_paddr,
-            p_filesz: header.p_filesz,
-            p_memsz: header.p_memsz,
-            p_align: header.p_align
+    #[inline]
+    fn get_section_header(&self, index: usize) -> Option<SectionHeader> {
+        let header = &self.header;
+        if index >= header.e_shnum as usize {
+            return None;
         }
+        let offset = header.e_shoff as usize + index * header.e_shentsize as usize;
+        read_section_header(self.bytes, offset, self.endianness, self.is_64)
     }
-}
 
-define_iter! {
-    Elf32SymIter, Sym, |sym: Sym32| {
-        Sym {
-            st_name: sym.st_name as usize,
-            st_info: sym.st_info,
-            st_other: sym.st_other,
-            st_shndx: sym.st_shndx as usize,
-            st_value: sym.st_value as u64,
-            st_size: sym.st_size as u64
-        }
+    #[inline]
+    fn get_section_body(&self, header: &SectionHeader) -> &'a [u8] {
+        let start = header.sh_offset as usize;
+        let end = start + header.sh_size as usize;
+        &self.bytes[start..end]
     }
-}
 
-define_iter! {
-    Elf64SymIter, Sym, |sym: Sym64| {
-        Sym {
-            st_name: sym.st_name as usize,
-            st_info: sym.st_info,
-            st_other: sym.st_other,
-            st_shndx: sym.st_shndx as usize,
-            st_value: sym.st_value,
-            st_size: sym.st_size
-        }
+    #[inline]
+    fn get_section_body_range(&self, header: &SectionHeader) -> Range<u64> {
+        header.sh_offset..header.sh_offset + header.sh_size
     }
-}
 
-macro_rules! parse_elf {
-    ($elf:expr, $callback:expr) => {{
-        use elf::{Elf, ElfKind, call_callback};
-
-        match $elf {
-            ElfKind::Elf32( elf ) => call_callback( elf, $callback ),
-            ElfKind::Elf64( elf ) => call_callback( elf, $callback )
+    #[inline]
+    fn get_strtab(&self, header: &SectionHeader) -> Option<Strtab<'a>> {
+        if header.sh_type != SHT_STRTAB {
+            return None;
         }
-    }}
-}
+        Some(Strtab::new(self.get_section_body(header), 0))
+    }
 
-pub enum ElfKind< 'a > {
-    Elf32( Elf32< 'a > ),
-    Elf64( Elf64< 'a > )
+    fn parse_note(&self, data: &'a [u8]) -> Option<Note<'a>> {
+        // Layout:
+        //   u32 namesz, u32 descsz, u32 type, name[namesz padded], desc[descsz padded]
+        // The header words are 4-byte aligned regardless of class; padding
+        // is to 4 bytes for 32-bit and to 4 bytes in the wild for 64-bit
+        // build-id notes too.
+        if data.len() < 12 {
+            return None;
+        }
+        let mut cur = data;
+        let namesz = read_u32(&mut cur, self.endianness)? as usize;
+        let descsz = read_u32(&mut cur, self.endianness)? as usize;
+        let n_type = read_u32(&mut cur, self.endianness)?;
+        let header_len: usize = 12;
+
+        let name_start = header_len;
+        let name_end = name_start.checked_add(namesz)?;
+        let name = data.get(name_start..name_end)?;
+        let name = name.split(|&b| b == 0).next()?;
+
+        let aligned_namesz = align_up(namesz, 4);
+        let desc_start = header_len.checked_add(aligned_namesz)?;
+        let desc_end = desc_start.checked_add(descsz)?;
+        let desc = data.get(desc_start..desc_end)?;
+
+        Some(Note { name, n_type, desc })
+    }
 }
 
 #[inline]
-pub fn call_callback< 'a, R, E: Elf< 'a >, F: FnOnce( E ) -> R >( elf: E, callback: F ) -> R {
-    callback( elf )
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
 }
 
-pub fn parse< 'a >( bytes: &'a [u8] ) -> Result< ElfKind< 'a >, &'static str > {
-    if bytes.len() < SIZEOF_IDENT {
-        return Err( "not an ELF file" );
-    }
+#[inline]
+fn read_u16(bytes: &mut &[u8], endian: Endian) -> Option<u16> {
+    Some(match endian {
+        Endian::Little => bytes.read_u16::<LittleEndian>().ok()?,
+        Endian::Big => bytes.read_u16::<BigEndian>().ok()?,
+    })
+}
 
-    let endianness =
-        match bytes[ EI_DATA ] {
-            ELFDATA2LSB => scroll::LE,
-            ELFDATA2MSB => scroll::BE,
-            _ => return Err( "invalid endianness" )
+#[inline]
+fn read_u32(bytes: &mut &[u8], endian: Endian) -> Option<u32> {
+    Some(match endian {
+        Endian::Little => bytes.read_u32::<LittleEndian>().ok()?,
+        Endian::Big => bytes.read_u32::<BigEndian>().ok()?,
+    })
+}
+
+#[inline]
+fn read_u64(bytes: &mut &[u8], endian: Endian) -> Option<u64> {
+    Some(match endian {
+        Endian::Little => bytes.read_u64::<LittleEndian>().ok()?,
+        Endian::Big => bytes.read_u64::<BigEndian>().ok()?,
+    })
+}
+
+#[inline]
+fn read_u8(bytes: &mut &[u8]) -> Option<u8> {
+    bytes.read_u8().ok()
+}
+
+fn read_section_header(
+    src: &[u8],
+    offset: usize,
+    endian: Endian,
+    is_64: bool,
+) -> Option<SectionHeader> {
+    let len = if is_64 { 64 } else { 40 };
+    let mut buf = src.get(offset..offset + len)?;
+    if is_64 {
+        let sh_name = read_u32(&mut buf, endian)? as usize;
+        let sh_type = read_u32(&mut buf, endian)?;
+        let sh_flags = read_u64(&mut buf, endian)?;
+        let sh_addr = read_u64(&mut buf, endian)?;
+        let sh_offset = read_u64(&mut buf, endian)?;
+        let sh_size = read_u64(&mut buf, endian)?;
+        let sh_link = read_u32(&mut buf, endian)?;
+        let sh_info = read_u32(&mut buf, endian)?;
+        let sh_addralign = read_u64(&mut buf, endian)?;
+        let sh_entsize = read_u64(&mut buf, endian)?;
+        Some(SectionHeader {
+            sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
+            sh_link, sh_info, sh_addralign, sh_entsize,
+        })
+    } else {
+        let sh_name = read_u32(&mut buf, endian)? as usize;
+        let sh_type = read_u32(&mut buf, endian)?;
+        let sh_flags = read_u32(&mut buf, endian)? as u64;
+        let sh_addr = read_u32(&mut buf, endian)? as u64;
+        let sh_offset = read_u32(&mut buf, endian)? as u64;
+        let sh_size = read_u32(&mut buf, endian)? as u64;
+        let sh_link = read_u32(&mut buf, endian)?;
+        let sh_info = read_u32(&mut buf, endian)?;
+        let sh_addralign = read_u32(&mut buf, endian)? as u64;
+        let sh_entsize = read_u32(&mut buf, endian)? as u64;
+        Some(SectionHeader {
+            sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
+            sh_link, sh_info, sh_addralign, sh_entsize,
+        })
+    }
+}
+
+fn read_program_header(
+    src: &[u8],
+    offset: usize,
+    endian: Endian,
+    is_64: bool,
+) -> Option<ProgramHeader> {
+    let len = if is_64 { 56 } else { 32 };
+    let mut buf = src.get(offset..offset + len)?;
+    if is_64 {
+        // 64-bit Elf64_Phdr layout: type, flags, offset, vaddr, paddr,
+        // filesz, memsz, align.
+        let p_type = read_u32(&mut buf, endian)?;
+        let p_flags = read_u32(&mut buf, endian)?;
+        let p_offset = read_u64(&mut buf, endian)?;
+        let p_vaddr = read_u64(&mut buf, endian)?;
+        let p_paddr = read_u64(&mut buf, endian)?;
+        let p_filesz = read_u64(&mut buf, endian)?;
+        let p_memsz = read_u64(&mut buf, endian)?;
+        let p_align = read_u64(&mut buf, endian)?;
+        Some(ProgramHeader {
+            p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align,
+        })
+    } else {
+        // 32-bit Elf32_Phdr layout: type, offset, vaddr, paddr, filesz,
+        // memsz, flags, align — note `flags` moved.
+        let p_type = read_u32(&mut buf, endian)?;
+        let p_offset = read_u32(&mut buf, endian)? as u64;
+        let p_vaddr = read_u32(&mut buf, endian)? as u64;
+        let p_paddr = read_u32(&mut buf, endian)? as u64;
+        let p_filesz = read_u32(&mut buf, endian)? as u64;
+        let p_memsz = read_u32(&mut buf, endian)? as u64;
+        let p_flags = read_u32(&mut buf, endian)?;
+        let p_align = read_u32(&mut buf, endian)? as u64;
+        Some(ProgramHeader {
+            p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align,
+        })
+    }
+}
+
+pub struct SectionHeaderIter<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    stride: usize,
+    remaining: usize,
+    endianness: Endian,
+    is_64: bool,
+}
+
+impl<'a> Iterator for SectionHeaderIter<'a> {
+    type Item = SectionHeader;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let header = read_section_header(self.bytes, self.offset, self.endianness, self.is_64)?;
+        self.offset += self.stride;
+        self.remaining -= 1;
+        Some(header)
+    }
+}
+
+pub struct ProgramHeaderIter<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    stride: usize,
+    remaining: usize,
+    endianness: Endian,
+    is_64: bool,
+}
+
+impl<'a> Iterator for ProgramHeaderIter<'a> {
+    type Item = ProgramHeader;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let header = read_program_header(self.bytes, self.offset, self.endianness, self.is_64)?;
+        self.offset += self.stride;
+        self.remaining -= 1;
+        Some(header)
+    }
+}
+
+pub struct Elf32SymIter<'a> {
+    bytes: &'a [u8],
+    endianness: Endian,
+}
+
+impl<'a> Elf32SymIter<'a> {
+    #[inline]
+    pub fn new(bytes: &'a [u8], endianness: Endian) -> Self {
+        Elf32SymIter { bytes, endianness }
+    }
+}
+
+impl<'a> Iterator for Elf32SymIter<'a> {
+    type Item = Sym;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bytes.len() < 16 {
+            return None;
+        }
+        let mut buf = &self.bytes[..16];
+        let st_name = read_u32(&mut buf, self.endianness)? as usize;
+        let st_value = read_u32(&mut buf, self.endianness)? as u64;
+        let st_size = read_u32(&mut buf, self.endianness)? as u64;
+        let st_info = read_u8(&mut buf)?;
+        let st_other = read_u8(&mut buf)?;
+        let st_shndx = read_u16(&mut buf, self.endianness)? as usize;
+        self.bytes = &self.bytes[16..];
+        Some(Sym { st_name, st_info, st_other, st_shndx, st_value, st_size })
+    }
+}
+
+pub struct Elf64SymIter<'a> {
+    bytes: &'a [u8],
+    endianness: Endian,
+}
+
+impl<'a> Elf64SymIter<'a> {
+    #[inline]
+    pub fn new(bytes: &'a [u8], endianness: Endian) -> Self {
+        Elf64SymIter { bytes, endianness }
+    }
+}
+
+impl<'a> Iterator for Elf64SymIter<'a> {
+    type Item = Sym;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bytes.len() < 24 {
+            return None;
+        }
+        let mut buf = &self.bytes[..24];
+        let st_name = read_u32(&mut buf, self.endianness)? as usize;
+        let st_info = read_u8(&mut buf)?;
+        let st_other = read_u8(&mut buf)?;
+        let st_shndx = read_u16(&mut buf, self.endianness)? as usize;
+        let st_value = read_u64(&mut buf, self.endianness)?;
+        let st_size = read_u64(&mut buf, self.endianness)?;
+        self.bytes = &self.bytes[24..];
+        Some(Sym { st_name, st_info, st_other, st_shndx, st_value, st_size })
+    }
+}
+
+pub enum ElfKind<'a> {
+    Elf32(ElfImpl<'a>),
+    Elf64(ElfImpl<'a>),
+}
+
+#[inline]
+pub fn call_callback<'a, R, E: Elf<'a>, F: FnOnce(E) -> R>(elf: E, callback: F) -> R {
+    callback(elf)
+}
+
+const EI_CLASS: usize = 4;
+const EI_DATA: usize = 5;
+
+pub fn parse(bytes: &[u8]) -> Result<ElfKind<'_>, &'static str> {
+    if bytes.len() < 16 {
+        return Err("not an ELF file");
+    }
+    let endianness = match bytes[EI_DATA] {
+        ELFDATA2LSB => Endian::Little,
+        ELFDATA2MSB => Endian::Big,
+        _ => return Err("invalid endianness"),
+    };
+    let is_64 = match bytes[EI_CLASS] {
+        ELFCLASS32 => false,
+        ELFCLASS64 => true,
+        _ => return Err("invalid bitness"),
     };
 
-    let is_64 =
-        match bytes[ EI_CLASS ] {
-            ELFCLASS32 => false,
-            ELFCLASS64 => true,
-            _ => return Err( "invalid bitness" )
-        };
+    // Common header layout: e_ident(16) + e_type(2) + e_machine(2) +
+    // e_version(4), then e_entry/e_phoff/e_shoff which are word-sized.
+    let header_len = if is_64 { 64 } else { 52 };
+    let raw = bytes.get(0..header_len).ok_or("ELF header truncated")?;
+    let mut e_ident = [0u8; 16];
+    e_ident.copy_from_slice(&raw[0..16]);
 
-    if is_64 {
-        let header = Header64::parse( bytes ).map_err( |_| "cannot parse ELF header" )?;
-        let elf = Elf64 {
-            bytes,
-            header: Header {
-                e_ident: header.e_ident,
-                e_type: header.e_type,
-                e_machine: header.e_machine,
-                e_version: header.e_version,
-                e_entry: header.e_entry,
-                e_phoff: header.e_phoff,
-                e_shoff: header.e_shoff,
-                e_flags: header.e_flags,
-                e_ehsize: header.e_ehsize,
-                e_phentsize: header.e_phentsize,
-                e_phnum: header.e_phnum,
-                e_shentsize: header.e_shentsize,
-                e_shnum: header.e_shnum,
-                e_shstrndx: header.e_shstrndx
-            },
-            endianness
-        };
-
-        Ok( ElfKind::Elf64( elf ) )
+    let mut cursor = &raw[16..];
+    let e_type = read_u16(&mut cursor, endianness).ok_or("e_type")?;
+    let e_machine = read_u16(&mut cursor, endianness).ok_or("e_machine")?;
+    let e_version = read_u32(&mut cursor, endianness).ok_or("e_version")?;
+    let (e_entry, e_phoff, e_shoff) = if is_64 {
+        let entry = read_u64(&mut cursor, endianness).ok_or("e_entry")?;
+        let phoff = read_u64(&mut cursor, endianness).ok_or("e_phoff")?;
+        let shoff = read_u64(&mut cursor, endianness).ok_or("e_shoff")?;
+        (entry, phoff, shoff)
     } else {
-        let header = Header32::parse( bytes ).map_err( |_| "cannot parse ELF header" )?;
-        let elf = Elf32 {
-            bytes,
-            header: Header {
-                e_ident: header.e_ident,
-                e_type: header.e_type,
-                e_machine: header.e_machine,
-                e_version: header.e_version,
-                e_entry: header.e_entry as u64,
-                e_phoff: header.e_phoff as u64,
-                e_shoff: header.e_shoff as u64,
-                e_flags: header.e_flags,
-                e_ehsize: header.e_ehsize,
-                e_phentsize: header.e_phentsize,
-                e_phnum: header.e_phnum,
-                e_shentsize: header.e_shentsize,
-                e_shnum: header.e_shnum,
-                e_shstrndx: header.e_shstrndx
-            },
-            endianness
-        };
+        let entry = read_u32(&mut cursor, endianness).ok_or("e_entry")? as u64;
+        let phoff = read_u32(&mut cursor, endianness).ok_or("e_phoff")? as u64;
+        let shoff = read_u32(&mut cursor, endianness).ok_or("e_shoff")? as u64;
+        (entry, phoff, shoff)
+    };
+    let e_flags = read_u32(&mut cursor, endianness).ok_or("e_flags")?;
+    let e_ehsize = read_u16(&mut cursor, endianness).ok_or("e_ehsize")?;
+    let e_phentsize = read_u16(&mut cursor, endianness).ok_or("e_phentsize")?;
+    let e_phnum = read_u16(&mut cursor, endianness).ok_or("e_phnum")?;
+    let e_shentsize = read_u16(&mut cursor, endianness).ok_or("e_shentsize")?;
+    let e_shnum = read_u16(&mut cursor, endianness).ok_or("e_shnum")?;
+    let e_shstrndx = read_u16(&mut cursor, endianness).ok_or("e_shstrndx")?;
 
-        Ok( ElfKind::Elf32( elf ) )
-    }
+    let header = Header {
+        e_ident, e_type, e_machine, e_version, e_entry, e_phoff, e_shoff,
+        e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx,
+    };
+
+    let elf = ElfImpl { bytes, header, endianness, is_64 };
+    Ok(if is_64 { ElfKind::Elf64(elf) } else { ElfKind::Elf32(elf) })
+}
+
+/// `parse_elf!(elf, |inner| { ... })` lets us dispatch over the 32/64
+/// kinds without writing the match by hand at every call site.
+#[macro_export]
+macro_rules! parse_elf {
+    ($elf:expr, $callback:expr) => {{
+        match $elf {
+            $crate::elf::ElfKind::Elf32(inner) => $crate::elf::call_callback(inner, $callback),
+            $crate::elf::ElfKind::Elf64(inner) => $crate::elf::call_callback(inner, $callback),
+        }
+    }};
 }

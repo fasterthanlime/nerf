@@ -9,13 +9,14 @@ use std::sync::Arc;
 use std::fmt;
 
 use memmap2::Mmap;
-use goblin::elf::header as elf_header;
-use goblin::elf::section_header::{SHT_SYMTAB, SHT_DYNSYM, SHT_STRTAB};
-use goblin::elf::program_header::PT_LOAD;
+use object::elf::{
+    self as elf_header,
+    PT_LOAD, SHT_DYNSYM, SHT_STRTAB, SHT_SYMTAB,
+};
 use gimli;
 use speedy::{Readable, Writable};
 
-use crate::elf::{self, Endian};
+use crate::elf::{self, Elf as _, Endian};
 use crate::utils::{HexValue, StableIndex, get_major, get_minor};
 use crate::types::{Inode, Bitness, Endianness};
 
