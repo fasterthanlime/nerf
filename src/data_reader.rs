@@ -28,7 +28,7 @@ use nwind::{
 };
 
 use crate::args::{self, Granularity};
-use crate::archive::{Packet, Inode, Bitness, UserFrame, ArchiveReader};
+use crate::archive::{Packet, Inode, Bitness, UserFrame, ArchiveReader, BinaryFormat};
 use crate::utils::StableIndex;
 use crate::kallsyms::{self, KernelSymbol};
 use crate::interner::{StringId, StringInterner};
@@ -664,7 +664,8 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
             Packet::MemoryRegionMap { .. } => "MemoryRegionMap",
             Packet::MemoryRegionUnmap { .. } => "MemoryRegionUnmap",
             Packet::StringTable { .. } => "StringTable",
-            Packet::SymbolTable { .. } => "SymbolTable",
+            Packet::ElfSymbolTable { .. } => "ElfSymbolTable",
+            Packet::MachOSymbolTable { .. } => "MachOSymbolTable",
             Packet::Sample { .. } => "Sample",
             Packet::RawSample { .. } => "RawSample",
             _ => "other"
@@ -711,13 +712,14 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
                 state.processes.push( process );
                 state.process_index_by_pid.insert( pid, process_index );
             },
-            Packet::BinaryInfo { inode, symbol_table_count, path, debuglink, load_headers, .. } => {
-                let debuglink_length = debuglink.iter().position( |&byte| byte == 0 ).unwrap_or( debuglink.len() );
-                let debuglink = debuglink[ 0..debuglink_length ].to_owned();
-                let debuglink = if debuglink.is_empty() {
-                    None
-                } else {
-                    Some( debuglink )
+            Packet::BinaryInfo { inode, symbol_table_count, path, load_headers, format } => {
+                let debuglink = match &format {
+                    BinaryFormat::Elf { debuglink, .. } => {
+                        let len = debuglink.iter().position( |&byte| byte == 0 ).unwrap_or( debuglink.len() );
+                        let debuglink = debuglink[ 0..len ].to_owned();
+                        if debuglink.is_empty() { None } else { Some( debuglink ) }
+                    },
+                    BinaryFormat::MachO => None
                 };
 
                 let path = String::from_utf8_lossy( &path ).into_owned();
@@ -798,51 +800,16 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
                 process.memory_regions.remove_by_exact_range( range ).expect( "unknown region unmapped" );
                 process.address_space_needs_reload = true;
             },
-            Packet::Deprecated_BinaryMap { pid, inode, base_address } => {
-                let process = match state.process_index_by_pid.get( &pid ).cloned() {
-                    Some( index ) => &mut state.processes[ index ],
-                    None => continue
-                };
-
-                let id = BinaryId::ByInode( inode );
-                let binary = match state.binary_by_id.get( &id ) {
-                    Some( binary ) => binary,
-                    None => {
-                        warn!( "Unknown binary mapped for PID {}: {:?}", pid, id );
-                        continue;
-                    }
-                };
-
-                debug!( "Binary mapped for PID {}: \"{}\" @ 0x{:016X}", pid, binary.path, base_address );
-                process.base_address_for_binary.insert( id, base_address );
-                process.address_space_needs_reload = true;
-            },
-            Packet::Deprecated_BinaryUnmap { pid, inode, .. } => {
-                let process = match state.process_index_by_pid.get( &pid ).cloned() {
-                    Some( index ) => &mut state.processes[ index ],
-                    None => continue
-                };
-
-                let binary_id = BinaryId::ByInode( inode );
-                let binary = match state.binary_by_id.get( &binary_id ) {
-                    Some( binary ) => binary,
-                    None => {
-                        warn!( "Unknown binary unmapped for PID {}: {:?}", pid, binary_id );
-                        continue;
-                    }
-                };
-
-                debug!( "Binary unmapped for PID {}: \"{}\"", pid, binary.path );
-                process.base_address_for_binary.remove( &binary_id );
-                process.address_space_needs_reload = true;
-            },
             Packet::StringTable { inode, offset, data, path } => {
                 let binary_name = String::from_utf8_lossy( &path );
                 let binary_id = to_binary_id( inode, &binary_name );
                 let binary = state.binary_by_id.get_mut( &binary_id ).unwrap();
                 Arc::get_mut( &mut binary.string_tables ).unwrap().add( offset, data.into_owned() );
             },
-            Packet::SymbolTable { inode, offset, data, string_table_offset, is_dynamic, path } => {
+            Packet::MachOSymbolTable { path, .. } => {
+                warn!( "MachOSymbolTable encountered for {:?}; mac analysis not yet implemented, skipping", String::from_utf8_lossy( &path ) );
+            },
+            Packet::ElfSymbolTable { inode, offset, data, string_table_offset, is_dynamic, path } => {
                 let binary_name = String::from_utf8_lossy( &path );
                 let binary_id = to_binary_id( inode, &binary_name );
                 let binary = state.binary_by_id.get_mut( &binary_id ).unwrap();

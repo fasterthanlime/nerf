@@ -29,7 +29,7 @@ use nwind::{
 
 use crate::args::{self, TargetProcess};
 use crate::utils::{SigintHandler, read_string_lossy, get_major, get_minor, get_ms};
-use crate::archive::{FramedPacket, Packet, Inode, Bitness, DwarfReg, ARCHIVE_MAGIC, ARCHIVE_VERSION};
+use crate::archive::{FramedPacket, Packet, Inode, Bitness, DwarfReg, BinaryFormat, Platform, ARCHIVE_MAGIC, ARCHIVE_VERSION};
 use crate::execution_queue::ExecutionQueue;
 use crate::ps::{wait_for_process, find_process};
 use crate::stack_reader::StackReader;
@@ -415,7 +415,8 @@ impl PacketWriter {
             cpu_count: num_cpus::get() as u32,
             endianness: Endianness::NATIVE,
             bitness: Bitness::NATIVE,
-            architecture: arch::native::Arch::NAME.into()
+            architecture: arch::native::Arch::NAME.into(),
+            platform: Platform::Linux
         })
     }
 
@@ -480,10 +481,12 @@ impl PacketWriter {
         self.write_packet( Packet::BinaryInfo {
             inode,
             path: binary.name().as_bytes().into(),
-            is_shared_object: binary.is_shared_object(),
-            debuglink: debuglink.into(),
             symbol_table_count: binary.symbol_tables().len() as u16,
-            load_headers: binary.load_headers().into()
+            load_headers: binary.load_headers().into(),
+            format: BinaryFormat::Elf {
+                is_shared_object: binary.is_shared_object(),
+                debuglink: debuglink.into()
+            }
         })?;
 
         if let Some( build_id ) = binary.build_id() {
@@ -519,7 +522,7 @@ impl PacketWriter {
                     })?;
                 }
 
-                self.write_packet( Packet::SymbolTable {
+                self.write_packet( Packet::ElfSymbolTable {
                     inode,
                     path: binary.name().as_bytes().into(),
                     offset: symbol_table.range.start,

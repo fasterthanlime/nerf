@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde_json;
 
 use nwind::BinaryId;
-use crate::archive::{Packet, ArchiveReader};
+use crate::archive::{Packet, ArchiveReader, BinaryFormat};
 use crate::metadata::{self, Metadata};
 use crate::args;
 
@@ -39,16 +39,21 @@ pub fn generate_metadata( args: args::MetadataArgs ) -> Result< Metadata, Box< d
                     executable: String::from_utf8_lossy( &executable ).into()
                 });
             },
-            Packet::BinaryInfo { inode, path, debuglink, .. } => {
+            Packet::BinaryInfo { inode, path, format, .. } => {
                 let path = String::from_utf8_lossy( &path ).into_owned();
                 let binary_id: BinaryId = if !inode.is_invalid() { BinaryId::ByInode( inode ) } else { BinaryId::ByName( path.clone() ) };
 
-                let debuglink_length = debuglink.iter().position( |&byte| byte == 0 ).unwrap_or( debuglink.len() );
-                let debuglink = &debuglink[ 0..debuglink_length ];
-                let debuglink = if debuglink.is_empty() {
-                    None
-                } else {
-                    Some( String::from_utf8_lossy( &debuglink ).into_owned() )
+                let debuglink = match &format {
+                    BinaryFormat::Elf { debuglink, .. } => {
+                        let len = debuglink.iter().position( |&byte| byte == 0 ).unwrap_or( debuglink.len() );
+                        let debuglink = &debuglink[ 0..len ];
+                        if debuglink.is_empty() {
+                            None
+                        } else {
+                            Some( String::from_utf8_lossy( debuglink ).into_owned() )
+                        }
+                    },
+                    BinaryFormat::MachO => None
                 };
 
                 binary_id_to_index.insert( binary_id, metadata.binaries.len() );

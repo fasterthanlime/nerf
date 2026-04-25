@@ -15,38 +15,14 @@ pub use nwind::{
 pub use speedy::Endianness;
 pub use crate::raw_data::CowRawData;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Readable, Writable)]
 pub struct DwarfReg {
     pub register: u16,
     pub value: u64
 }
 
-impl< 'a, C: Context > Readable< 'a, C > for DwarfReg {
-    #[inline]
-    fn read_from< R: Reader< 'a, C > >( reader: &mut R ) -> Result< Self, C::Error > {
-        let mut register = reader.read_u16()?;
-        let value = reader.read_u64()?;
-
-        // HACK: Compatibility with old profiling data for AMD64.
-        if register == 0xff01 {
-            register = 16;
-        }
-
-        Ok( DwarfReg { register, value } )
-    }
-}
-
-impl< 'a, C: Context > Writable< C > for DwarfReg {
-    #[inline]
-    fn write_to< T: ?Sized + Writer< C > >( &self, writer: &mut T ) -> Result< (), C::Error > {
-        writer.write_u16( self.register )?;
-        writer.write_u64( self.value )?;
-        Ok(())
-    }
-}
-
 pub const ARCHIVE_MAGIC: u32 = 0x4652504E;
-pub const ARCHIVE_VERSION: u32 = 1;
+pub const ARCHIVE_VERSION: u32 = 2;
 
 #[derive(Debug, Readable, Writable)]
 pub enum ContextSwitchKind {
@@ -55,7 +31,21 @@ pub enum ContextSwitchKind {
     OutWhileRunning
 }
 
-#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, Readable, Writable)]
+pub enum Platform {
+    Linux,
+    MacOS
+}
+
+#[derive(Debug, Readable, Writable)]
+pub enum BinaryFormat< 'a > {
+    Elf {
+        is_shared_object: bool,
+        debuglink: Cow< 'a, [u8] >
+    },
+    MachO
+}
+
 #[derive(Debug, Readable, Writable)]
 pub enum Packet< 'a > {
     Header {
@@ -66,7 +56,8 @@ pub enum Packet< 'a > {
         cpu_count: u32,
         bitness: Bitness,
         endianness: Endianness,
-        architecture: Cow< 'a, str >
+        architecture: Cow< 'a, str >,
+        platform: Platform
     },
     ProcessInfo {
         pid: u32,
@@ -83,27 +74,23 @@ pub enum Packet< 'a > {
     },
     BinaryInfo {
         inode: Inode,
-        is_shared_object: bool,
         symbol_table_count: u16,
         path: Cow< 'a, [u8] >,
-        debuglink: Cow< 'a, [u8] >,
-        #[speedy(default_on_eof)]
-        load_headers: Cow< 'a, [LoadHeader] >
+        load_headers: Cow< 'a, [LoadHeader] >,
+        format: BinaryFormat< 'a >
     },
     StringTable {
         inode: Inode,
         offset: u64,
         data: Cow< 'a, [u8] >,
-        #[speedy(default_on_eof)]
         path: Cow< 'a, [u8] >
     },
-    SymbolTable {
+    ElfSymbolTable {
         inode: Inode,
         offset: u64,
         string_table_offset: u64,
         is_dynamic: bool,
         data: Cow< 'a, [u8] >,
-        #[speedy(default_on_eof)]
         path: Cow< 'a, [u8] >
     },
     FileBlob {
@@ -146,23 +133,12 @@ pub enum Packet< 'a > {
         pid: u32,
         range: Range< u64 >
     },
-    Deprecated_BinaryMap {
-        pid: u32,
-        inode: Inode,
-        base_address: u64
-    },
-    Deprecated_BinaryUnmap {
-        pid: u32,
-        inode: Inode,
-        base_address: u64
-    },
     Lost {
         count: u64
     },
     BuildId {
         inode: Inode,
         build_id: Vec< u8 >,
-        #[speedy(default_on_eof)]
         path: Cow< 'a, [u8] >
     },
     BinaryLoaded {
@@ -182,6 +158,13 @@ pub enum Packet< 'a > {
         pid: u32,
         cpu: u32,
         kind: ContextSwitchKind
+    },
+    MachOSymbolTable {
+        inode: Inode,
+        offset: u64,
+        string_table_offset: u64,
+        data: Cow< 'a, [u8] >,
+        path: Cow< 'a, [u8] >
     }
 }
 
