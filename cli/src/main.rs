@@ -16,7 +16,7 @@ use nperf_core::{
 };
 
 #[cfg(target_os = "macos")]
-use nperf_core::cmd_record_mac;
+use nperf_core::{cmd_record_mac, cmd_setup_mac};
 #[cfg(not(target_os = "macos"))]
 use nperf_core::cmd_record;
 
@@ -64,6 +64,10 @@ fn main_impl() -> Result< (), Box< dyn Error > > {
         },
         args::Opt::TraceEvents( args ) => {
             cmd_trace_events::main( args )?;
+        },
+        #[cfg(target_os = "macos")]
+        args::Opt::Setup( args ) => {
+            cmd_setup_mac::main( args )?;
         }
     }
 

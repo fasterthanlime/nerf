@@ -29,6 +29,8 @@ pub use crate::stack_reader::StackReader;
 pub mod cmd_record;
 #[cfg(target_os = "macos")]
 pub mod cmd_record_mac;
+#[cfg(target_os = "macos")]
+pub mod cmd_setup_mac;
 #[cfg(feature = "inferno")]
 pub mod cmd_flamegraph;
 pub mod cmd_csv;

@@ -440,5 +440,20 @@ pub enum Opt {
 
     /// Outputs rudimentary JSON-formatted metadata
     #[structopt(name = "metadata")]
-    Metadata( MetadataArgs )
+    Metadata( MetadataArgs ),
+
+    /// Codesign this nperf binary with the entitlements needed to call
+    /// task_for_pid against existing processes (macOS only).
+    #[cfg(target_os = "macos")]
+    #[structopt(name = "setup")]
+    Setup( SetupArgs )
+}
+
+#[cfg(target_os = "macos")]
+#[derive(StructOpt, Debug)]
+#[structopt(rename_all = "kebab-case")]
+pub struct SetupArgs {
+    /// Skip the confirmation prompt before running `codesign`.
+    #[structopt(long, short = "y")]
+    pub yes: bool
 }

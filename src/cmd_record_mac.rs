@@ -126,8 +126,10 @@ pub fn main(args: args::RecordArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn native_arch_name() -> &'static str {
+    // Match the architecture-name strings the nwind crate uses, since
+    // data_reader dispatches on these to pick a per-arch AddressSpace.
     if cfg!(target_arch = "aarch64") {
-        "arm64"
+        "aarch64"
     } else if cfg!(target_arch = "x86_64") {
         "amd64"
     } else {
