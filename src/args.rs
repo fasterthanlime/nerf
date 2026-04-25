@@ -3,6 +3,9 @@ use structopt::StructOpt;
 
 use perf_event_open::EventSource;
 
+#[cfg(feature = "inferno")]
+use inferno::flamegraph::Palette;
+
 use crate::cmd_collate::CollateFormat;
 
 fn parse_event_source( source: &str ) -> EventSource {
@@ -266,6 +269,40 @@ pub struct ArgGranularity {
 #[cfg(feature = "inferno")]
 #[derive(StructOpt, Debug)]
 #[structopt(rename_all = "kebab-case")]
+pub struct ArgsInferno {
+    /// Plot the flame graph up-side-down
+    #[structopt(short, long)]
+    pub inverted: bool,
+
+    /// Generate stack-reversed flame graph
+    #[structopt(long)]
+    pub reverse: bool,
+
+    /// Set embedded notes in SVG
+    #[structopt(long)]
+    pub notes: Option< String >,
+
+    /// Omit functions smaller than <min-width> pixels
+    #[structopt(long, default_value = "0.01")]
+    pub min_width: f64,
+
+    /// Image width in pixels
+    #[structopt(long)]
+    pub image_width: Option< usize >,
+
+    /// Color palette [possible values: hot, mem, io, red, green, blue, aqua, yellow, purple,
+    /// orange, wakeup, java, perl, js, rust]
+    #[structopt(long)]
+    pub palette: Option< Palette >,
+
+    /// Cut off stack frames below <skip-after>; may be repeated
+    #[structopt(long)]
+    pub skip_after: Vec< String >,
+}
+
+#[cfg(feature = "inferno")]
+#[derive(StructOpt, Debug)]
+#[structopt(rename_all = "kebab-case")]
 pub struct FlamegraphArgs {
     #[structopt(flatten)]
     pub collation_args: SharedCollationArgs,
@@ -275,6 +312,9 @@ pub struct FlamegraphArgs {
 
     #[structopt(flatten)]
     pub arg_granularity: ArgGranularity,
+
+    #[structopt(flatten)]
+    pub args_inferno: ArgsInferno,
 
     /// The file to which the flamegraph will be written to (instead of the stdout)
     #[structopt(long, short = "o", parse(from_os_str))]
