@@ -436,13 +436,14 @@ fn group_top_entries(
         function_name: Option<String>,
         binary: Option<String>,
         is_main: bool,
+        language: nperf_demangle::Language,
     }
     let mut groups: HashMap<(String, String), Agg> = HashMap::new();
     for e in raw {
         let resolved = binaries.lookup_symbol(e.address);
-        let (fn_name, bin, is_main) = match resolved {
-            Some(r) => (Some(r.function_name), Some(r.binary), r.is_main),
-            None => (None, None, false),
+        let (fn_name, bin, is_main, language) = match resolved {
+            Some(r) => (Some(r.function_name), Some(r.binary), r.is_main, r.language),
+            None => (None, None, false, nperf_demangle::Language::Unknown),
         };
         let key: (String, String) = match (&fn_name, &bin) {
             (Some(n), Some(b)) => (n.clone(), b.clone()),
@@ -466,6 +467,7 @@ fn group_top_entries(
                 function_name: fn_name,
                 binary: bin,
                 is_main,
+                language,
             });
     }
 
@@ -478,6 +480,7 @@ fn group_top_entries(
             function_name: g.function_name,
             binary: g.binary,
             is_main: g.is_main,
+            language: g.language.as_str().to_owned(),
         })
         .collect();
     // Tie-break on function_name → binary → address so the row order
@@ -578,16 +581,21 @@ fn compute_neighbors_update(
         rep_address: u64,
         rep_self: u64,
         is_main: bool,
+        language: nperf_demangle::Language,
         children: HashMap<SymbolKey, SymbolNode>,
     }
 
     fn classify(
         addr: u64,
         bins: &BinaryRegistry,
-    ) -> (SymbolKey, bool) {
+    ) -> (SymbolKey, bool, nperf_demangle::Language) {
         match bins.lookup_symbol(addr) {
-            Some(r) => ((Some(r.function_name), Some(r.binary)), r.is_main),
-            None => ((None, None), false),
+            Some(r) => (
+                (Some(r.function_name), Some(r.binary)),
+                r.is_main,
+                r.language,
+            ),
+            None => ((None, None), false, nperf_demangle::Language::Unknown),
         }
     }
 
@@ -600,12 +608,14 @@ fn compute_neighbors_update(
         addr: u64,
         delta: u64,
         is_main: bool,
+        language: nperf_demangle::Language,
     ) {
         node.count += delta;
         if delta > node.rep_self {
             node.rep_address = addr;
             node.rep_self = delta;
             node.is_main = is_main;
+            node.language = language;
         }
     }
 
@@ -615,9 +625,9 @@ fn compute_neighbors_update(
         bins: &BinaryRegistry,
     ) {
         for (caddr, child) in &src.children {
-            let (key, is_main) = classify(*caddr, bins);
+            let (key, is_main, language) = classify(*caddr, bins);
             let entry = dst.children.entry(key).or_default();
-            accumulate(entry, *caddr, child.count, is_main);
+            accumulate(entry, *caddr, child.count, is_main, language);
             merge_descendants(entry, child, bins);
         }
     }
@@ -633,15 +643,15 @@ fn compute_neighbors_update(
         own_count: &mut u64,
     ) {
         if node_addr != 0 {
-            let (key, _is_main) = classify(node_addr, bins);
+            let (key, _is_main, _language) = classify(node_addr, bins);
             if &key == target_key {
                 *own_count += node.count;
                 // Insert ancestor chain into callers_tree, innermost-first.
                 let mut cur = &mut *callers;
                 for &caller_addr in ancestors.iter().rev() {
-                    let (ckey, cmain) = classify(caller_addr, bins);
+                    let (ckey, cmain, clang) = classify(caller_addr, bins);
                     let entry = cur.children.entry(ckey).or_default();
-                    accumulate(entry, caller_addr, node.count, cmain);
+                    accumulate(entry, caller_addr, node.count, cmain, clang);
                     cur = entry;
                 }
                 // Merge descendants into callees_tree.
@@ -679,6 +689,7 @@ fn compute_neighbors_update(
             count,
             rep_address,
             is_main,
+            language,
             children,
             ..
         } = sn;
@@ -694,6 +705,7 @@ fn compute_neighbors_update(
             function_name: key.0,
             binary: key.1,
             is_main,
+            language: language.as_str().to_owned(),
             children: child_nodes,
         }
     }
@@ -703,6 +715,10 @@ fn compute_neighbors_update(
         Some(r) => (Some(r.function_name.clone()), Some(r.binary.clone())),
         None => (None, None),
     };
+    let target_language = target_resolved
+        .as_ref()
+        .map(|r| r.language)
+        .unwrap_or(nperf_demangle::Language::Unknown);
 
     let mut callers = SymbolNode::default();
     let mut callees = SymbolNode::default();
@@ -725,9 +741,11 @@ fn compute_neighbors_update(
     callers.count = own_count;
     callers.rep_address = target_address;
     callers.is_main = target_resolved.as_ref().map(|r| r.is_main).unwrap_or(false);
+    callers.language = target_language;
     callees.count = own_count;
     callees.rep_address = target_address;
     callees.is_main = target_resolved.as_ref().map(|r| r.is_main).unwrap_or(false);
+    callees.language = target_language;
 
     let threshold = (own_count / 200).max(1);
     let callers_tree = to_flame_node(callers, target_key.clone(), threshold);
@@ -737,6 +755,7 @@ fn compute_neighbors_update(
         function_name: target_key.0,
         binary: target_key.1,
         is_main: target_resolved.as_ref().map(|r| r.is_main).unwrap_or(false),
+        language: target_language.as_str().to_owned(),
         own_count,
         callers_tree,
         callees_tree,
@@ -766,6 +785,7 @@ fn compute_flame_update(
         function_name: Some("(all)".into()),
         binary: None,
         is_main: false,
+        language: nperf_demangle::Language::Unknown.as_str().to_owned(),
         children,
     };
     FlamegraphUpdate {
@@ -799,9 +819,14 @@ fn flame_node_to_proto(
     binaries: &BinaryRegistry,
 ) -> FlameNode {
     let resolved = binaries.lookup_symbol(address);
-    let (function_name, binary, is_main) = match resolved {
-        Some(r) => (Some(r.function_name), Some(r.binary), r.is_main),
-        None => (None, None, false),
+    let (function_name, binary, is_main, language) = match resolved {
+        Some(r) => (
+            Some(r.function_name),
+            Some(r.binary),
+            r.is_main,
+            r.language,
+        ),
+        None => (None, None, false, nperf_demangle::Language::Unknown),
     };
     let mut children: Vec<FlameNode> = node
         .children
@@ -816,6 +841,7 @@ fn flame_node_to_proto(
         function_name,
         binary,
         is_main,
+        language: language.as_str().to_owned(),
         children,
     }
 }
@@ -860,9 +886,14 @@ fn compute_annotated_view(
         Some(r) => r.function_name.clone(),
         None => format!("(no binary mapped at {:#x})", address),
     };
+    let language = resolved
+        .as_ref()
+        .map(|r| r.language)
+        .unwrap_or(nperf_demangle::Language::Unknown);
     let base_address = resolved.as_ref().map(|r| r.base_address).unwrap_or(address);
     AnnotatedView {
         function_name,
+        language: language.as_str().to_owned(),
         base_address,
         queried_address: address,
         lines,

@@ -25,6 +25,10 @@ pub struct TopEntry {
     /// than a system / runtime dylib. The frontend uses this to colour
     /// target-code rows distinctly.
     pub is_main: bool,
+    /// Source language inferred from demangling — `"rust"`, `"cpp"`,
+    /// `"swift"`, etc. The frontend uses this to pick a glyph;
+    /// `"unknown"` when no demangler claimed the symbol.
+    pub language: String,
 }
 
 #[derive(Clone, Debug, Facet)]
@@ -53,6 +57,7 @@ pub struct FlameNode {
     pub function_name: Option<String>,
     pub binary: Option<String>,
     pub is_main: bool,
+    pub language: String,
     pub children: Vec<FlameNode>,
 }
 
@@ -155,6 +160,7 @@ pub struct NeighborsUpdate {
     pub function_name: Option<String>,
     pub binary: Option<String>,
     pub is_main: bool,
+    pub language: String,
     /// Total samples that passed through this symbol (sum across
     /// every address resolving to it).
     pub own_count: u64,
@@ -196,6 +202,7 @@ pub struct AnnotatedLine {
 pub struct AnnotatedView {
     /// Best-effort symbol name (or hex string fallback).
     pub function_name: String,
+    pub language: String,
     /// Address the disassembly starts at. Used by the client to mark which
     /// line corresponds to the original query address.
     pub base_address: u64,

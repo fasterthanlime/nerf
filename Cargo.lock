@@ -815,6 +815,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "debugid"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "derive_more"
 version = "0.99.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1773,6 +1782,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "msvc-demangler"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbeff6bd154a309b2ada5639b2661ca6ae4599b34e8487dc276d2cd637da2d76"
+dependencies = [
+ "bitflags 2.11.1",
+ "itoa",
+]
+
+[[package]]
 name = "museair"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1859,20 +1878,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "nperf-demangle"
+version = "0.1.0"
+dependencies = [
+ "symbolic-common",
+ "symbolic-demangle",
+]
+
+[[package]]
 name = "nperf-live"
 version = "0.1.0"
 dependencies = [
  "addr2line",
  "arborium",
- "cpp_demangle",
  "eyre",
  "mach2 0.4.3",
  "memmap2",
  "nperf-core",
+ "nperf-demangle",
  "nperf-live-proto",
  "object 0.39.1",
  "parking_lot",
- "rustc-demangle",
  "tokio",
  "tracing",
  "vox",
@@ -1925,16 +1951,15 @@ dependencies = [
  "addr2line",
  "byteorder",
  "cc",
- "cpp_demangle",
  "env_logger",
  "gimli 0.28.1",
  "libc",
  "log",
  "lru",
  "memmap2",
+ "nperf-demangle",
  "object 0.32.2",
  "proc-maps",
- "rustc-demangle",
  "speedy",
  "thread-local-reentrant",
 ]
@@ -2618,6 +2643,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "symbolic-common"
+version = "12.18.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "332615d90111d8eeaf86a84dc9bbe9f65d0d8c5cf11b4caccedc37754eb0dcfd"
+dependencies = [
+ "debugid",
+ "memmap2",
+ "stable_deref_trait",
+ "uuid",
+]
+
+[[package]]
+name = "symbolic-demangle"
+version = "12.18.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "912017718eb4d21930546245af9a3475c9dccf15675a5c215664e76621afc471"
+dependencies = [
+ "cc",
+ "cpp_demangle",
+ "msvc-demangler",
+ "rustc-demangle",
+ "symbolic-common",
+]
+
+[[package]]
 name = "syn"
 version = "0.15.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2874,6 +2924,16 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "uuid"
+version = "1.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "vec_map"

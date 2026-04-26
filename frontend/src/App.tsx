@@ -559,18 +559,34 @@ type LangKind = "rust" | "c" | "cpp" | "swift" | "asm" | "unknown";
 export type ObjKind = "main" | "system" | "dylib" | "unknown";
 type PaneTab = "asm" | "neighbors";
 
-function langOf(fn: string | null | undefined): LangKind {
+/// Pick a language icon for a row. Prefers the server-side demangler
+/// classification (carried on every TopEntry / FlameNode); only falls
+/// back to a string heuristic when the demangler couldn't tell — for
+/// instance unresolved hex addresses or images we never observed.
+function langOf(o: {
+  function_name: string | null;
+  language?: string;
+}): LangKind {
+  switch (o.language) {
+    case "rust":
+      return "rust";
+    case "swift":
+      return "swift";
+    case "cpp":
+    case "objcpp":
+      return "cpp";
+    case "objc":
+    case "c":
+      return "c";
+  }
+  const fn = o.function_name;
   if (!fn) return "unknown";
   if (fn.startsWith("0x")) return "asm";
-  // Swift v5 mangling: `$s…` (or `_$s…` with the C-ABI underscore).
-  // Swift v3/4 (legacy): `_T…`. Catch all three before the generic
-  // demangled-name heuristics, since Swift mangled symbols still
-  // contain `_` and digits that could otherwise look like C.
+  // Swift v5 mangling: `$s…` / `_$s…`. Pre-demangler fallback when
+  // the symbol was never resolved.
   if (fn.startsWith("$s") || fn.startsWith("_$s") || fn.startsWith("_T"))
     return "swift";
   if (fn.includes("::")) return "rust";
-  // C++ template in symbol name (e.g. `std::__1::vector<…>`) is caught
-  // above by `::`. What remains and contains <> is rare but mostly C++.
   if (fn.includes("<") && fn.includes(">")) return "cpp";
   return "c";
 }
@@ -735,7 +751,7 @@ function TopTable({
       </thead>
       <tbody>
         {visible.map((e) => {
-          const lang = langOf(e.function_name);
+          const lang = langOf(e);
           const obj = objKindOf(e);
           const fnLabel = e.function_name ?? `0x${e.address.toString(16)}`;
           const binLabel = e.binary ?? "(no binary)";

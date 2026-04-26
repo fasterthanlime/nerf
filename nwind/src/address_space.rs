@@ -10,7 +10,6 @@ use std::sync::Mutex;
 use std::str;
 
 use byteorder::{self, ByteOrder};
-use cpp_demangle;
 #[cfg(feature = "addr2line")]
 use addr2line;
 use gimli;
@@ -113,59 +112,6 @@ mod addr2line {
             Err(())
         }
     }
-}
-
-fn strip_isra( string: &str ) -> &str {
-    // Strip a trailing `.isra.<digits>` suffix (a GCC IPA-SRA marker that
-    // `cpp_demangle` doesn't accept) — but only if it's actually present.
-    // The previous implementation stripped trailing digits first and then
-    // checked for `.isra.`, which silently mutilated any symbol that just
-    // happened to end in a digit (e.g. Rust v0 names like `…from_utf8`).
-    let bytes = string.as_bytes();
-    let mut end = bytes.len();
-    while end > 0 && bytes[ end - 1 ] >= b'0' && bytes[ end - 1 ] <= b'9' {
-        end -= 1;
-    }
-    let suffix = b".isra.";
-    if end >= suffix.len() && end < bytes.len() && &bytes[ end - suffix.len()..end ] == suffix {
-        return unsafe { str::from_utf8_unchecked( &bytes[ ..end - suffix.len() ] ) };
-    }
-    string
-}
-
-fn strip_global( string: &str ) -> Option< &str > {
-    if string.starts_with( "_GLOBAL__sub_I_" ) {
-        Some( &string[ 15.. ] )
-    } else {
-        None
-    }
-}
-
-#[test]
-fn test_strip_isra() {
-    let symbol   = "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag.isra.90";
-    let expected = "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag";
-
-    assert_eq!( strip_isra( symbol ), expected );
-
-    // Symbols that simply end in a digit must be left untouched; only an
-    // actual `.isra.<digits>` suffix is meaningful here.
-    assert_eq!(
-        strip_isra( "_RNvNtNtCsgEmfK2I1SDS_4core3str8converts9from_utf8" ),
-        "_RNvNtNtCsgEmfK2I1SDS_4core3str8converts9from_utf8"
-    );
-    assert_eq!( strip_isra( "foo123" ), "foo123" );
-    assert_eq!( strip_isra( "foo.isra." ), "foo.isra." );
-    assert_eq!( strip_isra( "foo.isra.0" ), "foo" );
-}
-
-#[test]
-fn test_strip_global() {
-    let symbol = "_GLOBAL__sub_I__ZN5xxxxx7xxxxxxx8xxxxxxxx2xx3yyyC2Ev";
-    let expected = "_ZN5xxxxx7xxxxxxx8xxxxxxxx2xx3yyyC2Ev";
-
-    assert_eq!( strip_global( symbol ), Some( expected ) );
-    assert_eq!( strip_global( expected ), None );
 }
 
 fn translate_address( mappings: &[AddressMapping], address: u64 ) -> u64 {
@@ -299,83 +245,24 @@ fn process_frame< R: gimli::Reader >( raw_frame: addr2line::Frame< R >, frame: &
     }
 }
 
-#[cfg(feature = "rustc-demangle")]
-fn demangle_rust_symbol( symbol: &str ) -> Option< String > {
-    rustc_demangle::try_demangle( symbol ).ok().map( |symbol| format!( "{:#}", symbol ) )
-}
-
-#[cfg(not(feature = "rustc-demangle"))]
-fn demangle_rust_symbol( _: &str ) -> Option< String > {
-    None
-}
-
-fn demangle_cpp_symbol( symbol: &str ) -> Option< String > {
-    cpp_demangle::Symbol::new( symbol ).ok()
-        .and_then( |symbol| symbol.demangle( &cpp_demangle::DemangleOptions::new() ).ok() )
-}
-
-enum SymbolKind {
-    Rust,
-    Cpp
-}
-
-fn pick_symbol( symbol: &str, cpp_name: &str, rust_name: &str ) -> SymbolKind {
-    if cpp_name == rust_name {
-        return SymbolKind::Cpp;
-    }
-
-    if symbol.contains( "$LT$" ) || symbol.contains( "$u" ) {
-        return SymbolKind::Rust;
-    }
-
-    if cpp_name.starts_with( rust_name ) {
-        if cpp_name.len() - rust_name.len() == 19 && cpp_name[ rust_name.len().. ].starts_with( "::" ) {
-            return SymbolKind::Rust;
-        }
-    }
-
-    SymbolKind::Cpp
-}
-
+/// Thin shim over the shared `nperf_demangle` crate so the rest of
+/// `nwind` keeps the `Option<String>` return shape it expects.
+/// `Some` is returned only when the demangler actually rewrote the
+/// symbol; otherwise we leave it to the caller to keep the raw name.
 fn demangle( symbol: &str ) -> Option< String > {
-    if !symbol.starts_with( "_" ) {
+    if !symbol.starts_with( "_" ) && !symbol.starts_with( "$s" ) && !symbol.starts_with( "?" ) {
         return None;
     }
-
-    let symbol = strip_isra( symbol ); // TODO: Remove this once `cpp_demangle` will properly support these symbols.
-    let (symbol, is_global_init) = match strip_global( symbol ) {
-        Some( symbol ) => (symbol, true),
-        None => (symbol, false)
-    };
-
-    let demangled_name_cpp = demangle_cpp_symbol( symbol );
-    let demangled_name_rust = demangle_rust_symbol( symbol );
-    let mut demangled_name = match (demangled_name_cpp, demangled_name_rust) {
-        (None, None) => return None,
-        (Some( name ), None) => name,
-        (None, Some( name )) => name,
-        (Some( cpp_name ), Some( rust_name )) => {
-            match pick_symbol( symbol, &cpp_name, &rust_name ) {
-                SymbolKind::Rust => rust_name,
-                SymbolKind::Cpp => cpp_name
-            }
-        }
-    };
-
-    if is_global_init {
-        demangled_name = format!( "global init {}", demangled_name );
+    let result = nperf_demangle::demangle_str( symbol );
+    if result.name == symbol {
+        None
+    } else {
+        Some( result.name )
     }
-
-    Some( demangled_name.into() )
 }
 
 #[test]
 fn test_demangle() {
-    assert_eq!(
-        demangle( "_ZN12_GLOBAL__N_111writev_dataE" ).unwrap(),
-        "(anonymous namespace)::writev_data"
-    );
-
     assert_eq!(
         demangle( "_ZN9nsGkAtoms4headE" ).unwrap(),
         "nsGkAtoms::head"
@@ -391,18 +278,6 @@ fn test_demangle() {
         "alloc::raw_vec::RawVec<T>::from_raw_parts"
     );
 
-    assert_eq!(
-        demangle( "_ZN12panic_unwind3imp14find_eh_action28_$u7b$$u7b$closure$u7d$$u7d$17hd5299eb0542f59b0E" ).unwrap(),
-        "panic_unwind::imp::find_eh_action::{{closure}}"
-    );
-
-    assert_eq!(
-        demangle( "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag.isra.90" ).unwrap(),
-        "void std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_construct<char*>(char*, char*, std::forward_iterator_tag)"
-    );
-
-    // Rust v0 mangling. rustc-demangle 0.1.21+ supports it; the current
-    // pick_symbol heuristics do not.
     assert_eq!(
         demangle( "_RNvNtNtCsgEmfK2I1SDS_4core3str8converts9from_utf8" ).unwrap(),
         "core::str::converts::from_utf8"

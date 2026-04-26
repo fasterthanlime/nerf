@@ -19,8 +19,7 @@ yaxpeax-x86 = { version = "2", default-features = false, features = ["std", "fmt
 yaxpeax-arm = { version = "0.4.0", default-features = false, features = ["std", "fmt"] }
 object = { version = "0.39.1", default-features = false, features = ["std", "read_core", "elf", "macho", "compression", "archive"] }
 memmap2 = "0.9"
-rustc-demangle = "0.1"
-cpp_demangle = "0.4"
+nperf-demangle = { path = "../nperf-demangle" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.4"

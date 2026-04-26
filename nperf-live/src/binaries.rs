@@ -71,12 +71,17 @@ pub struct ResolvedSymbol {
     pub function_name: String,
     pub binary: String,
     pub is_main: bool,
+    /// Detected source language from demangling. `Unknown` for
+    /// addresses without a symbol or where the demangler couldn't
+    /// classify the mangling.
+    pub language: nperf_demangle::Language,
 }
 
 pub struct ResolvedAddress {
     pub binary_path: String,
     pub arch: Option<String>,
     pub function_name: String,
+    pub language: nperf_demangle::Language,
     /// Function start address, in the same AVMA space the user clicked.
     pub base_address: u64,
     /// AVMA space, end (exclusive).
@@ -167,27 +172,31 @@ impl BinaryRegistry {
         // gives us the first symbol whose start_svma > svma; the candidate
         // containing svma is the one before that (if its end_svma > svma).
         let idx = binary.symbols.partition_point(|s| s.start_svma <= svma);
-        let function_name = if idx > 0 {
+        let demangled = if idx > 0 {
             let candidate = &binary.symbols[idx - 1];
             if svma < candidate.end_svma {
-                let raw = String::from_utf8_lossy(&candidate.name).into_owned();
-                Some(demangle_name(&raw))
+                Some(nperf_demangle::demangle_bytes(&candidate.name))
             } else {
                 None
             }
         } else {
             None
         };
-        let function_name = function_name.unwrap_or_else(|| {
-            // Binary is mapped but no symbol for this address — still
-            // useful to show the basename so the user knows where the
-            // sample landed.
-            format!("{}+{:#x}", basename, svma)
-        });
+        let (function_name, language) = match demangled {
+            Some(d) => (d.name, d.language),
+            None => (
+                // Binary is mapped but no symbol for this address —
+                // still useful to show the basename so the user knows
+                // where the sample landed.
+                format!("{}+{:#x}", basename, svma),
+                nperf_demangle::Language::Unknown,
+            ),
+        };
         Some(ResolvedSymbol {
             function_name,
             binary: basename,
             is_main,
+            language,
         })
     }
 
@@ -231,11 +240,11 @@ impl BinaryRegistry {
         // Re-borrow the binary now that the registry mutation is done.
         let binary = &self.by_base[binary_idx];
         let basename = short_path(&binary.path).to_owned();
-        let (function_name, fn_start_svma, fn_end_svma) = match sym_idx {
+        let (function_name, language, fn_start_svma, fn_end_svma) = match sym_idx {
             Some(i) => {
                 let s = &binary.symbols[i];
-                let raw = String::from_utf8_lossy(&s.name).into_owned();
-                (demangle_name(&raw), s.start_svma, s.end_svma)
+                let d = nperf_demangle::demangle_bytes(&s.name);
+                (d.name, d.language, s.start_svma, s.end_svma)
             }
             None => {
                 // No symbol — fall back to a small window around the
@@ -244,6 +253,7 @@ impl BinaryRegistry {
                 let window = 64u64;
                 (
                     format!("{}+{:#x}", basename, svma),
+                    nperf_demangle::Language::Unknown,
                     svma.saturating_sub(window / 2),
                     svma.saturating_add(window / 2),
                 )
@@ -279,6 +289,7 @@ impl BinaryRegistry {
             binary_path: path,
             arch,
             function_name,
+            language,
             base_address,
             end_address,
             bytes,
@@ -306,6 +317,7 @@ impl BinaryRegistry {
             binary_path: String::from("(target memory)"),
             arch,
             function_name: format!("(unmapped) {:#x}", address),
+            language: nperf_demangle::Language::Unknown,
             base_address,
             end_address: base_address + bytes.len() as u64,
             bytes,
@@ -398,20 +410,6 @@ fn avma_for_svma(base_avma: u64, text_svma: u64, svma: u64) -> u64 {
 
 fn short_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-fn demangle_name(raw: &str) -> String {
-    // Mach-O typically has a leading underscore on C/C++/Rust symbols.
-    let stripped = raw.strip_prefix('_').unwrap_or(raw);
-    if let Ok(d) = rustc_demangle::try_demangle(stripped) {
-        return format!("{:#}", d);
-    }
-    if let Ok(d) = cpp_demangle::Symbol::new(stripped) {
-        if let Ok(s) = d.demangle(&cpp_demangle::DemangleOptions::default()) {
-            return s;
-        }
-    }
-    stripped.to_owned()
 }
 
 fn load_image(path: &str) -> Option<Arc<CodeImage>> {

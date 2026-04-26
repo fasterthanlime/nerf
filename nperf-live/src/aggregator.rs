@@ -282,6 +282,7 @@ impl Aggregator {
                 function_name: None,
                 binary: None,
                 is_main: false,
+                language: "unknown".to_owned(),
             })
             .collect()
     }

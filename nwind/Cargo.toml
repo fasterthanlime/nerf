@@ -11,8 +11,7 @@ memmap2 = "0.9"
 log = { version = "0.4", optional = true }
 speedy = "0.8"
 lru = "0.12"
-cpp_demangle = "0.4"
-rustc-demangle = { version = "0.1", optional = true }
+nperf-demangle = { version = "0.1", path = "../nperf-demangle" }
 addr2line = { version = "0.21", optional = true, default-features = false, features = ["std"] }
 object = { version = "0.32", default-features = false, features = ["std", "read_core", "elf", "macho", "compression"] }
 proc-maps = { version = "0.1", path = "../proc-maps" }
@@ -26,9 +25,8 @@ cc = { version = "1", optional = true }
 env_logger = "0.11"
 
 [features]
-default = ["log", "addr2line", "rustc-demangle"]
+default = ["log", "addr2line"]
 local-unwinding = ["cc", "thread-local-reentrant"]
 debug-logs = ["log"]
 addr2line = ["dep:addr2line"]
-rustc-demangle = ["dep:rustc-demangle"]
 log = ["dep:log"]
