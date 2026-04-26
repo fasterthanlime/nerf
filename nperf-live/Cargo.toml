@@ -21,4 +21,7 @@ memmap2 = "0.9"
 rustc-demangle = "0.1"
 cpp_demangle = "0.4"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+
 vox = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d", features = ["transport-websocket"] }

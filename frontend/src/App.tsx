@@ -5,6 +5,7 @@ import {
   type AnnotatedView,
   type ProfilerClient,
   type TopEntry,
+  type TopSort,
   type TopUpdate,
 } from "./generated/profiler.generated.ts";
 
@@ -15,6 +16,8 @@ function defaultUrl(): string {
   return params.get("ws") ?? "ws://127.0.0.1:8080";
 }
 
+type SortKey = "self" | "total";
+
 export function App() {
   const [url, setUrl] = useState(defaultUrl());
   const [committedUrl, setCommittedUrl] = useState(url);
@@ -24,6 +27,7 @@ export function App() {
   const [displayed, setDisplayed] = useState<TopUpdate | null>(null);
   const [selected, setSelected] = useState<bigint | null>(null);
   const [frozen, setFrozen] = useState(false);
+  const [sort, setSort] = useState<SortKey>("self");
   // Latest update kept in a ref so the frozen-gate logic can pull the
   // most recent snapshot when the mouse leaves without re-running the
   // subscribe effect.
@@ -46,7 +50,9 @@ export function App() {
         setStatus("ok");
 
         const [tx, rx] = channel<TopUpdate>();
-        c.subscribeTop(50, tx).catch((err) => {
+        const sortArg: TopSort =
+          sort === "self" ? { tag: "BySelf" } : { tag: "ByTotal" };
+        c.subscribeTop(50, sortArg, tx).catch((err) => {
           if (!cancelled) {
             setStatus("err");
             setError(String(err));
@@ -72,7 +78,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [committedUrl]);
+  }, [committedUrl, sort]);
 
   // Mirror `frozen` into a ref so the rx loop can check it without re-running.
   const frozenRef = useRef(frozen);
@@ -118,6 +124,8 @@ export function App() {
             entries={displayed?.entries ?? []}
             selected={selected}
             onSelect={setSelected}
+            sort={sort}
+            onSort={setSort}
           />
         </section>
         <section className="pane ann-pane">
@@ -136,10 +144,14 @@ function TopTable({
   entries,
   selected,
   onSelect,
+  sort,
+  onSort,
 }: {
   entries: TopEntry[];
   selected: bigint | null;
   onSelect: (a: bigint) => void;
+  sort: SortKey;
+  onSort: (s: SortKey) => void;
 }) {
   return (
     <table className="top-table">
@@ -147,15 +159,28 @@ function TopTable({
         <tr>
           <th>function</th>
           <th>binary</th>
-          <th className="num-h">self</th>
-          <th className="num-h">total</th>
+          <th
+            className={`num-h sortable${sort === "self" ? " active" : ""}`}
+            onClick={() => onSort("self")}
+          >
+            self{sort === "self" ? " ↓" : ""}
+          </th>
+          <th
+            className={`num-h sortable${sort === "total" ? " active" : ""}`}
+            onClick={() => onSort("total")}
+          >
+            total{sort === "total" ? " ↓" : ""}
+          </th>
         </tr>
       </thead>
       <tbody>
         {entries.map((e) => (
           <tr
             key={String(e.address)}
-            className={selected === e.address ? "selected" : ""}
+            className={
+              (selected === e.address ? "selected " : "") +
+              (e.is_main ? "main" : "")
+            }
             onClick={() => onSelect(e.address)}
           >
             <td className="fn">
@@ -173,6 +198,24 @@ function TopTable({
   );
 }
 
+/// Map a sample count to a heat color. 0 → transparent; otherwise
+/// interpolates blue → yellow → red based on relative intensity, with
+/// alpha rising for hotter lines so the eye picks them out.
+function heatBg(count: bigint, max: bigint): string {
+  if (count === 0n || max === 0n) return "transparent";
+  const t = Math.max(0, Math.min(1, Number(count) / Number(max)));
+  let hue: number;
+  if (t < 0.5) {
+    // blue (240°) → yellow (60°)
+    hue = 240 - (240 - 60) * (t * 2);
+  } else {
+    // yellow (60°) → red (0°)
+    hue = 60 - 60 * ((t - 0.5) * 2);
+  }
+  const alpha = 0.15 + 0.5 * t;
+  return `hsla(${hue}, 70%, 45%, ${alpha})`;
+}
+
 function Annotation({
   client,
   address,
@@ -182,6 +225,7 @@ function Annotation({
 }) {
   const [view, setView] = useState<AnnotatedView | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -205,29 +249,64 @@ function Annotation({
     };
   }, [client, address]);
 
+  const lines = view?.lines ?? [];
+  const maxSelf = lines.reduce(
+    (m, l) => (l.self_count > m ? l.self_count : m),
+    0n,
+  );
+
+  const jumpTo = (addr: bigint) => {
+    const tr = bodyRef.current?.querySelector(
+      `tr[data-addr="${String(addr)}"]`,
+    ) as HTMLElement | null;
+    tr?.scrollIntoView({ block: "center" });
+  };
+
   return (
     <div className="annotation">
       <div className="ann-header">
         {view ? view.function_name : "loading..."}
         {err && <span className="err-text"> · {err}</span>}
       </div>
-      <div className="ann-body">
-        <table className="asm">
-          <tbody>
-            {view?.lines.map((line) => (
-              <tr key={String(line.address)}>
-                <td className="num">
-                  {line.self_count > 0n ? line.self_count.toString() : ""}
-                </td>
-                <td className="addr">0x{line.address.toString(16)}</td>
-                <td
-                  className="asm-line"
-                  dangerouslySetInnerHTML={{ __html: line.html }}
-                />
-              </tr>
-            )) ?? null}
-          </tbody>
-        </table>
+      <div className="ann-content">
+        <div className="ann-body" ref={bodyRef}>
+          <table className="asm">
+            <tbody>
+              {lines.map((line) => {
+                const off = line.address - view!.base_address;
+                return (
+                  <tr
+                    key={String(line.address)}
+                    data-addr={String(line.address)}
+                    style={{ background: heatBg(line.self_count, maxSelf) }}
+                  >
+                    <td className="num">
+                      {line.self_count > 0n ? line.self_count.toString() : ""}
+                    </td>
+                    <td className="addr">+0x{off.toString(16)}</td>
+                    <td
+                      className="asm-line"
+                      dangerouslySetInnerHTML={{ __html: line.html }}
+                    />
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {lines.length > 0 && (
+          <div className="ann-minimap" aria-label="heatmap minimap">
+            {lines.map((line) => (
+              <div
+                key={String(line.address)}
+                className="mm-row"
+                title={`+0x${(line.address - view!.base_address).toString(16)} · ${line.self_count.toString()} samples`}
+                style={{ background: heatBg(line.self_count, maxSelf) }}
+                onClick={() => jumpTo(line.address)}
+              />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

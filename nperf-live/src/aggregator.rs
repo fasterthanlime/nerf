@@ -52,23 +52,36 @@ impl Aggregator {
                 total_count: e.total_count,
                 function_name: None,
                 binary: None,
+                is_main: false,
             })
             .collect()
     }
 
     /// Top-N as raw addresses + counts, for callers (the live server)
     /// that want to layer symbol resolution on top.
+    ///
+    /// Iterates the *total*-counts universe rather than the self-counts
+    /// universe so symbols that only ever appear as inner frames (e.g.
+    /// `drop_in_place<T>` in a tower of `_xzm_free` calls) still show up.
     pub fn top_raw(&self, limit: usize) -> Vec<RawTopEntry> {
         let mut entries: Vec<RawTopEntry> = self
-            .self_counts
+            .total_counts
             .iter()
-            .map(|(&address, &self_count)| RawTopEntry {
+            .map(|(&address, &total_count)| RawTopEntry {
                 address,
-                self_count,
-                total_count: self.total_counts.get(&address).copied().unwrap_or(0),
+                self_count: self.self_counts.get(&address).copied().unwrap_or(0),
+                total_count,
             })
             .collect();
-        entries.sort_by(|a, b| b.self_count.cmp(&a.self_count));
+        // Primary sort by self (where time is actually being spent at the
+        // leaf), tiebreak by total (where the function appears on the
+        // stack at all), so pure inner frames don't all collapse to the
+        // bottom in arbitrary order.
+        entries.sort_by(|a, b| {
+            b.self_count
+                .cmp(&a.self_count)
+                .then_with(|| b.total_count.cmp(&a.total_count))
+        });
         entries.truncate(limit);
         entries
     }

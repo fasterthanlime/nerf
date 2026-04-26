@@ -21,12 +21,26 @@ pub struct TopEntry {
     /// Basename of the image (e.g. "libsystem_malloc.dylib"). Same
     /// availability semantics as `function_name`.
     pub binary: Option<String>,
+    /// True when the containing binary is the main executable rather
+    /// than a system / runtime dylib. The frontend uses this to colour
+    /// target-code rows distinctly.
+    pub is_main: bool,
 }
 
 #[derive(Clone, Debug, Facet)]
 pub struct TopUpdate {
     pub total_samples: u64,
     pub entries: Vec<TopEntry>,
+}
+
+/// Sort key for the top-N list. Truncation happens after sorting, so
+/// `ByTotal` will surface rows that are pure inner frames (high total,
+/// zero self) which `BySelf` would push past the limit.
+#[derive(Clone, Copy, Debug, Facet)]
+#[repr(u8)]
+pub enum TopSort {
+    BySelf = 0,
+    ByTotal = 1,
 }
 
 /// One disassembled instruction with its current sample count.
@@ -53,11 +67,11 @@ pub struct AnnotatedView {
 
 #[vox::service]
 pub trait Profiler {
-    /// Snapshot of the top-N functions by self time.
-    async fn top(&self, limit: u32) -> Vec<TopEntry>;
+    /// Snapshot of the top-N functions, ranked by `sort`.
+    async fn top(&self, limit: u32, sort: TopSort) -> Vec<TopEntry>;
 
-    /// Stream periodic top-N updates to the client.
-    async fn subscribe_top(&self, limit: u32, output: vox::Tx<TopUpdate>);
+    /// Stream periodic top-N updates to the client, ranked by `sort`.
+    async fn subscribe_top(&self, limit: u32, sort: TopSort, output: vox::Tx<TopUpdate>);
 
     /// Total number of samples observed since the server started.
     async fn total_samples(&self) -> u64;

@@ -25,6 +25,9 @@ pub struct LoadedBinary {
     pub avma_end: u64,
     pub text_svma: u64,
     pub arch: Option<String>,
+    /// Mach-O `MH_EXECUTE` (the target's main binary) vs every other
+    /// loaded image. Used by the UI to set the main executable apart.
+    pub is_executable: bool,
     pub symbols: Vec<LiveSymbolOwned>,
 }
 
@@ -64,6 +67,12 @@ impl CodeImage {
     }
 }
 
+pub struct ResolvedSymbol {
+    pub function_name: String,
+    pub binary: String,
+    pub is_main: bool,
+}
+
 pub struct ResolvedAddress {
     pub binary_path: String,
     pub arch: Option<String>,
@@ -88,6 +97,11 @@ pub struct BinaryRegistry {
     /// Lazily-opened macOS dyld shared cache (one per arch).
     dyld_bundle: Option<Option<Arc<DyldCacheBundle>>>,
     dyld_arch: Option<String>,
+    /// PID + Mach task port handed to us by `on_target_attached`.
+    /// Used to read instruction bytes directly from the target when an
+    /// address falls outside any mapped image (typically JIT'd code).
+    target_pid: Option<u32>,
+    target_task_port: Option<u64>,
 }
 
 struct DyldCacheBundle {
@@ -102,6 +116,15 @@ impl BinaryRegistry {
             images: std::collections::HashMap::new(),
             dyld_bundle: None,
             dyld_arch: None,
+            target_pid: None,
+            target_task_port: None,
+        }
+    }
+
+    pub fn set_target(&mut self, pid: u32, task_port: u64) {
+        self.target_pid = Some(pid);
+        if task_port != 0 {
+            self.target_task_port = Some(task_port);
         }
     }
 
@@ -121,21 +144,22 @@ impl BinaryRegistry {
         self.by_base.retain(|b| b.base_avma != base_avma);
     }
 
-    /// Resolve `address` to (function_name, binary_basename) without
-    /// loading any image bytes. Used by top-N rendering where we want
-    /// labels but don't need disassembly.
-    pub fn lookup_symbol(&self, address: u64) -> Option<(String, String)> {
+    /// Resolve `address` to a (function name, binary basename, is-main)
+    /// triple without loading any image bytes. Used by top-N rendering
+    /// where we want labels but don't need disassembly.
+    pub fn lookup_symbol(&self, address: u64) -> Option<ResolvedSymbol> {
         let binary = self
             .by_base
             .iter()
             .find(|b| address >= b.base_avma && address < b.avma_end)?;
         let svma = svma_for(binary, address);
         let basename = short_path(&binary.path).to_owned();
+        let is_main = binary.is_executable;
         // Symbols are sorted by start_svma at insert time. partition_point
         // gives us the first symbol whose start_svma > svma; the candidate
         // containing svma is the one before that (if its end_svma > svma).
         let idx = binary.symbols.partition_point(|s| s.start_svma <= svma);
-        let name = if idx > 0 {
+        let function_name = if idx > 0 {
             let candidate = &binary.symbols[idx - 1];
             if svma < candidate.end_svma {
                 let raw = String::from_utf8_lossy(&candidate.name).into_owned();
@@ -146,22 +170,33 @@ impl BinaryRegistry {
         } else {
             None
         };
-        name.map(|n| (n, basename.clone())).or_else(|| {
+        let function_name = function_name.unwrap_or_else(|| {
             // Binary is mapped but no symbol for this address — still
             // useful to show the basename so the user knows where the
             // sample landed.
-            Some((format!("{}+{:#x}", basename, svma), basename))
+            format!("{}+{:#x}", basename, svma)
+        });
+        Some(ResolvedSymbol {
+            function_name,
+            binary: basename,
+            is_main,
         })
     }
 
     /// Resolve `address` (AVMA) into a function: which binary, which
     /// symbol, and the bytes of the function. Lazily loads the binary's
-    /// `CodeImage` on first hit.
+    /// `CodeImage` on first hit. When no image is mapped at `address`
+    /// (typical for JIT'd code), falls back to reading bytes directly
+    /// out of the target process via `mach_vm_read`.
     pub fn resolve(&mut self, address: u64) -> Option<ResolvedAddress> {
-        let binary_idx = self
+        let binary_idx = match self
             .by_base
             .iter()
-            .position(|b| address >= b.base_avma && address < b.avma_end)?;
+            .position(|b| address >= b.base_avma && address < b.avma_end)
+        {
+            Some(i) => i,
+            None => return self.resolve_unmapped(address),
+        };
 
         // Snapshot the bits we need from the binary so we can drop the
         // borrow before touching `self.images` (which `&mut`s self).
@@ -220,6 +255,68 @@ impl BinaryRegistry {
             end_address,
             bytes,
         })
+    }
+
+    /// Fallback when `address` falls outside every mapped image: read
+    /// instruction bytes straight out of the target's address space.
+    /// Returns `None` if we never got a target task port (Linux, or
+    /// pre-attach), or if the read fails (page unmapped, etc.).
+    fn resolve_unmapped(&self, address: u64) -> Option<ResolvedAddress> {
+        // ±128 bytes of context around the queried address. Aligned down
+        // to a 4-byte boundary so the aarch64 disassembler stays in sync.
+        const WINDOW: u64 = 256;
+        let half = WINDOW / 2;
+        let base_address = (address.saturating_sub(half)) & !0x3;
+        let bytes = self.read_target_memory(base_address, WINDOW as usize)?;
+        // Detect the host arch from the dyld cache hint we picked up
+        // during `insert`; for unmapped addresses we have no per-binary
+        // arch tag of our own.
+        let arch = self.dyld_arch.clone();
+        Some(ResolvedAddress {
+            binary_path: String::from("(target memory)"),
+            arch,
+            function_name: format!("(unmapped) {:#x}", address),
+            base_address,
+            end_address: base_address + bytes.len() as u64,
+            bytes,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_target_memory(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+        use mach2::kern_return::KERN_SUCCESS;
+        use mach2::vm::mach_vm_read_overwrite;
+        use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
+
+        let task = self.target_task_port? as mach2::port::mach_port_t;
+        let mut buf = vec![0u8; len];
+        let mut got: mach_vm_size_t = 0;
+        let kr = unsafe {
+            mach_vm_read_overwrite(
+                task,
+                address as mach_vm_address_t,
+                len as mach_vm_size_t,
+                buf.as_mut_ptr() as mach_vm_address_t,
+                &mut got,
+            )
+        };
+        if kr != KERN_SUCCESS {
+            tracing::debug!(
+                "mach_vm_read_overwrite({:#x}, {}) failed: kr={}",
+                address,
+                len,
+                kr
+            );
+            return None;
+        }
+        buf.truncate(got as usize);
+        Some(buf)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn read_target_memory(&self, _address: u64, _len: usize) -> Option<Vec<u8>> {
+        // TODO: pread /proc/<pid>/mem on Linux.
+        None
     }
 
     fn image_for(&mut self, path: &str, arch: Option<&str>) -> Option<Arc<CodeImage>> {

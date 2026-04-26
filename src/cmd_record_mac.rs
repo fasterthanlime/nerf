@@ -15,7 +15,7 @@ use speedy::{Endianness, Writable};
 
 use nerf_mac_capture::process_launcher::{ReceivedStuff, TaskAccepter, TaskLauncher};
 use nerf_mac_capture::{
-    record as mac_record, record_with_task_and_tick_hook, BinaryLoadedEvent, BinaryUnloadedEvent,
+    record_with_task, record_with_task_and_tick_hook, BinaryLoadedEvent, BinaryUnloadedEvent,
     JitdumpEvent, RecordOptions, SampleEvent, SampleSink, ThreadNameEvent,
 };
 
@@ -26,7 +26,7 @@ use crate::archive::{
 use crate::args::{self, TargetProcess};
 use crate::live_sink::{
     BinaryLoadedEvent as LiveBinaryLoadedEvent, BinaryUnloadedEvent as LiveBinaryUnloadedEvent,
-    LiveSink, LiveSymbol, SampleEvent as LiveSampleEvent,
+    LiveSink, LiveSymbol, SampleEvent as LiveSampleEvent, TargetAttached,
 };
 use crate::utils::SigintHandler;
 
@@ -75,6 +75,18 @@ fn record_existing_pid(
 
     let mut sink = open_sink(&output_path, pid, &exe_path, &args)?;
     sink.live_sink = live_sink;
+
+    // Acquire the task port up front so we can hand it to the live sink
+    // (lets it read JIT'd bytes directly from the target via
+    // mach_vm_read), then pass the same port to `record_with_task`.
+    let task = task_for_pid_existing(pid)?;
+    if let Some(live) = sink.live_sink.as_ref() {
+        live.on_target_attached(&TargetAttached {
+            pid,
+            task_port: task as u64,
+        });
+    }
+
     let sigint = SigintHandler::new();
     let start = std::time::Instant::now();
     let time_limit = args.profiler_args.time_limit.map(Duration::from_secs);
@@ -87,7 +99,7 @@ fn record_existing_pid(
     };
 
     info!("Running... press Ctrl-C to stop.");
-    if let Err(err) = mac_record(opts, &mut sink, should_stop) {
+    if let Err(err) = record_with_task(task, opts, &mut sink, should_stop) {
         return Err(format!("nerf-mac-capture::record failed: {}", err).into());
     }
 
@@ -124,6 +136,15 @@ fn record_child_launch(
     info!("Recording PID {} -> {}", pid, output_path.display());
     let mut sink = open_sink(&output_path, pid, &exe_path, &args)?;
     sink.live_sink = live_sink;
+
+    // The child path already holds the task port from the bootstrap IPC;
+    // hand it to the live sink before resuming the child.
+    if let Some(live) = sink.live_sink.as_ref() {
+        live.on_target_attached(&TargetAttached {
+            pid,
+            task_port: accepted_task.task() as u64,
+        });
+    }
 
     // Resume the child now that we have the task port and the headers
     // are written.
@@ -269,6 +290,22 @@ fn resolve_output_path(args: &args::RecordArgs, pid: u32, exe_path: &str) -> Pat
         pid,
         basename
     ))
+}
+
+/// Acquire a Mach task port for an existing PID. Mirrors what
+/// `nerf-mac-capture::record` does internally — but there we use it via
+/// `record_with_task` so the same port can be handed to the live sink.
+fn task_for_pid_existing(pid: u32) -> Result<mach2::port::mach_port_t, Box<dyn Error>> {
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::port::{mach_port_t, MACH_PORT_NULL};
+    use mach2::traps::{mach_task_self, task_for_pid};
+
+    let mut task: mach_port_t = MACH_PORT_NULL;
+    let kr = unsafe { task_for_pid(mach_task_self(), pid as i32, &mut task) };
+    if kr != KERN_SUCCESS {
+        return Err(format!("task_for_pid({}) failed: kr={}", pid, kr).into());
+    }
+    Ok(task)
 }
 
 fn sigint_or_deadline(
@@ -422,6 +459,7 @@ impl SampleSink for MacSink {
                 vmsize: ev.vmsize,
                 text_svma: ev.text_svma,
                 arch: ev.arch,
+                is_executable: ev.is_executable,
                 symbols: &live_symbols,
             });
         }

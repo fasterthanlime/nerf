@@ -132,10 +132,9 @@ body {
 }
 
 .frozen-badge {
-  position: sticky;
-  top: 0;
-  float: right;
-  margin: 4px 8px;
+  position: absolute;
+  top: 4px;
+  right: 4px;
   padding: 2px 8px;
   font-size: 11px;
   background: #2a2418;
@@ -175,6 +174,19 @@ table.top-table th {
 
 table.top-table th.num-h {
   text-align: right;
+}
+
+table.top-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+table.top-table th.sortable:hover {
+  color: #e6e8eb;
+}
+
+table.top-table th.sortable.active {
+  color: #d3b75f;
 }
 
 table.top-table td {
@@ -220,6 +232,15 @@ td.bin {
   text-overflow: ellipsis;
 }
 
+/* Rows backed by the main executable (target code) get a distinct
+   accent so they read apart from system / runtime dylibs at a glance. */
+table.top-table tr.main td.fn {
+  color: #b8e0a3;
+}
+table.top-table tr.main td.bin {
+  color: #7fa86a;
+}
+
 /* ---------- annotation pane ---------- */
 
 .annotation {
@@ -245,9 +266,39 @@ td.bin {
   text-overflow: ellipsis;
 }
 
+.ann-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
 .ann-body {
   flex: 1 1 auto;
   min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.ann-minimap {
+  flex: 0 0 auto;
+  width: 22px;
+  border-left: 1px solid #232629;
+  background: #0a0b0d;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.ann-minimap .mm-row {
+  flex: 1 1 0;
+  min-height: 1px;
+  cursor: pointer;
+}
+
+.ann-minimap .mm-row:hover {
+  outline: 1px solid #d3b75f;
+  outline-offset: -1px;
+  z-index: 1;
 }
 
 table.asm {
@@ -263,13 +314,16 @@ table.asm td {
 }
 
 table.asm td.num {
-  width: 4em;
+  width: 1px; /* shrink to content */
+  padding-right: 6px;
   color: #d35f5f;
+  white-space: nowrap;
 }
 
 table.asm td.addr {
   color: #6c7480;
-  width: 9em;
+  width: 5em;
+  text-align: right;
 }
 
 table.asm td.asm-line {

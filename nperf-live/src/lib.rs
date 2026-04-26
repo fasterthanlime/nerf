@@ -12,10 +12,10 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
 use nperf_core::live_sink::{
-    BinaryLoadedEvent, BinaryUnloadedEvent, LiveSink, SampleEvent,
+    BinaryLoadedEvent, BinaryUnloadedEvent, LiveSink, SampleEvent, TargetAttached,
 };
 use nperf_live_proto::{
-    AnnotatedLine, AnnotatedView, Profiler, ProfilerDispatcher, TopEntry, TopUpdate,
+    AnnotatedLine, AnnotatedView, Profiler, ProfilerDispatcher, TopEntry, TopSort, TopUpdate,
 };
 
 mod aggregator;
@@ -35,6 +35,10 @@ pub(crate) enum LiveEvent {
     BinaryLoaded(binaries::LoadedBinary),
     BinaryUnloaded {
         base_avma: u64,
+    },
+    TargetAttached {
+        pid: u32,
+        task_port: u64,
     },
 }
 
@@ -65,6 +69,7 @@ impl LiveSink for LiveSinkImpl {
             avma_end: event.base_avma + event.vmsize,
             text_svma: event.text_svma,
             arch: event.arch.map(|s| s.to_owned()),
+            is_executable: event.is_executable,
             symbols,
         };
         let _ = self.tx.send(LiveEvent::BinaryLoaded(loaded));
@@ -73,6 +78,13 @@ impl LiveSink for LiveSinkImpl {
     fn on_binary_unloaded(&self, event: &BinaryUnloadedEvent) {
         let _ = self.tx.send(LiveEvent::BinaryUnloaded {
             base_avma: event.base_avma,
+        });
+    }
+
+    fn on_target_attached(&self, event: &TargetAttached) {
+        let _ = self.tx.send(LiveEvent::TargetAttached {
+            pid: event.pid,
+            task_port: event.task_port,
         });
     }
 }
@@ -84,18 +96,18 @@ pub struct LiveServer {
 }
 
 impl Profiler for LiveServer {
-    async fn top(&self, limit: u32) -> Vec<TopEntry> {
-        build_top_entries(&self.aggregator, &self.binaries, limit as usize)
+    async fn top(&self, limit: u32, sort: TopSort) -> Vec<TopEntry> {
+        build_top_entries(&self.aggregator, &self.binaries, limit as usize, sort)
     }
 
-    async fn subscribe_top(&self, limit: u32, output: vox::Tx<TopUpdate>) {
+    async fn subscribe_top(&self, limit: u32, sort: TopSort, output: vox::Tx<TopUpdate>) {
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             interval.tick().await;
             let snapshot = {
-                let entries = build_top_entries(&aggregator, &binaries, limit as usize);
+                let entries = build_top_entries(&aggregator, &binaries, limit as usize, sort);
                 let total_samples = aggregator.read().total_samples();
                 TopUpdate {
                     total_samples,
@@ -132,6 +144,7 @@ fn build_top_entries(
     aggregator: &Arc<RwLock<Aggregator>>,
     binaries: &Arc<RwLock<BinaryRegistry>>,
     limit: usize,
+    sort: TopSort,
 ) -> Vec<TopEntry> {
     use std::collections::HashMap;
 
@@ -154,12 +167,14 @@ fn build_top_entries(
         total_total: u64,
         function_name: Option<String>,
         binary: Option<String>,
+        is_main: bool,
     }
     let mut groups: HashMap<(String, String), Agg> = HashMap::new();
     for e in raw {
-        let (fn_name, bin) = match binaries.lookup_symbol(e.address) {
-            Some((n, b)) => (Some(n), Some(b)),
-            None => (None, None),
+        let resolved = binaries.lookup_symbol(e.address);
+        let (fn_name, bin, is_main) = match resolved {
+            Some(r) => (Some(r.function_name), Some(r.binary), r.is_main),
+            None => (None, None, false),
         };
         // Unresolved entries get their own group (keyed by address) so
         // we don't collapse different unknown rows into one.
@@ -188,6 +203,7 @@ fn build_top_entries(
                 total_total: e.total_count,
                 function_name: fn_name,
                 binary: bin,
+                is_main,
             });
     }
 
@@ -199,9 +215,19 @@ fn build_top_entries(
             total_count: g.total_total,
             function_name: g.function_name,
             binary: g.binary,
+            is_main: g.is_main,
         })
         .collect();
-    out.sort_by(|a, b| b.self_count.cmp(&a.self_count));
+    out.sort_by(|a, b| match sort {
+        TopSort::BySelf => b
+            .self_count
+            .cmp(&a.self_count)
+            .then_with(|| b.total_count.cmp(&a.total_count)),
+        TopSort::ByTotal => b
+            .total_count
+            .cmp(&a.total_count)
+            .then_with(|| b.self_count.cmp(&a.self_count)),
+    });
     out.truncate(limit);
     out
 }
@@ -264,6 +290,9 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
                     }
                     LiveEvent::BinaryUnloaded { base_avma } => {
                         binaries.write().remove(base_avma);
+                    }
+                    LiveEvent::TargetAttached { pid, task_port } => {
+                        binaries.write().set_target(pid, task_port);
                     }
                 }
             }

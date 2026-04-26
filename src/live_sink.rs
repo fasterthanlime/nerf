@@ -34,6 +34,10 @@ pub struct BinaryLoadedEvent< 'a > {
     /// Architecture identifier matching `archive::Packet::MachineInfo`
     /// (e.g. "aarch64", "amd64"). Used to pick the disassembler.
     pub arch: Option< &'a str >,
+    /// Whether this image is the main executable (Mach-O `MH_EXECUTE`
+    /// / ELF `ET_EXEC`/`ET_DYN` with PIE). The live UI uses this to
+    /// visually distinguish target code from system dylibs.
+    pub is_executable: bool,
     pub symbols: &'a [LiveSymbol< 'a >],
 }
 
@@ -42,8 +46,24 @@ pub struct BinaryUnloadedEvent< 'a > {
     pub base_avma: u64,
 }
 
+/// One-shot init event sent when the recorder has acquired its handle on
+/// the target. `task_port` is the macOS Mach task port (a `mach_port_t`
+/// widened to u64); on Linux it's 0 and the registry falls back to
+/// `/proc/<pid>/mem`. The registry uses these to read instruction bytes
+/// directly from the target when an address falls outside any mapped
+/// image (typically JIT'd code).
+pub struct TargetAttached {
+    pub pid: u32,
+    pub task_port: u64,
+}
+
 pub trait LiveSink: Send + Sync {
     fn on_sample( &self, event: &SampleEvent );
+
+    /// Recorder acquired its handle on the target. Fires once at the
+    /// start of recording, before any samples.
+    #[allow(unused_variables)]
+    fn on_target_attached( &self, event: &TargetAttached ) {}
 
     /// A new image was mapped into the target process.
     #[allow(unused_variables)]
