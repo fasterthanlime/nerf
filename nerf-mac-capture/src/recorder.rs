@@ -277,6 +277,7 @@ fn sample_all_threads<S: SampleSink>(
             pid,
             tid,
             backtrace: &backtrace,
+            kernel_backtrace: &[],
         });
     }
     Ok(())
@@ -333,7 +334,11 @@ impl Drop for ThreadList {
     }
 }
 
-fn get_thread_id_and_name(
+/// Look up the kernel-stable thread id (matches kperf's `arg5`) and
+/// the pthread-set name for a `mach_port_t` thread port. Returns
+/// `(tid, name)` where name is `None` if `pthread_setname_np` was
+/// never called or the read failed.
+pub fn get_thread_id_and_name(
     thread_act: mach_port_t,
 ) -> crate::kernel_error::Result<(u32, Option<String>)> {
     // THREAD_IDENTIFIER_INFO -> stable thread_id (matches `gettid`-ish semantics).
@@ -382,19 +387,22 @@ fn get_thread_id_and_name(
     Ok((tid, name))
 }
 
-struct ThreadNameCache {
+/// Tracks which (tid, name) pairs we've already reported so the
+/// recorder only emits a `ThreadNameEvent` when the binding actually
+/// changes (or appears for the first time).
+pub struct ThreadNameCache {
     seen: std::collections::HashMap<u32, String>,
 }
 
 impl ThreadNameCache {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             seen: std::collections::HashMap::new(),
         }
     }
 
     /// Returns true iff the thread name was newly seen or has changed.
-    fn note_thread(&mut self, tid: u32, name: &str) -> bool {
+    pub fn note_thread(&mut self, tid: u32, name: &str) -> bool {
         match self.seen.get(&tid) {
             Some(existing) if existing == name => false,
             _ => {
@@ -402,5 +410,11 @@ impl ThreadNameCache {
                 true
             }
         }
+    }
+}
+
+impl Default for ThreadNameCache {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -24,13 +24,20 @@ pub trait SampleSink {
     fn on_jitdump(&mut self, ev: JitdumpEvent<'_>) {}
 }
 
-/// One sample. `backtrace` is callee-most first; addresses are absolute
+/// One sample. Backtraces are callee-most first; addresses are absolute
 /// (i.e. AVMAs in samply terminology, runtime instruction pointers).
 pub struct SampleEvent<'a> {
     pub timestamp_ns: u64,
     pub pid: u32,
     pub tid: u32,
+    /// User-space stack. Empty for samples taken while the thread was
+    /// in-kernel (and the kperf backend couldn't walk the user side).
     pub backtrace: &'a [u64],
+    /// Kernel stack (callee-most first), or empty if the recorder
+    /// can't or didn't capture kernel frames. nerf-mac-capture (the
+    /// suspend-and-walk path) always emits empty here; nerf-mac-kperf
+    /// fills it when kperf walked the kernel side.
+    pub kernel_backtrace: &'a [u64],
 }
 
 pub struct BinaryLoadedEvent<'a> {

@@ -10,12 +10,17 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use mach2::kern_return::KERN_SUCCESS;
+use mach2::mach_types::thread_act_array_t;
+use mach2::message::mach_msg_type_number_t;
 use mach2::port::{mach_port_t, MACH_PORT_NULL};
+use mach2::task::task_threads;
 use mach2::traps::{mach_task_self, task_for_pid};
+use mach2::vm::mach_vm_deallocate;
 
 use nerf_mac_capture::proc_maps::{DyldInfo, DyldInfoManager, Modification};
+use nerf_mac_capture::recorder::{get_thread_id_and_name, ThreadNameCache};
 use nerf_mac_capture::{
-    BinaryLoadedEvent, BinaryUnloadedEvent, SampleEvent, SampleSink,
+    BinaryLoadedEvent, BinaryUnloadedEvent, SampleEvent, SampleSink, ThreadNameEvent,
 };
 
 use crate::bindings::{self, sampler, Frameworks};
@@ -89,20 +94,81 @@ pub fn record<S: SampleSink>(
     // analysis side which dylib each PC came from.
     let task = task_for_pid_existing(opts.pid)?;
     let mut dyld = DyldInfoManager::new(task);
+    let mut thread_names = ThreadNameCache::new();
 
     let t0 = Instant::now();
     apply_dyld_changes(&mut dyld, opts.pid, sink);
     log::info!("initial dyld scan took {:?}", t0.elapsed());
+
+    scan_thread_names(task, opts.pid, sink, &mut thread_names);
 
     let t0 = Instant::now();
     let mut session = Session::start(&fw, &opts)?;
     session.enable_kdebug(&opts)?;
     log::info!("kperf+kdebug arming took {:?}", t0.elapsed());
 
-    drain_loop(&fw, &opts, sink, &mut dyld, &mut should_stop)?;
+    drain_loop(&fw, &opts, sink, task, &mut dyld, &mut thread_names, &mut should_stop)?;
 
     drop(session);
     Ok(())
+}
+
+/// Enumerate the target task's threads and emit a `ThreadNameEvent`
+/// for every (tid, name) binding the cache hasn't seen yet.
+fn scan_thread_names<S: SampleSink>(
+    task: mach_port_t,
+    pid: u32,
+    sink: &mut S,
+    cache: &mut ThreadNameCache,
+) {
+    let mut ptr: thread_act_array_t = std::ptr::null_mut();
+    let mut len: mach_msg_type_number_t = 0;
+    let kr = unsafe { task_threads(task, &mut ptr, &mut len) };
+    if kr != KERN_SUCCESS {
+        log::debug!("task_threads failed: kr={kr}");
+        return;
+    }
+    let threads = if ptr.is_null() || len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    };
+    let mut named = 0u32;
+    let mut nameless = 0u32;
+    for &thread_act in threads {
+        match get_thread_id_and_name(thread_act) {
+            Ok((tid, Some(name))) => {
+                named += 1;
+                log::trace!("thread tid={tid} name={name}");
+                if cache.note_thread(tid, &name) {
+                    sink.on_thread_name(ThreadNameEvent { pid, tid, name: &name });
+                }
+            }
+            Ok((tid, None)) => {
+                nameless += 1;
+                log::trace!("thread tid={tid} (no name)");
+            }
+            Err(err) => {
+                log::trace!("get_thread_id_and_name failed: {err:?}");
+            }
+        }
+    }
+    log::debug!(
+        "scan_thread_names: pid={pid} threads={} named={named} nameless={nameless}",
+        threads.len()
+    );
+    // Release per-thread port rights and the array allocation; otherwise
+    // we leak a port reference per scan.
+    unsafe {
+        for &port in threads {
+            let _ = mach2::mach_port::mach_port_deallocate(mach_task_self(), port);
+        }
+        if !ptr.is_null() && len > 0 {
+            let bytes =
+                len as u64 * std::mem::size_of::<mach_port_t>() as u64;
+            let _ = mach_vm_deallocate(mach_task_self(), ptr as u64, bytes);
+        }
+    }
 }
 
 fn task_for_pid_existing(pid: u32) -> Result<mach_port_t, Error> {
@@ -266,7 +332,9 @@ fn drain_loop<S: SampleSink>(
     _fw: &Frameworks,
     opts: &RecordOptions,
     sink: &mut S,
+    task: mach_port_t,
     dyld: &mut DyldInfoManager,
+    thread_names: &mut ThreadNameCache,
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<(), Error> {
     let start = Instant::now();
@@ -279,6 +347,10 @@ fn drain_loop<S: SampleSink>(
     // image table hasn't moved.
     let dyld_period = Duration::from_millis(250);
     let mut next_dyld = Instant::now() + dyld_period;
+    // Thread-name scan is cheap (one task_threads + thread_info per
+    // thread) but we still don't need it every drain tick.
+    let thread_period = Duration::from_millis(500);
+    let mut next_thread = Instant::now() + thread_period;
 
     let mut buf: Vec<KdBuf> = vec![
         KdBuf {
@@ -316,6 +388,10 @@ fn drain_loop<S: SampleSink>(
             apply_dyld_changes(dyld, opts.pid, sink);
             next_dyld = Instant::now() + dyld_period;
         }
+        if Instant::now() >= next_thread {
+            scan_thread_names(task, opts.pid, sink, thread_names);
+            next_thread = Instant::now() + thread_period;
+        }
 
         let n = kdebug::read_trace(&mut buf)?;
         if n == 0 {
@@ -333,13 +409,12 @@ fn drain_loop<S: SampleSink>(
                 *histogram.entry(key).or_insert(0) += 1;
             }
             parser.feed(rec, |sample| {
-                let backtrace: Vec<u64> =
-                    sample.user_backtrace.iter().copied().collect();
                 sink.on_sample(SampleEvent {
                     timestamp_ns: sample.timestamp_ns,
                     pid: opts.pid,
                     tid: sample.tid,
-                    backtrace: &backtrace,
+                    backtrace: sample.user_backtrace,
+                    kernel_backtrace: sample.kernel_backtrace,
                 });
             });
         }

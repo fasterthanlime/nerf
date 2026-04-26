@@ -449,13 +449,14 @@ impl SampleSink for MacSink {
                 initial_address: None,
             })
             .collect();
+        let kernel_backtrace: Vec<u64> = ev.kernel_backtrace.to_vec();
         if let Some(sink) = self.live_sink.as_ref() {
             sink.on_sample(&LiveSampleEvent {
                 timestamp: ev.timestamp_ns,
                 pid: ev.pid,
                 tid: ev.tid,
                 cpu: u32::MAX,
-                kernel_backtrace: &[],
+                kernel_backtrace: &kernel_backtrace,
                 user_backtrace: &user_backtrace,
             });
         }
@@ -464,7 +465,7 @@ impl SampleSink for MacSink {
             pid: ev.pid,
             tid: ev.tid,
             cpu: u32::MAX, // unknown / not tracked on mac yet
-            kernel_backtrace: Cow::Owned(Vec::new()),
+            kernel_backtrace: Cow::Owned(kernel_backtrace),
             user_backtrace: Cow::Owned(user_backtrace),
         };
         if let Err(err) = self.write_packet(packet) {

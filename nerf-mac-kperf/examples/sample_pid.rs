@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     struct CountingSink {
         samples: u64,
         total_frames: u64,
+        total_kernel_frames: u64,
         empty_samples: u64,
         printed: u32,
     }
@@ -45,17 +46,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fn on_sample(&mut self, ev: SampleEvent<'_>) {
             self.samples += 1;
             self.total_frames += ev.backtrace.len() as u64;
-            if ev.backtrace.is_empty() {
+            self.total_kernel_frames += ev.kernel_backtrace.len() as u64;
+            if ev.backtrace.is_empty() && ev.kernel_backtrace.is_empty() {
                 self.empty_samples += 1;
             }
-            if self.printed < 3 && !ev.backtrace.is_empty() {
+            if self.printed < 3 && (!ev.backtrace.is_empty() || !ev.kernel_backtrace.is_empty()) {
                 self.printed += 1;
                 println!(
-                    "[sample] tid={} ts={} frames={}: top={:#x}",
+                    "[sample] tid={} ts={} u={} k={}",
                     ev.tid,
                     ev.timestamp_ns,
                     ev.backtrace.len(),
-                    ev.backtrace[0],
+                    ev.kernel_backtrace.len(),
                 );
             }
         }
@@ -75,19 +77,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sink = CountingSink {
         samples: 0,
         total_frames: 0,
+        total_kernel_frames: 0,
         empty_samples: 0,
         printed: 0,
     };
     record(opts, &mut sink, || false)?;
 
-    let avg = if sink.samples == 0 {
+    let avg_u = if sink.samples == 0 {
         0.0
     } else {
         sink.total_frames as f64 / sink.samples as f64
     };
+    let avg_k = if sink.samples == 0 {
+        0.0
+    } else {
+        sink.total_kernel_frames as f64 / sink.samples as f64
+    };
     println!(
-        "duration={}s, samples={}, total_frames={}, avg_frames={:.1}, empty={}",
-        secs, sink.samples, sink.total_frames, avg, sink.empty_samples,
+        "duration={}s, samples={}, avg_user_frames={:.1}, avg_kernel_frames={:.1}, empty={}",
+        secs, sink.samples, avg_u, avg_k, sink.empty_samples,
     );
     Ok(())
 }
