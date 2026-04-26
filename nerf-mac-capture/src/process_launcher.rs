@@ -15,8 +15,9 @@
 //!   - The iteration_count / ignore_exit_code knobs are dropped: launch
 //!     once, profile until exit.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::prelude::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -71,11 +72,11 @@ impl TaskLauncher {
     }
 
     pub fn launch_child(&self) -> Child {
-        match Command::new(&self.program)
-            .args(&self.args)
-            .envs(self.extra_env.iter().map(|(k, v)| (k, v)))
-            .spawn()
-        {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args)
+            .envs(self.extra_env.iter().map(|(k, v)| (k, v)));
+        drop_sudo_privileges(&mut cmd);
+        match cmd.spawn() {
             Ok(child) => child,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!(
@@ -191,6 +192,83 @@ impl AcceptedTask {
         } else {
             unsafe { task_resume(self.task) };
         }
+    }
+}
+
+/// If the parent is running as root via sudo, configure `cmd` so the
+/// spawned child drops to the invoking user (from `SUDO_UID` /
+/// `SUDO_GID` / `SUDO_USER`) before `execve`. Also rewrites `HOME`,
+/// `USER`, and `LOGNAME` so the child doesn't end up reading config
+/// out of `/var/root`. No-op when the parent isn't root.
+pub fn drop_sudo_privileges(cmd: &mut Command) {
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let Some(uid) = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
+        log::warn!("running as root but SUDO_UID is unset; child will run as root");
+        return;
+    };
+    let gid = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(uid);
+    let user = std::env::var_os("SUDO_USER");
+
+    if let Some(ref u) = user {
+        cmd.env("USER", u);
+        cmd.env("LOGNAME", u);
+        if let Some(home) = lookup_home(u) {
+            cmd.env("HOME", home);
+        }
+    }
+
+    log::info!(
+        "Dropping child privileges to uid={} gid={} user={}",
+        uid,
+        gid,
+        user.as_deref()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unknown>".into())
+    );
+
+    let user_cstr = user
+        .as_deref()
+        .and_then(|s| CString::new(s.as_bytes()).ok());
+
+    unsafe {
+        cmd.pre_exec(move || {
+            if let Some(ref u) = user_cstr {
+                if libc::initgroups(u.as_ptr(), gid as _) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if libc::setgid(gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(uid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn lookup_home(user: &OsStr) -> Option<OsString> {
+    let cstr = CString::new(user.as_bytes()).ok()?;
+    unsafe {
+        let pwd = libc::getpwnam(cstr.as_ptr());
+        if pwd.is_null() {
+            return None;
+        }
+        let dir = (*pwd).pw_dir;
+        if dir.is_null() {
+            return None;
+        }
+        let bytes = std::ffi::CStr::from_ptr(dir).to_bytes();
+        Some(OsStr::from_bytes(bytes).to_owned())
     }
 }
 

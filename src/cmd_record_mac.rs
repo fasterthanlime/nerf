@@ -13,7 +13,9 @@ use std::time::Duration;
 use chrono::prelude::*;
 use speedy::{Endianness, Writable};
 
-use nerf_mac_capture::process_launcher::{ReceivedStuff, TaskAccepter, TaskLauncher};
+use nerf_mac_capture::process_launcher::{
+    drop_sudo_privileges, ReceivedStuff, TaskAccepter, TaskLauncher,
+};
 use nerf_mac_capture::{
     record_with_task, record_with_task_and_tick_hook, BinaryLoadedEvent, BinaryUnloadedEvent,
     JitdumpEvent, RecordOptions, SampleEvent, SampleSink, ThreadNameEvent,
@@ -256,8 +258,10 @@ fn record_child_launch_kperf(
     use std::process::Command;
 
     info!("Launching {}...", program);
-    let mut child = Command::new(&program)
-        .args(&program_args)
+    let mut cmd = Command::new(&program);
+    cmd.args(&program_args);
+    drop_sudo_privileges(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|err| format!("failed to spawn {program}: {err}"))?;
     let pid = child.id();
