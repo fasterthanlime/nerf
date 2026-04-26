@@ -22,6 +22,7 @@ mod aggregator;
 mod binaries;
 mod disassemble;
 mod highlight;
+mod source;
 
 pub use aggregator::Aggregator;
 pub use binaries::{BinaryRegistry, LoadedBinary};
@@ -93,6 +94,10 @@ impl LiveSink for LiveSinkImpl {
 pub struct LiveServer {
     pub aggregator: Arc<RwLock<Aggregator>>,
     pub binaries: Arc<RwLock<BinaryRegistry>>,
+    /// One source resolver per server. addr2line `Context` isn't `Sync`
+    /// (interior `LazyCell`s), so we use a `Mutex` rather than `RwLock`.
+    /// Be careful not to hold this guard across `.await`.
+    pub source: Arc<parking_lot::Mutex<source::SourceResolver>>,
 }
 
 impl Profiler for LiveServer {
@@ -127,12 +132,13 @@ impl Profiler for LiveServer {
     async fn subscribe_annotated(&self, address: u64, output: vox::Tx<AnnotatedView>) {
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
+        let source = self.source.clone();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             interval.tick().await;
             // Build the view in a sync block so neither the parking_lot guards
             // nor the (non-Send) arborium Highlighter cross an await.
-            let view = build_annotated_view(&aggregator, &binaries, address);
+            let view = build_annotated_view(&aggregator, &binaries, &source, address);
             if output.send(view).await.is_err() {
                 break;
             }
@@ -235,6 +241,7 @@ fn build_top_entries(
 fn build_annotated_view(
     aggregator: &Arc<RwLock<Aggregator>>,
     binaries: &Arc<RwLock<BinaryRegistry>>,
+    source: &Arc<parking_lot::Mutex<source::SourceResolver>>,
     address: u64,
 ) -> AnnotatedView {
     // Resolve binary + symbol + bytes outside the aggregator lock; the
@@ -243,13 +250,39 @@ fn build_annotated_view(
     let resolved = binaries.write().resolve(address);
 
     let mut hl = highlight::AsmHighlighter::new();
-    let lines: Vec<AnnotatedLine> = match &resolved {
+    let mut lines: Vec<AnnotatedLine> = match &resolved {
         Some(r) => {
             let agg = aggregator.read();
             disassemble::disassemble(r, &mut hl, |addr| agg.self_count(addr))
         }
         None => Vec::new(),
     };
+
+    // Layer source-line headers onto the asm rows. Only mapped binaries
+    // with DWARF participate; for the unmapped (target-memory) path,
+    // `image` is None and we just leave `source_header` unset.
+    if let Some(r) = resolved.as_ref()
+        && let Some(image) = r.image.as_ref()
+    {
+        let mut src = source.lock();
+        let mut last: Option<(String, u32)> = None;
+        for line in lines.iter_mut() {
+            // The asm address is in AVMA space; addr2line wants SVMA.
+            let svma = r.fn_start_svma + (line.address - r.base_address);
+            let here = src.locate(&r.binary_path, image, svma);
+            if here != last {
+                if let Some((ref file, ln)) = here {
+                    let html = src.snippet(file, ln);
+                    line.source_header = Some(nperf_live_proto::SourceHeader {
+                        file: file.clone(),
+                        line: ln,
+                        html,
+                    });
+                }
+                last = here;
+            }
+        }
+    }
 
     let function_name = match &resolved {
         Some(r) => r.function_name.clone(),
@@ -307,6 +340,7 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
     let server = LiveServer {
         aggregator,
         binaries,
+        source: Arc::new(parking_lot::Mutex::new(source::SourceResolver::new())),
     };
     let dispatcher = ProfilerDispatcher::new(server);
     let handle = tokio::spawn(async move {

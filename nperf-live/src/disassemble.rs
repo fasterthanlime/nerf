@@ -63,6 +63,7 @@ fn disassemble_aarch64(
             address,
             html: hl.highlight_line(&asm),
             self_count: self_count(address),
+            source_header: None,
         });
         offset += 4;
     }
@@ -89,6 +90,7 @@ fn disassemble_amd64(
                     address,
                     html: hl.highlight_line(&asm),
                     self_count: self_count(address),
+                    source_header: None,
                 });
                 offset += len.max(1);
             }
@@ -97,6 +99,7 @@ fn disassemble_amd64(
                     address,
                     html: hl.highlight_line(&format!("<decode error: {}>", err)),
                     self_count: self_count(address),
+                    source_header: None,
                 });
                 offset += 1;
             }

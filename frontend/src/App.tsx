@@ -272,9 +272,35 @@ function Annotation({
         <div className="ann-body" ref={bodyRef}>
           <table className="asm">
             <tbody>
-              {lines.map((line) => {
+              {lines.flatMap((line) => {
                 const off = line.address - view!.base_address;
-                return (
+                const sh = line.source_header;
+                const rows = [];
+                if (sh) {
+                  // Banner row above the asm rows for this source line.
+                  // file:line on the left, highlighted snippet on the right.
+                  const basename = sh.file.split("/").pop() ?? sh.file;
+                  rows.push(
+                    <tr
+                      key={`src-${String(line.address)}`}
+                      className="src-header"
+                    >
+                      <td className="src-loc" colSpan={2}>
+                        {basename}:{sh.line}
+                      </td>
+                      <td
+                        className="src-snip"
+                        dangerouslySetInnerHTML={{
+                          __html:
+                            sh.html.length > 0
+                              ? sh.html
+                              : "(source not on disk)",
+                        }}
+                      />
+                    </tr>,
+                  );
+                }
+                rows.push(
                   <tr
                     key={String(line.address)}
                     data-addr={String(line.address)}
@@ -288,8 +314,9 @@ function Annotation({
                       className="asm-line"
                       dangerouslySetInnerHTML={{ __html: line.html }}
                     />
-                  </tr>
+                  </tr>,
                 );
+                return rows;
               })}
             </tbody>
           </table>

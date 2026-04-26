@@ -85,6 +85,14 @@ pub struct ResolvedAddress {
     /// `CodeImage` (whose `Arc<Vec<u8>>` we don't want to expose past the
     /// registry lock).
     pub bytes: Vec<u8>,
+    /// SVMA the function starts at — i.e. `base_address` translated back
+    /// into the binary's symbol-VMA space. We need this to ask DWARF for
+    /// the (file, line) of each instruction.
+    pub fn_start_svma: u64,
+    /// The full image bytes for DWARF lookups. `None` for the
+    /// "unmapped target memory" path where we don't have a binary at
+    /// all.
+    pub image: Option<Arc<CodeImage>>,
 }
 
 pub struct BinaryRegistry {
@@ -254,6 +262,8 @@ impl BinaryRegistry {
             base_address,
             end_address,
             bytes,
+            fn_start_svma,
+            image: Some(image),
         })
     }
 
@@ -279,6 +289,8 @@ impl BinaryRegistry {
             base_address,
             end_address: base_address + bytes.len() as u64,
             bytes,
+            fn_start_svma: base_address,
+            image: None,
         })
     }
 

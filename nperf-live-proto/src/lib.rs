@@ -43,15 +43,34 @@ pub enum TopSort {
     ByTotal = 1,
 }
 
+/// Source-line header attached to the first instruction generated from
+/// a given (file, line) pair. The frontend renders one of these as a
+/// banner row above the asm row whenever the source location changes
+/// between consecutive instructions.
+#[derive(Clone, Debug, Facet)]
+pub struct SourceHeader {
+    pub file: String,
+    pub line: u32,
+    /// Highlighted source-line snippet (arborium custom-tag HTML); empty
+    /// when the file couldn't be loaded (build-machine-relative paths,
+    /// missing source on this box, etc.).
+    pub html: String,
+}
+
 /// One disassembled instruction with its current sample count.
 #[derive(Clone, Debug, Facet)]
 pub struct AnnotatedLine {
     pub address: u64,
-    /// HTML-highlighted assembly text. Uses the class-name format of
-    /// `arborium` (`<span class="a-k">mov</span>` etc.). Render with
-    /// `dangerouslySetInnerHTML` and style the classes via CSS.
+    /// HTML-highlighted assembly text. Uses arborium's default
+    /// `CustomElements` format (`<a-k>mov</a-k>` etc.); the frontend
+    /// styles those tags via the generated theme.css. Render with
+    /// `dangerouslySetInnerHTML`.
     pub html: String,
     pub self_count: u64,
+    /// Set on the first instruction emitted for a new source location.
+    /// `None` for instructions that share their source line with the
+    /// previous instruction, and for binaries without DWARF.
+    pub source_header: Option<SourceHeader>,
 }
 
 #[derive(Clone, Debug, Facet)]

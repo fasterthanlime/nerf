@@ -329,3 +329,28 @@ table.asm td.addr {
 table.asm td.asm-line {
   white-space: pre;
 }
+
+table.asm tr.src-header {
+  background: #11161c;
+  border-top: 1px solid #1c2329;
+}
+
+table.asm tr.src-header td {
+  border-bottom: none;
+  padding-top: 4px;
+  padding-bottom: 2px;
+}
+
+table.asm td.src-loc {
+  color: #6c7480;
+  font-size: 11px;
+  width: 14em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+table.asm td.src-snip {
+  color: #c8d3e0;
+  white-space: pre;
+}

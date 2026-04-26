@@ -20,15 +20,24 @@ impl AsmHighlighter {
         }
     }
 
-    /// Highlight one line of assembly. Returns class-name HTML on success;
-    /// falls back to plain (escaped) text on error so the UI still renders.
+    /// Highlight one line of assembly.
     pub fn highlight_line(&mut self, asm: &str) -> String {
-        match self.inner.highlight("asm", asm) {
+        self.highlight_in("asm", asm)
+    }
+
+    /// Construct a highlighter aimed at arbitrary languages. Same arborium
+    /// instance, just a different default-language convention.
+    pub fn new_for_source() -> Self {
+        Self::new()
+    }
+
+    /// Highlight `text` in `lang` (an arborium language id like "rust",
+    /// "c", "cpp"). Falls back to escaped plain text on error so the UI
+    /// always has something to render.
+    pub fn highlight_in(&mut self, lang: &str, text: &str) -> String {
+        match self.inner.highlight(lang, text) {
             Ok(html) => html,
-            Err(err) => {
-                tracing::warn!("arborium failed on {asm:?}: {err}");
-                html_escape(asm)
-            }
+            Err(_) => html_escape(text),
         }
     }
 }

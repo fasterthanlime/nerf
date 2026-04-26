@@ -138,7 +138,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db65328fda517795f476b9d1b0794199cce180077e204629946a0705f0093093"
 dependencies = [
  "arborium-asm",
+ "arborium-c",
+ "arborium-cpp",
  "arborium-highlight",
+ "arborium-rust",
  "arborium-theme",
  "arborium-tree-sitter",
  "dlmalloc",
@@ -156,6 +159,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "arborium-c"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f548f9082e4058b76a7c380033ad5f8d171e56999644fe5f92cfa3e70d3961f"
+dependencies = [
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "arborium-cpp"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "497a85adb48c08a0f5751e7a3e180e9a12491f81bcc32d517d99f69218fe2347"
+dependencies = [
+ "arborium-c",
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "arborium-highlight"
 version = "2.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -164,6 +190,17 @@ dependencies = [
  "arborium-theme",
  "arborium-tree-sitter",
  "streaming-iterator",
+]
+
+[[package]]
+name = "arborium-rust"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdac14e869cffb0378a3f6535f814f1105dd9cbe223f29751589c07f81a6d4a5"
+dependencies = [
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]
@@ -1822,6 +1859,7 @@ dependencies = [
 name = "nperf-live"
 version = "0.1.0"
 dependencies = [
+ "addr2line",
  "arborium",
  "cpp_demangle",
  "eyre",
