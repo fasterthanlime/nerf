@@ -16,7 +16,8 @@ use nperf_core::live_sink::{
 };
 use nperf_live_proto::{
     AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, NeighborsUpdate, Profiler,
-    ProfilerDispatcher, ThreadInfo, ThreadsUpdate, TopEntry, TopSort, TopUpdate,
+    ProfilerDispatcher, ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate, TopEntry,
+    TopSort, TopUpdate,
 };
 
 mod aggregator;
@@ -31,11 +32,23 @@ pub use binaries::{BinaryRegistry, LoadedBinary};
 /// What the sampler thread pushes into tokio. Owned data so we can move
 /// across the thread boundary cheaply.
 pub(crate) enum LiveEvent {
-    Sample { tid: u32, user_addrs: Vec<u64> },
+    Sample {
+        tid: u32,
+        timestamp_ns: u64,
+        user_addrs: Vec<u64>,
+    },
     BinaryLoaded(binaries::LoadedBinary),
-    BinaryUnloaded { base_avma: u64 },
-    TargetAttached { pid: u32, task_port: u64 },
-    ThreadName { tid: u32, name: String },
+    BinaryUnloaded {
+        base_avma: u64,
+    },
+    TargetAttached {
+        pid: u32,
+        task_port: u64,
+    },
+    ThreadName {
+        tid: u32,
+        name: String,
+    },
 }
 
 #[derive(Clone)]
@@ -48,6 +61,7 @@ impl LiveSink for LiveSinkImpl {
         let user_addrs: Vec<u64> = event.user_backtrace.iter().map(|f| f.address).collect();
         let _ = self.tx.send(LiveEvent::Sample {
             tid: event.tid,
+            timestamp_ns: event.timestamp,
             user_addrs,
         });
     }
@@ -224,6 +238,26 @@ impl Profiler for LiveServer {
         });
     }
 
+    async fn subscribe_timeline(
+        &self,
+        tid: Option<u32>,
+        output: vox::Tx<TimelineUpdate>,
+    ) {
+        tracing::info!(?tid, "subscribe_timeline: starting stream");
+        let aggregator = self.aggregator.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let update = build_timeline_update(&aggregator, tid);
+                if let Err(e) = output.send(update).await {
+                    tracing::info!(?tid, "subscribe_timeline: stream ended: {e:?}");
+                    break;
+                }
+            }
+        });
+    }
+
     async fn subscribe_threads(&self, output: vox::Tx<ThreadsUpdate>) {
         tracing::info!("subscribe_threads: starting stream");
         let aggregator = self.aggregator.clone();
@@ -335,6 +369,57 @@ fn build_top_entries(
     });
     out.truncate(limit);
     out
+}
+
+/// Build a sample-density timeline from the per-thread raw sample
+/// log. Bucket size is chosen so we stay around `TARGET_BUCKETS`
+/// regardless of recording duration, with a sensible minimum so we
+/// don't over-quantize a 1-second recording.
+fn build_timeline_update(
+    aggregator: &Arc<RwLock<Aggregator>>,
+    tid: Option<u32>,
+) -> TimelineUpdate {
+    const TARGET_BUCKETS: u64 = 200;
+    const MIN_BUCKET_NS: u64 = 50_000_000; // 50 ms
+
+    let agg = aggregator.read();
+    let start = agg.session_start_ns().unwrap_or(0);
+    let last = agg.last_sample_ns().unwrap_or(start);
+    let duration = last.saturating_sub(start);
+
+    let bucket_size_ns = if duration == 0 {
+        MIN_BUCKET_NS
+    } else {
+        (duration / TARGET_BUCKETS).max(MIN_BUCKET_NS)
+    };
+    let n_buckets = ((duration / bucket_size_ns) + 1) as usize;
+    let mut counts: Vec<u64> = vec![0; n_buckets.max(1)];
+
+    let mut total: u64 = 0;
+    for (_tid, sample) in agg.iter_samples(tid) {
+        let rel = sample.timestamp_ns.saturating_sub(start);
+        let idx = (rel / bucket_size_ns) as usize;
+        if idx < counts.len() {
+            counts[idx] += 1;
+            total += 1;
+        }
+    }
+
+    let buckets: Vec<TimelineBucket> = counts
+        .into_iter()
+        .enumerate()
+        .map(|(i, count)| TimelineBucket {
+            start_ns: i as u64 * bucket_size_ns,
+            count,
+        })
+        .collect();
+
+    TimelineUpdate {
+        bucket_size_ns,
+        duration_ns: duration,
+        total_samples: total,
+        buckets,
+    }
 }
 
 /// Build the kcachegrind-style "family tree" view of a symbol.
@@ -676,8 +761,12 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
-                    LiveEvent::Sample { tid, user_addrs } => {
-                        aggregator.write().record(tid, &user_addrs);
+                    LiveEvent::Sample {
+                        tid,
+                        timestamp_ns,
+                        user_addrs,
+                    } => {
+                        aggregator.write().record(tid, timestamp_ns, &user_addrs);
                     }
                     LiveEvent::ThreadName { tid, name } => {
                         aggregator.write().set_thread_name(tid, name);

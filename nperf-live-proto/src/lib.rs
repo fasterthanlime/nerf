@@ -74,6 +74,31 @@ pub struct ThreadsUpdate {
     pub threads: Vec<ThreadInfo>,
 }
 
+/// One time bucket on the timeline.
+#[derive(Clone, Debug, Facet)]
+pub struct TimelineBucket {
+    /// Bucket start, in nanoseconds since the recording started (i.e.
+    /// since the first sample).
+    pub start_ns: u64,
+    /// Total samples whose timestamp fell into this bucket.
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct TimelineUpdate {
+    /// Width of each bucket in nanoseconds.
+    pub bucket_size_ns: u64,
+    /// Recording duration so the UI can show "Xs elapsed" without
+    /// computing it client-side.
+    pub duration_ns: u64,
+    /// Total samples observed (sum of `count` across `buckets`).
+    pub total_samples: u64,
+    /// Buckets in chronological order, dense (zero-count buckets in
+    /// the middle are emitted so the UI can map x-position → time
+    /// directly).
+    pub buckets: Vec<TimelineBucket>,
+}
+
 /// kcachegrind-style "family tree" of a symbol's neighbors.
 ///
 /// `callers_tree` is rooted at the target. Its children are direct
@@ -186,6 +211,16 @@ pub trait Profiler {
 
     /// Stream the live list of threads (tid, name, sample count).
     async fn subscribe_threads(&self, output: vox::Tx<ThreadsUpdate>);
+
+    /// Stream a per-thread sample-density timeline, suitable for a
+    /// horizontal histogram with brush selection. Buckets are sized
+    /// adaptively to keep the count under ~200 regardless of recording
+    /// duration. `tid` filters to one thread; `None` aggregates across.
+    async fn subscribe_timeline(
+        &self,
+        tid: Option<u32>,
+        output: vox::Tx<TimelineUpdate>,
+    );
 
     /// Stream the callers and callees of the symbol containing
     /// `address`. The walker aggregates across every tree node whose

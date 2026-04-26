@@ -9,17 +9,48 @@ pub struct RawTopEntry {
     pub total_count: u64,
 }
 
-/// Aggregated state for one specific thread.
-#[derive(Default)]
+/// Aggregated state for one specific thread, plus a capped log of raw
+/// samples (timestamp + stack). The pre-aggregated maps + tree make
+/// no-filter queries cheap; the raw log lets us re-aggregate over a
+/// time slice or, eventually, exclude/focus on stacks containing a
+/// given symbol.
 pub struct ThreadStats {
     self_counts: HashMap<u64, u64>,
     total_counts: HashMap<u64, u64>,
     total_samples: u64,
     pub(crate) flame_root: StackNode,
+    /// FIFO ring of raw samples. Capped at MAX_SAMPLES_PER_THREAD so
+    /// memory doesn't grow unbounded; when full, we drop the oldest
+    /// (the pre-aggregations stay intact).
+    pub(crate) samples: std::collections::VecDeque<RawSample>,
 }
 
+impl Default for ThreadStats {
+    fn default() -> Self {
+        Self {
+            self_counts: HashMap::new(),
+            total_counts: HashMap::new(),
+            total_samples: 0,
+            flame_root: StackNode::default(),
+            samples: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+/// One captured sample. Stack is leaf-first (matches what the sampler
+/// feeds in). Kept boxed so the VecDeque stores fixed-size handles.
+pub struct RawSample {
+    pub timestamp_ns: u64,
+    pub stack: Box<[u64]>,
+}
+
+/// Per-thread cap on the raw sample log. ~100k * (avg ~30 frames * 8B
+/// + 24B header) ≈ 26 MB worst case, before slack — comfortable for
+/// live sessions of several minutes. FIFO drop above this cap.
+const MAX_SAMPLES_PER_THREAD: usize = 100_000;
+
 impl ThreadStats {
-    pub fn record(&mut self, user_addrs: &[u64]) {
+    pub fn record(&mut self, timestamp_ns: u64, user_addrs: &[u64]) {
         self.total_samples += 1;
         if let Some(&leaf) = user_addrs.first() {
             *self.self_counts.entry(leaf).or_insert(0) += 1;
@@ -37,6 +68,15 @@ impl ThreadStats {
             node = node.children.entry(addr).or_default();
             node.count += 1;
         }
+
+        // Append to the raw log; FIFO-drop the oldest when over cap.
+        if self.samples.len() >= MAX_SAMPLES_PER_THREAD {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(RawSample {
+            timestamp_ns,
+            stack: user_addrs.to_vec().into_boxed_slice(),
+        });
     }
 
     pub fn total_samples(&self) -> u64 {
@@ -55,6 +95,12 @@ impl ThreadStats {
 pub struct Aggregator {
     threads: HashMap<u32, ThreadStats>,
     thread_names: HashMap<u32, String>,
+    /// First sample timestamp we ever saw, in ns. Used as the timeline
+    /// origin so the UI shows "0s" at the start of recording rather
+    /// than a giant Mach absolute time.
+    session_start_ns: Option<u64>,
+    /// Most recent sample timestamp; gives the timeline a known end.
+    last_sample_ns: Option<u64>,
 }
 
 #[derive(Default)]
@@ -64,8 +110,43 @@ pub(crate) struct StackNode {
 }
 
 impl Aggregator {
-    pub fn record(&mut self, tid: u32, user_addrs: &[u64]) {
-        self.threads.entry(tid).or_default().record(user_addrs);
+    pub fn record(&mut self, tid: u32, timestamp_ns: u64, user_addrs: &[u64]) {
+        if self.session_start_ns.is_none() {
+            self.session_start_ns = Some(timestamp_ns);
+        }
+        self.last_sample_ns = Some(timestamp_ns);
+        self.threads
+            .entry(tid)
+            .or_default()
+            .record(timestamp_ns, user_addrs);
+    }
+
+    pub fn session_start_ns(&self) -> Option<u64> {
+        self.session_start_ns
+    }
+
+    pub fn last_sample_ns(&self) -> Option<u64> {
+        self.last_sample_ns
+    }
+
+    /// Iterate raw samples (timestamped + stacks) for a single thread,
+    /// or for every thread when `tid` is `None`. Used for filter-aware
+    /// queries that the pre-aggregated state can't answer.
+    pub fn iter_samples<'a>(
+        &'a self,
+        tid: Option<u32>,
+    ) -> Box<dyn Iterator<Item = (u32, &'a RawSample)> + 'a> {
+        match tid {
+            Some(tid) => match self.threads.get(&tid) {
+                Some(t) => Box::new(t.samples.iter().map(move |s| (tid, s))),
+                None => Box::new(std::iter::empty()),
+            },
+            None => Box::new(
+                self.threads
+                    .iter()
+                    .flat_map(|(&tid, t)| t.samples.iter().map(move |s| (tid, s))),
+            ),
+        }
     }
 
     pub fn set_thread_name(&mut self, tid: u32, name: String) {

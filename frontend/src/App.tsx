@@ -21,6 +21,7 @@ import {
 } from "./generated/profiler.generated.ts";
 import { Flamegraph } from "./Flamegraph.tsx";
 import { Neighbors } from "./Neighbors.tsx";
+import { Timeline } from "./Timeline.tsx";
 
 type Status = "pending" | "ok" | "err";
 
@@ -244,6 +245,11 @@ export function App() {
           </span>
         </div>
       </header>
+      {client && (
+        <section className="timeline-pane">
+          <Timeline client={client} tid={selectedTid} />
+        </section>
+      )}
       {client && (
         <section className="flame-pane">
           <Flamegraph
