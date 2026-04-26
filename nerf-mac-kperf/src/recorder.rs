@@ -9,7 +9,14 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use nerf_mac_capture::{SampleEvent, SampleSink};
+use mach2::kern_return::KERN_SUCCESS;
+use mach2::port::{mach_port_t, MACH_PORT_NULL};
+use mach2::traps::{mach_task_self, task_for_pid};
+
+use nerf_mac_capture::proc_maps::{DyldInfo, DyldInfoManager, Modification};
+use nerf_mac_capture::{
+    BinaryLoadedEvent, BinaryUnloadedEvent, SampleEvent, SampleSink,
+};
 
 use crate::bindings::{self, sampler, Frameworks};
 use crate::error::Error;
@@ -76,13 +83,76 @@ pub fn record<S: SampleSink>(
     let _ = kdebug::enable(false);
     let _ = kdebug::reset();
 
+    // Acquire a Mach task port so we can scan the target's loaded
+    // dyld images and emit BinaryLoadedEvents into the archive. The
+    // kernel walks user stacks for us; we still need to tell the
+    // analysis side which dylib each PC came from.
+    let task = task_for_pid_existing(opts.pid)?;
+    let mut dyld = DyldInfoManager::new(task);
+
+    let t0 = Instant::now();
+    apply_dyld_changes(&mut dyld, opts.pid, sink);
+    log::info!("initial dyld scan took {:?}", t0.elapsed());
+
+    let t0 = Instant::now();
     let mut session = Session::start(&fw, &opts)?;
     session.enable_kdebug(&opts)?;
+    log::info!("kperf+kdebug arming took {:?}", t0.elapsed());
 
-    drain_loop(&fw, &opts, sink, &mut should_stop)?;
+    drain_loop(&fw, &opts, sink, &mut dyld, &mut should_stop)?;
 
     drop(session);
     Ok(())
+}
+
+fn task_for_pid_existing(pid: u32) -> Result<mach_port_t, Error> {
+    let mut task: mach_port_t = MACH_PORT_NULL;
+    let kr = unsafe { task_for_pid(mach_task_self(), pid as i32, &mut task) };
+    if kr != KERN_SUCCESS {
+        return Err(Error::Kperf {
+            op: "task_for_pid",
+            code: kr,
+        });
+    }
+    Ok(task)
+}
+
+fn apply_dyld_changes<S: SampleSink>(
+    dyld: &mut DyldInfoManager,
+    pid: u32,
+    sink: &mut S,
+) {
+    let changes = match dyld.check_for_changes() {
+        Ok(c) => c,
+        Err(err) => {
+            log::debug!("DyldInfoManager::check_for_changes failed: {err:?}");
+            return;
+        }
+    };
+    for change in changes {
+        match change {
+            Modification::Added(lib) => emit_binary_loaded(pid, &lib, sink),
+            Modification::Removed(lib) => sink.on_binary_unloaded(BinaryUnloadedEvent {
+                pid,
+                base_avma: lib.base_avma,
+                path: &lib.file,
+            }),
+        }
+    }
+}
+
+fn emit_binary_loaded<S: SampleSink>(pid: u32, lib: &DyldInfo, sink: &mut S) {
+    sink.on_binary_loaded(BinaryLoadedEvent {
+        pid,
+        base_avma: lib.base_avma,
+        vmsize: lib.vmsize,
+        text_svma: lib.module_info.base_svma,
+        path: &lib.file,
+        uuid: lib.uuid,
+        arch: lib.arch,
+        is_executable: lib.is_executable,
+        symbols: &lib.symbols,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -196,12 +266,19 @@ fn drain_loop<S: SampleSink>(
     _fw: &Frameworks,
     opts: &RecordOptions,
     sink: &mut S,
+    dyld: &mut DyldInfoManager,
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<(), Error> {
     let start = Instant::now();
     let drain_period = Duration::from_micros(
         ((1_000_000 / opts.frequency_hz.max(1)) * 2).into(),
     );
+
+    // Re-scan dyld at most a few times per second; the timestamp
+    // check inside DyldInfoManager already short-circuits when the
+    // image table hasn't moved.
+    let dyld_period = Duration::from_millis(250);
+    let mut next_dyld = Instant::now() + dyld_period;
 
     let mut buf: Vec<KdBuf> = vec![
         KdBuf {
@@ -234,6 +311,11 @@ fn drain_loop<S: SampleSink>(
         }
 
         std::thread::sleep(drain_period);
+
+        if Instant::now() >= next_dyld {
+            apply_dyld_changes(dyld, opts.pid, sink);
+            next_dyld = Instant::now() + dyld_period;
+        }
 
         let n = kdebug::read_trace(&mut buf)?;
         if n == 0 {

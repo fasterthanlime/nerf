@@ -18,6 +18,7 @@ use nerf_mac_capture::{
     record_with_task, record_with_task_and_tick_hook, BinaryLoadedEvent, BinaryUnloadedEvent,
     JitdumpEvent, RecordOptions, SampleEvent, SampleSink, ThreadNameEvent,
 };
+use nerf_mac_kperf::{record as kperf_record, RecordOptions as KperfRecordOptions};
 
 use crate::archive::{
     BinaryFormat, Bitness, FramedPacket, Inode, MachOSymbolEntry, Packet, Platform, UserFrame,
@@ -99,8 +100,32 @@ fn record_existing_pid(
     };
 
     info!("Running... press Ctrl-C to stop.");
-    if let Err(err) = record_with_task(task, opts, &mut sink, should_stop) {
-        return Err(format!("nerf-mac-capture::record failed: {}", err).into());
+    match args.mac_backend.as_str() {
+        "samply" => {
+            if let Err(err) = record_with_task(task, opts, &mut sink, should_stop) {
+                return Err(format!("nerf-mac-capture::record failed: {}", err).into());
+            }
+        }
+        "kperf" => {
+            // Time-based stop is enforced inside the kperf drain
+            // loop (relative to kperf arming, after the initial
+            // dyld scan), so should_stop here only watches for
+            // SIGINT. Otherwise the slow first scan eats the
+            // user-requested time budget before sampling begins.
+            let kopts = KperfRecordOptions {
+                pid,
+                frequency_hz: args.frequency,
+                duration: time_limit,
+                ..Default::default()
+            };
+            let kperf_should_stop = || sigint.was_triggered();
+            if let Err(err) = kperf_record(kopts, &mut sink, kperf_should_stop) {
+                return Err(format!("nerf-mac-kperf::record failed: {}", err).into());
+            }
+        }
+        other => {
+            return Err(format!("unknown --mac-backend value: {other}").into());
+        }
     }
 
     sink.finish()?;
@@ -113,6 +138,14 @@ fn record_child_launch(
     program_args: Vec<String>,
     live_sink: Option<Box<dyn LiveSink>>,
 ) -> Result<(), Box<dyn Error>> {
+    if args.mac_backend == "kperf" {
+        return Err(
+            "--mac-backend=kperf does not support --process child-launch yet \
+             (use --pid <PID>). The preload-dylib bootstrap is samply-only \
+             today; kperf needs its own integration."
+                .into(),
+        );
+    }
     let mut accepter = TaskAccepter::new()
         .map_err(|err| format!("setting up Mach IPC accepter: {:?}", err))?;
     let server_name = accepter.server_name().to_owned();

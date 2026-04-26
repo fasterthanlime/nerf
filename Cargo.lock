@@ -1805,6 +1805,7 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "mach2 0.6.0",
  "nerf-mac-capture",
  "thiserror",
 ]

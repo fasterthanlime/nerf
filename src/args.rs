@@ -209,6 +209,12 @@ pub struct RecordArgs {
     #[structopt(long)]
     pub serve: Option< String >,
 
+    /// macOS-only: which sampling backend to use. `samply` (default)
+    /// drives nerf-mac-capture's suspend-and-walk loop with framehop;
+    /// `kperf` drives Apple's private kperf framework via PET.
+    #[structopt(long, default_value = "samply", raw(possible_values = r#"&["samply", "kperf"]"#))]
+    pub mac_backend: String,
+
     /// Arguments to pass to the launched child process. Use `--` to
     /// separate nperf flags from the target's arguments:
     ///
