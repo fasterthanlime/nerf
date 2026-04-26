@@ -90,38 +90,61 @@ impl SharedCache {
     /// runtime address. Drops images that fail to parse or lack a
     /// `__TEXT` segment.
     ///
-    /// Cost is parsing ~3-4k Mach-O headers + LC_SYMTABs; on the
-    /// happy path runs in <2s and produces hundreds of thousands of
-    /// symbols, all eagerly so the live UI has them ready when the
-    /// first samples land.
+    /// Parallelised across `NPERF_DYLD_WORKERS` threads (default 8):
+    /// per-image LC_SYMTAB parsing is pure CPU work over independent
+    /// slices of immutable cache memory, so this scales linearly with
+    /// cores. Each worker owns its own output Vec and we concatenate
+    /// at join time.
     pub fn enumerate_runtime_images(&self) -> Vec<CacheRuntimeImage> {
         let Some(slide) = self.runtime_slide else {
             return Vec::new();
         };
-        let mut out = Vec::new();
-        for image in self.cache.images() {
-            let Ok(path) = image.path() else { continue };
-            let Ok(file) = image.parse_object() else { continue };
-            let Some(text) = file
-                .segments()
-                .find(|s| matches!(s.name(), Ok(Some(n)) if n == "__TEXT"))
-            else {
-                continue;
-            };
-            let text_svma = text.address();
-            let vmsize = text.size();
-            let uuid = file.mach_uuid().ok().flatten();
-            let symbols = collect_symbols(&file);
-            let runtime_avma = (text_svma as i64).wrapping_add(slide) as u64;
-            out.push(CacheRuntimeImage {
-                install_name: path.to_owned(),
-                runtime_avma,
-                text_svma,
-                vmsize,
-                uuid,
-                symbols,
-            });
-        }
+        let images: Vec<_> = self.cache.images().collect();
+        let n_workers = std::env::var("NPERF_DYLD_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1);
+        let chunk_size = images.len().div_ceil(n_workers).max(1);
+
+        let mut out: Vec<CacheRuntimeImage> = Vec::with_capacity(images.len());
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in images.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    let mut local: Vec<CacheRuntimeImage> = Vec::with_capacity(chunk.len());
+                    for image in chunk {
+                        let Ok(path) = image.path() else { continue };
+                        let Ok(file) = image.parse_object() else { continue };
+                        let Some(text) = file
+                            .segments()
+                            .find(|s| matches!(s.name(), Ok(Some(n)) if n == "__TEXT"))
+                        else {
+                            continue;
+                        };
+                        let text_svma = text.address();
+                        let vmsize = text.size();
+                        let uuid = file.mach_uuid().ok().flatten();
+                        let symbols = collect_symbols(&file);
+                        let runtime_avma = (text_svma as i64).wrapping_add(slide) as u64;
+                        local.push(CacheRuntimeImage {
+                            install_name: path.to_owned(),
+                            runtime_avma,
+                            text_svma,
+                            vmsize,
+                            uuid,
+                            symbols,
+                        });
+                    }
+                    local
+                }));
+            }
+            for h in handles {
+                if let Ok(local) = h.join() {
+                    out.extend(local);
+                }
+            }
+        });
         out
     }
 
