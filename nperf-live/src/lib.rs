@@ -117,6 +117,7 @@ impl Profiler for LiveServer {
         tid: Option<u32>,
         output: vox::Tx<TopUpdate>,
     ) {
+        tracing::info!(?sort, ?tid, limit, "subscribe_top: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
         tokio::spawn(async move {
@@ -132,9 +133,11 @@ impl Profiler for LiveServer {
                         entries,
                     }
                 };
-                if output.send(snapshot).await.is_err() {
+                if let Err(e) = output.send(snapshot).await {
+                    tracing::info!(?tid, "subscribe_top: stream ended: {e:?}");
                     break;
                 }
+                tracing::info!(?tid, "subscribe_top: sent!");
             }
         });
     }
@@ -149,6 +152,11 @@ impl Profiler for LiveServer {
         tid: Option<u32>,
         output: vox::Tx<AnnotatedView>,
     ) {
+        tracing::info!(
+            address = format!("{:#x}", address),
+            ?tid,
+            "subscribe_annotated: starting stream"
+        );
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
         let source = self.source.clone();
@@ -157,18 +165,20 @@ impl Profiler for LiveServer {
             loop {
                 interval.tick().await;
                 let view = build_annotated_view(&aggregator, &binaries, &source, address, tid);
-                if output.send(view).await.is_err() {
+                if let Err(e) = output.send(view).await {
+                    tracing::info!(
+                        address = format!("{:#x}", address),
+                        ?tid,
+                        "subscribe_annotated: stream ended: {e:?}"
+                    );
                     break;
                 }
             }
         });
     }
 
-    async fn subscribe_flamegraph(
-        &self,
-        tid: Option<u32>,
-        output: vox::Tx<FlamegraphUpdate>,
-    ) {
+    async fn subscribe_flamegraph(&self, tid: Option<u32>, output: vox::Tx<FlamegraphUpdate>) {
+        tracing::info!(?tid, "subscribe_flamegraph: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
         tokio::spawn(async move {
@@ -176,7 +186,8 @@ impl Profiler for LiveServer {
             loop {
                 interval.tick().await;
                 let update = build_flame_update(&aggregator, &binaries, tid);
-                if output.send(update).await.is_err() {
+                if let Err(e) = output.send(update).await {
+                    tracing::info!(?tid, "subscribe_flamegraph: stream ended: {e:?}");
                     break;
                 }
             }
@@ -184,6 +195,7 @@ impl Profiler for LiveServer {
     }
 
     async fn subscribe_threads(&self, output: vox::Tx<ThreadsUpdate>) {
+        tracing::info!("subscribe_threads: starting stream");
         let aggregator = self.aggregator.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -202,7 +214,8 @@ impl Profiler for LiveServer {
                     threads.sort_by(|a, b| b.sample_count.cmp(&a.sample_count));
                     ThreadsUpdate { threads }
                 };
-                if output.send(update).await.is_err() {
+                if let Err(e) = output.send(update).await {
+                    tracing::info!("subscribe_threads: stream ended: {e:?}");
                     break;
                 }
             }

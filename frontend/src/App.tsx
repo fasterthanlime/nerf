@@ -44,6 +44,7 @@ export function App() {
   const [sort, setSort] = useState<SortKey>("self");
   const [selectedTid, setSelectedTid] = useState<number | null>(null);
   const [threads, setThreads] = useState<ThreadInfo[]>([]);
+  const [search, setSearch] = useState("");
   // Latest update kept in a ref so the frozen-gate logic can pull the
   // most recent snapshot when the mouse leaves without re-running the
   // subscribe effect.
@@ -60,15 +61,19 @@ export function App() {
 
     (async () => {
       try {
+        console.debug("App: connecting to", committedUrl);
         const c = await connectProfiler(committedUrl);
         if (cancelled) return;
+        console.debug("App: connected");
         setClient(c);
         setStatus("ok");
 
         const [tx, rx] = channel<TopUpdate>();
         const sortArg: TopSort =
           sort === "self" ? { tag: "BySelf" } : { tag: "ByTotal" };
+        console.debug("App: subscribeTop", { sort: sortArg, tid: selectedTid });
         await c.subscribeTop(50, sortArg, selectedTid, tx).catch((err) => {
+          console.debug("App: subscribeTop call failed", err);
           if (!cancelled) {
             setStatus("err");
             setError(String(err));
@@ -77,6 +82,13 @@ export function App() {
 
         for await (const next of rx) {
           if (cancelled) break;
+          console.debug(
+            "App: top update",
+            next.entries.length,
+            "entries,",
+            next.total_samples.toString(),
+            "samples",
+          );
           latest.current = next;
           // While frozen we accumulate into `latest` but don't render.
           // The mouse-leave handler will pull the freshest one.
@@ -84,7 +96,9 @@ export function App() {
           // value without it being a dep.
           setDisplayed((prev) => (tableFrozenRef.current ? prev : next));
         }
+        console.debug("App: subscribeTop rx ended");
       } catch (err) {
+        console.debug("App: subscribeTop loop threw", err);
         if (cancelled) return;
         setStatus("err");
         setError(String(err));
@@ -153,6 +167,13 @@ export function App() {
             selectedTid={selectedTid}
             onSelect={setSelectedTid}
           />
+          <input
+            type="search"
+            className="search-input"
+            placeholder="search symbols"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
           <span className="spacer" />
           <span className="meta">
             {displayed
@@ -166,6 +187,7 @@ export function App() {
           <Flamegraph
             client={client}
             tid={selectedTid}
+            search={search}
             onSelectAddress={setSelected}
             onFrozenChange={setFlameFrozen}
           />
@@ -184,6 +206,7 @@ export function App() {
             onSelect={setSelected}
             sort={sort}
             onSort={setSort}
+            search={search}
           />
         </section>
         <section className="pane ann-pane">
@@ -267,6 +290,15 @@ function objIcon(obj: ObjKind) {
   }
 }
 
+function entryMatches(e: TopEntry, search: string): boolean {
+  if (!search) return false;
+  const term = search.toLowerCase();
+  return (
+    (e.function_name?.toLowerCase().includes(term) ?? false) ||
+    (e.binary?.toLowerCase().includes(term) ?? false)
+  );
+}
+
 function TopTable({
   entries,
   totalSamples,
@@ -274,6 +306,7 @@ function TopTable({
   onSelect,
   sort,
   onSort,
+  search,
 }: {
   entries: TopEntry[];
   totalSamples: bigint;
@@ -281,6 +314,7 @@ function TopTable({
   onSelect: (a: bigint) => void;
   sort: SortKey;
   onSort: (s: SortKey) => void;
+  search: string;
 }) {
   return (
     <table className="top-table">
@@ -315,7 +349,8 @@ function TopTable({
               key={String(e.address)}
               className={
                 (selected === e.address ? "selected " : "") +
-                (e.is_main ? "main" : "")
+                (e.is_main ? "main " : "") +
+                (entryMatches(e, search) ? "match" : "")
               }
               onClick={() => onSelect(e.address)}
             >

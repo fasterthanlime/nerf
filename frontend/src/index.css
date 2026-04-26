@@ -105,6 +105,82 @@ select.thread-switcher:hover {
   border-color: #2a2e34;
 }
 
+input.search-input {
+  background: #16181c;
+  color: #e6e8eb;
+  border: 1px solid #232629;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  width: 14em;
+}
+
+input.search-input:focus {
+  outline: none;
+  border-color: #d3b75f;
+}
+
+/* Search match highlight. Subtle gold border + bg tint, both in the
+   top-N table and in flamegraph boxes. */
+table.top-table tr.match td {
+  box-shadow: inset 2px 0 0 0 #d3b75f;
+}
+
+table.top-table tr.match {
+  background: rgba(211, 183, 95, 0.08);
+}
+
+.flame-box.match {
+  box-shadow: inset 0 0 0 2px #d3b75f;
+  z-index: 1;
+}
+
+/* Reset-focus button + context menu */
+.flame-reset {
+  background: #1c1f24;
+  color: #d3b75f;
+  border: 1px solid #d3b75f55;
+  border-radius: 3px;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.flame-reset:hover {
+  background: #232730;
+}
+
+.context-menu {
+  position: fixed;
+  background: #1c1f24;
+  border: 1px solid #2a2e34;
+  border-radius: 4px;
+  box-shadow: 0 4px 12px #00000088;
+  padding: 4px 0;
+  font-size: 12px;
+  z-index: 100;
+  min-width: 180px;
+}
+
+.context-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: #e6e8eb;
+  border: 0;
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.context-menu button:hover {
+  background: #232730;
+}
+
 .err-text {
   color: #d35f5f;
 }

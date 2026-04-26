@@ -33,6 +33,29 @@ function colorFor(node: FlameNode): Color {
   return { bg: "#9b8453", fg: "#1a1208" };
 }
 
+function nodeMatches(n: FlameNode, search: string): boolean {
+  if (!search) return false;
+  const term = search.toLowerCase();
+  return (
+    (n.function_name?.toLowerCase().includes(term) ?? false) ||
+    (n.binary?.toLowerCase().includes(term) ?? false)
+  );
+}
+
+/// Find a node by its layout key (e.g. "r/2/1/0"). Mirrors the
+/// `${keyPrefix}/${i}` numbering in `layout`.
+function findByKey(node: FlameNode, target: string): FlameNode | null {
+  if (target === "r") return node;
+  const parts = target.split("/").slice(1); // drop the leading "r"
+  let cur: FlameNode = node;
+  for (const p of parts) {
+    const i = Number(p);
+    if (!Number.isFinite(i) || i < 0 || i >= cur.children.length) return null;
+    cur = cur.children[i];
+  }
+  return cur;
+}
+
 /// Layout the tree into [0,1] horizontal coordinate space.
 function layout(root: FlameNode): { boxes: Box[]; depth: number } {
   const boxes: Box[] = [];
@@ -69,17 +92,25 @@ function layout(root: FlameNode): { boxes: Box[]; depth: number } {
 export function Flamegraph({
   client,
   tid,
+  search,
   onSelectAddress,
   onFrozenChange,
 }: {
   client: ProfilerClient;
   tid: number | null;
+  search: string;
   onSelectAddress: (a: bigint) => void;
   onFrozenChange?: (frozen: boolean) => void;
 }) {
   const [update, setUpdate] = useState<FlamegraphUpdate | null>(null);
   const [hover, setHover] = useState<Box | null>(null);
   const [frozen, setFrozen] = useState(false);
+  const [focusKey, setFocusKey] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    box: Box;
+  } | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const frozenRef = useRef(false);
   const latestRef = useRef<FlamegraphUpdate | null>(null);
@@ -88,6 +119,7 @@ export function Flamegraph({
     let cancelled = false;
     setUpdate(null);
     latestRef.current = null;
+    setFocusKey(null);
     const [tx, rx] = channel<FlamegraphUpdate>();
     client.subscribeFlamegraph(tid, tx).catch(() => {});
     (async () => {
@@ -110,11 +142,30 @@ export function Flamegraph({
     onFrozenChange?.(frozen);
   }, [frozen, onFrozenChange]);
 
+  // Close the context menu on any outside click / scroll / key.
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", close);
+    };
+  }, [menu]);
+
   if (!update) {
     return <div className="flame placeholder">building flamegraph…</div>;
   }
 
-  const { boxes, depth } = layout(update.root);
+  // Pick the rendering root: focused subtree if set and findable,
+  // otherwise the live root.
+  const renderRoot = focusKey
+    ? findByKey(update.root, focusKey) ?? update.root
+    : update.root;
+  const { boxes, depth } = layout(renderRoot);
   const height = (depth + 1) * ROW_H;
   const total = update.total_samples;
 
@@ -135,10 +186,11 @@ export function Flamegraph({
         {boxes.map((b) => {
           const c = colorFor(b.node);
           const widthPct = (b.x1 - b.x0) * 100;
+          const isMatch = nodeMatches(b.node, search);
           return (
             <div
               key={b.key}
-              className="flame-box"
+              className={`flame-box${isMatch ? " match" : ""}`}
               style={{
                 left: `${b.x0 * 100}%`,
                 width: `${widthPct}%`,
@@ -150,6 +202,10 @@ export function Flamegraph({
               onClick={() => {
                 if (b.node.address !== 0n) onSelectAddress(b.node.address);
               }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY, box: b });
+              }}
               title={`${labelFor(b.node)} · ${b.node.count.toString()}/${total.toString()}`}
             >
               {widthPct > 2 ? labelFor(b.node) : ""}
@@ -158,6 +214,15 @@ export function Flamegraph({
         })}
       </div>
       <div className="flame-status">
+        {focusKey && (
+          <button
+            className="flame-reset"
+            onClick={() => setFocusKey(null)}
+            title="clear focus and show the full tree"
+          >
+            ↩ reset focus
+          </button>
+        )}
         {hover ? (
           <>
             <span className="flame-status-label">{labelFor(hover.node)}</span>
@@ -169,10 +234,38 @@ export function Flamegraph({
           </>
         ) : (
           <span className="flame-status-meta">
-            {total.toString()} samples · click a box to open its disassembly
+            {total.toString()} samples · click to open · right-click to focus
           </span>
         )}
       </div>
+      {menu && (
+        <div
+          className="context-menu"
+          style={{ top: menu.y, left: menu.x }}
+          // stop the outer window click handler from immediately closing us
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => {
+              setFocusKey(menu.box.key);
+              setMenu(null);
+            }}
+          >
+            Focus this subtree
+          </button>
+          <button
+            onClick={() => {
+              if (menu.box.node.address !== 0n) {
+                onSelectAddress(menu.box.node.address);
+              }
+              setMenu(null);
+            }}
+          >
+            Open disassembly
+          </button>
+        </div>
+      )}
     </div>
   );
 }
