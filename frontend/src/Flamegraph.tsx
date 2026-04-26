@@ -206,7 +206,12 @@ export function Flamegraph({
     ? findByKey(update.root, focusKey) ?? update.root
     : update.root;
   const { boxes, depth } = layout(renderRoot, hiddenKinds);
-  const height = (depth + 1) * ROW_H;
+  // Inner content height: enough rows for the deepest stack. The
+  // outer `.flame` element is sized by CSS (fixed `height: 30vh`)
+  // so the pane doesn't pop when stacks shrink; the inner sizer
+  // reserves vertical room for the absolutely-positioned boxes and
+  // lets the scroll container do its thing when stacks are deeper.
+  const innerHeight = (depth + 1) * ROW_H;
   const total = update.total_samples;
 
   return (
@@ -218,11 +223,12 @@ export function Flamegraph({
         setHover(null);
       }}
     >
-      <div
-        ref={containerRef}
-        className="flame"
-        style={{ height: `${height}px` }}
-      >
+      <div ref={containerRef} className="flame">
+        {/* Inner sizer: tall enough for the deepest stack so the
+            absolute children can position freely. The outer .flame
+            stays at its CSS-fixed height; this just gives the
+            scroll container something to scroll. */}
+        <div className="flame-inner" style={{ height: `${innerHeight}px` }} />
         {boxes.map((b) => {
           const widthPct = (b.x1 - b.x0) * 100;
           const isMatch = nodeMatches(b.node, matchText);
