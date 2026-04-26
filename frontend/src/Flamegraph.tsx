@@ -3,6 +3,7 @@ import { channel } from "@bearcove/vox-core";
 import type {
   FlameNode,
   FlamegraphUpdate,
+  LiveFilter,
   ProfilerClient,
 } from "./generated/profiler.generated.ts";
 import {
@@ -112,6 +113,7 @@ function layout(
 export function Flamegraph({
   client,
   tid,
+  filter,
   matchText,
   hiddenKinds,
   focusKey,
@@ -119,9 +121,11 @@ export function Flamegraph({
   onSelectAddress,
   onFrozenChange,
   onContextMenu,
+  onDropSymbol,
 }: {
   client: ProfilerClient;
   tid: number | null;
+  filter: LiveFilter;
   matchText: ((t: string) => boolean) | null;
   hiddenKinds: Set<ObjKind>;
   focusKey: string | null;
@@ -129,6 +133,7 @@ export function Flamegraph({
   onSelectAddress: (a: bigint) => void;
   onFrozenChange?: (frozen: boolean) => void;
   onContextMenu: (t: ContextMenuTarget) => void;
+  onDropSymbol: (s: { function_name: string | null; binary: string | null }) => void;
 }) {
   const [update, setUpdate] = useState<FlamegraphUpdate | null>(null);
   const [hover, setHover] = useState<Box | null>(null);
@@ -136,6 +141,7 @@ export function Flamegraph({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const frozenRef = useRef(false);
   const latestRef = useRef<FlamegraphUpdate | null>(null);
+  const hoverRef = useRef<Box | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -143,7 +149,7 @@ export function Flamegraph({
     latestRef.current = null;
     onFocusKeyChange(null);
     const [tx, rx] = channel<FlamegraphUpdate>();
-    client.subscribeFlamegraph(viewParams(tid), tx).catch(() => {});
+    client.subscribeFlamegraph(viewParams(tid, filter), tx).catch(() => {});
     (async () => {
       for await (const next of rx) {
         if (cancelled) break;
@@ -154,7 +160,7 @@ export function Flamegraph({
     return () => {
       cancelled = true;
     };
-  }, [client, tid]);
+  }, [client, tid, filter]);
 
   useEffect(() => {
     frozenRef.current = frozen;
@@ -163,6 +169,42 @@ export function Flamegraph({
     }
     onFrozenChange?.(frozen);
   }, [frozen, onFrozenChange]);
+
+  // F: focus the hovered subtree. D: drop the hovered symbol from
+  // future aggregations. Only active while the cursor is inside the
+  // flamegraph (frozen=true also means hovering).
+  useEffect(() => {
+    hoverRef.current = hover;
+  }, [hover]);
+  useEffect(() => {
+    if (!frozen) return;
+    const onKey = (e: KeyboardEvent) => {
+      const h = hoverRef.current;
+      if (!h || h.node.address === 0n) return;
+      // Don't fire when the user is typing into a search/regex input.
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        onFocusKeyChange(h.key);
+      } else if (e.key === "d" || e.key === "D") {
+        e.preventDefault();
+        onDropSymbol({
+          function_name: h.node.function_name,
+          binary: h.node.binary,
+        });
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [frozen, onFocusKeyChange, onDropSymbol]);
 
   if (!update) {
     return <div className="flame placeholder">building flamegraph…</div>;

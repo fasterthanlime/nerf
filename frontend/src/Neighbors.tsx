@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { channel } from "@bearcove/vox-core";
 import type {
   FlameNode,
+  LiveFilter,
   NeighborsUpdate,
   ProfilerClient,
 } from "./generated/profiler.generated.ts";
@@ -169,6 +170,7 @@ export function Neighbors({
   client,
   address,
   tid,
+  filter,
   matchText,
   hiddenKinds,
   onSelectAddress,
@@ -177,6 +179,7 @@ export function Neighbors({
   client: ProfilerClient;
   address: bigint;
   tid: number | null;
+  filter: LiveFilter;
   matchText: ((t: string) => boolean) | null;
   hiddenKinds: Set<ObjKind>;
   onSelectAddress: (a: bigint) => void;
@@ -192,7 +195,7 @@ export function Neighbors({
     setUpdate(null);
     latestRef.current = null;
     const [tx, rx] = channel<NeighborsUpdate>();
-    client.subscribeNeighbors(address, viewParams(tid), tx).catch(() => {});
+    client.subscribeNeighbors(address, viewParams(tid, filter), tx).catch(() => {});
     (async () => {
       for await (const next of rx) {
         if (cancelled) break;
@@ -203,7 +206,7 @@ export function Neighbors({
     return () => {
       cancelled = true;
     };
-  }, [client, address, tid]);
+  }, [client, address, tid, filter]);
 
   useEffect(() => {
     frozenRef.current = frozen;

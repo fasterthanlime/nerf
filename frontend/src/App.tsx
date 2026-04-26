@@ -69,6 +69,34 @@ export function App() {
   const [paneTab, setPaneTab] = useState<PaneTab>("asm");
   const [flameFocusKey, setFlameFocusKey] = useState<string | null>(null);
   const [menu, setMenu] = useState<ContextMenuTarget | null>(null);
+  const [filter, setFilter] = useState<LiveFilter>(EMPTY_FILTER);
+
+  const dropSymbol = (s: { function_name: string | null; binary: string | null }) => {
+    setFilter((prev) => {
+      const exists = prev.exclude_symbols.some(
+        (e) => e.function_name === s.function_name && e.binary === s.binary,
+      );
+      if (exists) return prev;
+      return {
+        ...prev,
+        exclude_symbols: [
+          ...prev.exclude_symbols,
+          { function_name: s.function_name, binary: s.binary },
+        ],
+      };
+    });
+  };
+
+  const removeExcludeAt = (idx: number) => {
+    setFilter((prev) => ({
+      ...prev,
+      exclude_symbols: prev.exclude_symbols.filter((_, i) => i !== idx),
+    }));
+  };
+
+  const setTimeRange = (tr: LiveFilter["time_range"]) => {
+    setFilter((prev) => ({ ...prev, time_range: tr }));
+  };
 
   // Close the context menu on any outside click / scroll / key.
   useEffect(() => {
@@ -136,7 +164,7 @@ export function App() {
         const sortArg: TopSort =
           sort === "self" ? { tag: "BySelf" } : { tag: "ByTotal" };
         console.debug("App: subscribeTop", { sort: sortArg, tid: selectedTid });
-        await c.subscribeTop(50, sortArg, viewParams(selectedTid), tx).catch((err) => {
+        await c.subscribeTop(50, sortArg, viewParams(selectedTid, filter), tx).catch((err) => {
           console.debug("App: subscribeTop call failed", err);
           if (!cancelled) {
             setStatus("err");
@@ -172,7 +200,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [committedUrl, sort, selectedTid]);
+  }, [committedUrl, sort, selectedTid, filter]);
 
   // Subscribe to the live thread list whenever the client connects.
   useEffect(() => {
@@ -264,7 +292,31 @@ export function App() {
       </header>
       {client && (
         <section className="timeline-pane">
-          <Timeline client={client} tid={selectedTid} />
+          <Timeline
+            client={client}
+            tid={selectedTid}
+            range={filter.time_range}
+            onRangeChange={setTimeRange}
+          />
+        </section>
+      )}
+      {filter.exclude_symbols.length > 0 && (
+        <section className="filter-bar">
+          <span className="filter-bar-label">excluded:</span>
+          <div className="filter-chips">
+            {filter.exclude_symbols.map((s, i) => (
+              <span key={i} className="filter-chip" title={s.binary ?? ""}>
+                {s.function_name ?? "(unresolved)"}
+                <button
+                  className="filter-chip-x"
+                  onClick={() => removeExcludeAt(i)}
+                  title="remove this exclusion"
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
         </section>
       )}
       {client && (
@@ -272,6 +324,7 @@ export function App() {
           <Flamegraph
             client={client}
             tid={selectedTid}
+            filter={filter}
             matchText={matchText}
             hiddenKinds={hiddenKinds}
             focusKey={flameFocusKey}
@@ -279,6 +332,7 @@ export function App() {
             onSelectAddress={setSelected}
             onFrozenChange={setFlameFrozen}
             onContextMenu={openMenu}
+            onDropSymbol={dropSymbol}
           />
         </section>
       )}
@@ -327,12 +381,14 @@ export function App() {
                     client={client}
                     address={selected}
                     tid={selectedTid}
+                    filter={filter}
                   />
                 ) : (
                   <Neighbors
                     client={client}
                     address={selected}
                     tid={selectedTid}
+                    filter={filter}
                     matchText={matchText}
                     hiddenKinds={hiddenKinds}
                     onSelectAddress={setSelected}
@@ -396,6 +452,19 @@ export function App() {
               }}
             >
               Search exact symbol
+            </button>
+          )}
+          {menu.functionName && (
+            <button
+              onClick={() => {
+                dropSymbol({
+                  function_name: menu.functionName,
+                  binary: menu.binary,
+                });
+                setMenu(null);
+              }}
+            >
+              Drop samples with this symbol
             </button>
           )}
           {menu.kind && menu.kind !== "main" && (
@@ -742,10 +811,12 @@ function Annotation({
   client,
   address,
   tid,
+  filter,
 }: {
   client: ProfilerClient;
   address: bigint;
   tid: number | null;
+  filter: LiveFilter;
 }) {
   const [view, setView] = useState<AnnotatedView | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -757,7 +828,7 @@ function Annotation({
     setErr(null);
 
     const [tx, rx] = channel<AnnotatedView>();
-    client.subscribeAnnotated(address, viewParams(tid), tx).catch((e) => {
+    client.subscribeAnnotated(address, viewParams(tid, filter), tx).catch((e) => {
       if (!cancelled) setErr(String(e));
     });
 
@@ -771,7 +842,7 @@ function Annotation({
     return () => {
       cancelled = true;
     };
-  }, [client, address, tid]);
+  }, [client, address, tid, filter]);
 
   const lines = view?.lines ?? [];
   const maxSelf = lines.reduce(
