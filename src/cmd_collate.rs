@@ -36,15 +36,16 @@ fn write_perf_like_output< T: io::Write >(
     write!( output, "{}", escape( sample.process.executable() ) )?;
     writeln!( output, " {}/{} [{:03}] {}.{:09}: cpu-clock: ", sample.process.pid(), sample.tid, sample.cpu, secs, nsecs )?;
 
+    let kmod = state.kernel_module_label();
     for &address in sample.kernel_backtrace {
         if let Some( symbol ) = state.get_kernel_symbol_by_address( address ) {
             if let Some( module ) = symbol.module.as_ref() {
-                writeln!( output, "\t{:16X} {} ([linux:{}])", address, symbol.name, module ).unwrap()
+                writeln!( output, "\t{:16X} {} ([{kmod}:{module}])", address, symbol.name ).unwrap()
             } else {
-                writeln!( output, "\t{:16X} {} ([linux])", address, symbol.name ).unwrap()
+                writeln!( output, "\t{:16X} {} ([{kmod}])", address, symbol.name ).unwrap()
             }
         } else {
-            writeln!( output, "\t{:16X} 0x{:016X} ([linux])", address, address )?;
+            writeln!( output, "\t{:16X} 0x{:016X} ([{kmod}])", address, address )?;
         }
     }
 

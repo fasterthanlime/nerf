@@ -268,9 +268,20 @@ pub(crate) struct State {
     frequency: Option< u32 >,
     jitdump_names: RangeMap< String >,
     architecture: String,
+    platform: crate::archive::Platform,
 }
 
 impl State {
+    /// Module label for kernel frames in collated / flame-graph output.
+    /// Linux kernel symbols are conventionally tagged `[linux]`; on
+    /// macOS we use `[xnu]`.
+    pub(crate) fn kernel_module_label( &self ) -> &'static str {
+        match self.platform {
+            crate::archive::Platform::Linux => "linux",
+            crate::archive::Platform::MacOS => "xnu",
+        }
+    }
+
     fn get_kernel_symbol( &self, symbol_index: usize ) -> &KernelSymbol {
         self.kallsyms.get_value_by_index( symbol_index ).unwrap()
     }
@@ -529,7 +540,8 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
         cpu_count: 1,
         frequency: None,
         jitdump_names: RangeMap::new(),
-        architecture: String::new()
+        architecture: String::new(),
+        platform: crate::archive::Platform::Linux,
     };
 
     let mut machine_architecture = String::new();
@@ -712,12 +724,13 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
         };
         *packet_kinds.entry( kind ).or_insert( 0 ) += 1;
         match packet {
-            Packet::MachineInfo { architecture, bitness, endianness, cpu_count, .. } => {
+            Packet::MachineInfo { architecture, bitness, endianness, cpu_count, platform } => {
                 machine_architecture = architecture.into_owned();
                 machine_bitness = bitness;
                 machine_endianness = endianness;
                 state.cpu_count = cpu_count;
                 state.architecture = machine_architecture.clone();
+                state.platform = platform;
 
                 if machine_architecture == arch::native::Arch::NAME &&
                    machine_endianness == Endianness::NATIVE &&
@@ -1135,10 +1148,11 @@ pub(crate) fn write_frame< T: fmt::Write >(
         },
         FrameKind::KernelSymbol( symbol_index ) => {
             let symbol = state.get_kernel_symbol( symbol_index );
+            let kmod = state.kernel_module_label();
             if let Some( module ) = symbol.module.as_ref() {
-                write!( output, "{} [linux:{}]_[k]", symbol.name, module ).unwrap()
+                write!( output, "{} [{kmod}:{module}]_[k]", symbol.name ).unwrap()
             } else {
-                write!( output, "{} [linux]_[k]", symbol.name ).unwrap()
+                write!( output, "{} [{kmod}]_[k]", symbol.name ).unwrap()
             }
         },
         FrameKind::Kernel( addr ) => {
