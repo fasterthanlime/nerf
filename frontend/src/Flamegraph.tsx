@@ -5,7 +5,12 @@ import type {
   FlamegraphUpdate,
   ProfilerClient,
 } from "./generated/profiler.generated.ts";
-import { objKindOf, type ContextMenuTarget, type ObjKind } from "./App.tsx";
+import {
+  objKindOf,
+  viewParams,
+  type ContextMenuTarget,
+  type ObjKind,
+} from "./App.tsx";
 
 const ROW_H = 18;
 
@@ -138,7 +143,7 @@ export function Flamegraph({
     latestRef.current = null;
     onFocusKeyChange(null);
     const [tx, rx] = channel<FlamegraphUpdate>();
-    client.subscribeFlamegraph(tid, tx).catch(() => {});
+    client.subscribeFlamegraph(viewParams(tid), tx).catch(() => {});
     (async () => {
       for await (const next of rx) {
         if (cancelled) break;

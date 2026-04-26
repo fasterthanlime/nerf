@@ -15,10 +15,12 @@ use nperf_core::live_sink::{
     BinaryLoadedEvent, BinaryUnloadedEvent, LiveSink, SampleEvent, TargetAttached, ThreadName,
 };
 use nperf_live_proto::{
-    AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, NeighborsUpdate, Profiler,
-    ProfilerDispatcher, ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate, TopEntry,
-    TopSort, TopUpdate,
+    AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, LiveFilter, NeighborsUpdate,
+    Profiler, ProfilerDispatcher, ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate,
+    TopEntry, TopSort, TopUpdate, ViewParams,
 };
+
+use crate::aggregator::{RawSample, RawTopEntry};
 
 mod aggregator;
 mod binaries;
@@ -120,17 +122,21 @@ pub struct LiveServer {
 }
 
 impl Profiler for LiveServer {
-    async fn top(&self, limit: u32, sort: TopSort, tid: Option<u32>) -> Vec<TopEntry> {
-        build_top_entries(&self.aggregator, &self.binaries, limit as usize, sort, tid)
+    async fn top(&self, limit: u32, sort: TopSort, params: ViewParams) -> Vec<TopEntry> {
+        let agg = self.aggregator.read();
+        let bins = self.binaries.read();
+        let raw = collect_top_raw(&agg, &bins, params.tid, &params.filter);
+        group_top_entries(raw, &bins, sort, limit as usize)
     }
 
     async fn subscribe_top(
         &self,
         limit: u32,
         sort: TopSort,
-        tid: Option<u32>,
+        params: ViewParams,
         output: vox::Tx<TopUpdate>,
     ) {
+        let ViewParams { tid, filter } = params;
         tracing::info!(?sort, ?tid, limit, "subscribe_top: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
@@ -139,19 +145,34 @@ impl Profiler for LiveServer {
             loop {
                 interval.tick().await;
                 let snapshot = {
-                    let entries =
-                        build_top_entries(&aggregator, &binaries, limit as usize, sort, tid);
-                    let total_samples = aggregator.read().total_samples(tid);
-                    TopUpdate {
-                        total_samples,
-                        entries,
+                    let agg = aggregator.read();
+                    let bins = binaries.read();
+                    if is_filter_empty(&filter) {
+                        let raw = agg.top_raw(usize::MAX, tid);
+                        let entries = group_top_entries(raw, &bins, sort, limit as usize);
+                        TopUpdate {
+                            total_samples: agg.total_samples(tid),
+                            entries,
+                        }
+                    } else {
+                        let pred = make_predicate(
+                            &filter,
+                            agg.session_start_ns().unwrap_or(0),
+                            &bins,
+                        );
+                        let f = agg.aggregate_filtered(tid, pred);
+                        let entries =
+                            group_top_entries(f.top_raw(usize::MAX), &bins, sort, limit as usize);
+                        TopUpdate {
+                            total_samples: f.total_samples,
+                            entries,
+                        }
                     }
                 };
                 if let Err(e) = output.send(snapshot).await {
                     tracing::info!(?tid, "subscribe_top: stream ended: {e:?}");
                     break;
                 }
-                tracing::info!(?tid, "subscribe_top: sent!");
             }
         });
     }
@@ -163,9 +184,10 @@ impl Profiler for LiveServer {
     async fn subscribe_annotated(
         &self,
         address: u64,
-        tid: Option<u32>,
+        params: ViewParams,
         output: vox::Tx<AnnotatedView>,
     ) {
+        let ViewParams { tid, filter } = params;
         tracing::info!(
             address = format!("{:#x}", address),
             ?tid,
@@ -178,7 +200,29 @@ impl Profiler for LiveServer {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
             loop {
                 interval.tick().await;
-                let view = build_annotated_view(&aggregator, &binaries, &source, address, tid);
+                let view = {
+                    if is_filter_empty(&filter) {
+                        let agg = aggregator.read();
+                        compute_annotated_view(&binaries, &source, address, |a| {
+                            agg.self_count(a, tid)
+                        })
+                    } else {
+                        // Snapshot self_counts under the lock, drop, then build.
+                        let self_counts = {
+                            let agg = aggregator.read();
+                            let bins = binaries.read();
+                            let pred = make_predicate(
+                                &filter,
+                                agg.session_start_ns().unwrap_or(0),
+                                &bins,
+                            );
+                            agg.aggregate_filtered(tid, pred).self_counts
+                        };
+                        compute_annotated_view(&binaries, &source, address, |a| {
+                            self_counts.get(&a).copied().unwrap_or(0)
+                        })
+                    }
+                };
                 if let Err(e) = output.send(view).await {
                     tracing::info!(
                         address = format!("{:#x}", address),
@@ -191,7 +235,8 @@ impl Profiler for LiveServer {
         });
     }
 
-    async fn subscribe_flamegraph(&self, tid: Option<u32>, output: vox::Tx<FlamegraphUpdate>) {
+    async fn subscribe_flamegraph(&self, params: ViewParams, output: vox::Tx<FlamegraphUpdate>) {
+        let ViewParams { tid, filter } = params;
         tracing::info!(?tid, "subscribe_flamegraph: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
@@ -199,7 +244,21 @@ impl Profiler for LiveServer {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 interval.tick().await;
-                let update = build_flame_update(&aggregator, &binaries, tid);
+                let update = {
+                    let agg = aggregator.read();
+                    let bins = binaries.read();
+                    if is_filter_empty(&filter) {
+                        compute_flame_update(agg.total_samples(tid), &agg.flame_root(tid), &bins)
+                    } else {
+                        let pred = make_predicate(
+                            &filter,
+                            agg.session_start_ns().unwrap_or(0),
+                            &bins,
+                        );
+                        let f = agg.aggregate_filtered(tid, pred);
+                        compute_flame_update(f.total_samples, &f.flame_root, &bins)
+                    }
+                };
                 if let Err(e) = output.send(update).await {
                     tracing::info!(?tid, "subscribe_flamegraph: stream ended: {e:?}");
                     break;
@@ -211,9 +270,10 @@ impl Profiler for LiveServer {
     async fn subscribe_neighbors(
         &self,
         address: u64,
-        tid: Option<u32>,
+        params: ViewParams,
         output: vox::Tx<NeighborsUpdate>,
     ) {
+        let ViewParams { tid, filter } = params;
         tracing::info!(
             address = format!("{:#x}", address),
             ?tid,
@@ -225,7 +285,21 @@ impl Profiler for LiveServer {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 interval.tick().await;
-                let update = build_neighbors_update(&aggregator, &binaries, address, tid);
+                let update = {
+                    let agg = aggregator.read();
+                    let bins = binaries.read();
+                    if is_filter_empty(&filter) {
+                        compute_neighbors_update(&agg.flame_root(tid), &bins, address)
+                    } else {
+                        let pred = make_predicate(
+                            &filter,
+                            agg.session_start_ns().unwrap_or(0),
+                            &bins,
+                        );
+                        let f = agg.aggregate_filtered(tid, pred);
+                        compute_neighbors_update(&f.flame_root, &bins, address)
+                    }
+                };
                 if let Err(e) = output.send(update).await {
                     tracing::info!(
                         address = format!("{:#x}", address),
@@ -287,20 +361,69 @@ impl Profiler for LiveServer {
     }
 }
 
-fn build_top_entries(
-    aggregator: &Arc<RwLock<Aggregator>>,
-    binaries: &Arc<RwLock<BinaryRegistry>>,
-    limit: usize,
-    sort: TopSort,
+fn is_filter_empty(filter: &LiveFilter) -> bool {
+    filter.time_range.is_none() && filter.exclude_symbols.is_empty()
+}
+
+/// Build the predicate that `aggregate_filtered` calls for each raw
+/// sample. Captures `filter` + `binaries` + the recording origin so
+/// time-range and exclude-symbol filters can be applied in one pass.
+fn make_predicate<'a>(
+    filter: &'a LiveFilter,
+    session_start_ns: u64,
+    binaries: &'a BinaryRegistry,
+) -> impl FnMut(&RawSample) -> bool + 'a {
+    use std::collections::HashSet;
+    let exclude: HashSet<(Option<String>, Option<String>)> = filter
+        .exclude_symbols
+        .iter()
+        .map(|s| (s.function_name.clone(), s.binary.clone()))
+        .collect();
+    move |sample: &RawSample| {
+        if let Some(ref tr) = filter.time_range {
+            let rel = sample.timestamp_ns.saturating_sub(session_start_ns);
+            if rel < tr.start_ns || rel >= tr.end_ns {
+                return false;
+            }
+        }
+        if !exclude.is_empty() {
+            for &addr in sample.stack.iter() {
+                let key = match binaries.lookup_symbol(addr) {
+                    Some(r) => (Some(r.function_name), Some(r.binary)),
+                    None => (None, None),
+                };
+                if exclude.contains(&key) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Helper for the one-shot `top` RPC: chooses fast/slow path based on
+/// the filter and returns raw counts (pre-grouping).
+fn collect_top_raw(
+    agg: &Aggregator,
+    binaries: &BinaryRegistry,
     tid: Option<u32>,
+    filter: &LiveFilter,
+) -> Vec<RawTopEntry> {
+    if is_filter_empty(filter) {
+        agg.top_raw(usize::MAX, tid)
+    } else {
+        let pred = make_predicate(filter, agg.session_start_ns().unwrap_or(0), binaries);
+        agg.aggregate_filtered(tid, pred).top_raw(usize::MAX)
+    }
+}
+
+fn group_top_entries(
+    raw: Vec<RawTopEntry>,
+    binaries: &BinaryRegistry,
+    sort: TopSort,
+    limit: usize,
 ) -> Vec<TopEntry> {
     use std::collections::HashMap;
-
-    // Pull *all* per-address counts. We're going to collapse multiple
-    // addresses inside one symbol into a single row, so truncating to
-    // `limit` here would miss the symbol totals.
-    let raw = aggregator.read().top_raw(usize::MAX, tid);
-    let binaries = binaries.read();
 
     // Group key: (function_name, binary_basename). When unresolved (no
     // containing image), each address is its own group (keyed by its
@@ -430,11 +553,10 @@ fn build_timeline_update(
 ///      into `callers_tree`, growing outward toward `main`.
 ///   2. Merge the entire descendant subtree into `callees_tree`,
 ///      keyed by symbol (so recursion + multiple call sites collapse).
-fn build_neighbors_update(
-    aggregator: &Arc<RwLock<Aggregator>>,
-    binaries: &Arc<RwLock<BinaryRegistry>>,
+fn compute_neighbors_update(
+    flame_root: &aggregator::StackNode,
+    binaries: &BinaryRegistry,
     target_address: u64,
-    tid: Option<u32>,
 ) -> NeighborsUpdate {
     use std::collections::HashMap;
 
@@ -566,8 +688,7 @@ fn build_neighbors_update(
         }
     }
 
-    let bins = binaries.read();
-    let target_resolved = bins.lookup_symbol(target_address);
+    let target_resolved = binaries.lookup_symbol(target_address);
     let target_key: SymbolKey = match &target_resolved {
         Some(r) => (Some(r.function_name.clone()), Some(r.binary.clone())),
         None => (None, None),
@@ -577,15 +698,13 @@ fn build_neighbors_update(
     let mut callees = SymbolNode::default();
     let mut own_count: u64 = 0;
 
-    let agg = aggregator.read();
-    let root = agg.flame_root(tid);
     let mut ancestors: Vec<u64> = Vec::new();
     walk(
-        &root,
+        flame_root,
         0,
         &mut ancestors,
         &target_key,
-        &bins,
+        binaries,
         &mut callers,
         &mut callees,
         &mut own_count,
@@ -614,22 +733,17 @@ fn build_neighbors_update(
     }
 }
 
-fn build_flame_update(
-    aggregator: &Arc<RwLock<Aggregator>>,
-    binaries: &Arc<RwLock<BinaryRegistry>>,
-    tid: Option<u32>,
+fn compute_flame_update(
+    total: u64,
+    flame_root: &aggregator::StackNode,
+    binaries: &BinaryRegistry,
 ) -> FlamegraphUpdate {
-    let agg = aggregator.read();
-    let bins = binaries.read();
-    let total = agg.total_samples(tid);
     let threshold = (total / 200).max(1);
-
-    let flame_root = agg.flame_root(tid);
     let mut children: Vec<FlameNode> = flame_root
         .children
         .iter()
         .filter(|(_, c)| c.count >= threshold)
-        .map(|(a, c)| flame_node_to_proto(*a, c, threshold, &bins))
+        .map(|(a, c)| flame_node_to_proto(*a, c, threshold, binaries))
         .collect();
     for c in &mut children {
         fold_recursion(c);
@@ -696,21 +810,17 @@ fn flame_node_to_proto(
     }
 }
 
-fn build_annotated_view(
-    aggregator: &Arc<RwLock<Aggregator>>,
+fn compute_annotated_view(
     binaries: &Arc<RwLock<BinaryRegistry>>,
     source: &Arc<parking_lot::Mutex<source::SourceResolver>>,
     address: u64,
-    tid: Option<u32>,
+    self_count: impl Fn(u64) -> u64,
 ) -> AnnotatedView {
     let resolved = binaries.write().resolve(address);
 
     let mut hl = highlight::AsmHighlighter::new();
     let mut lines: Vec<AnnotatedLine> = match &resolved {
-        Some(r) => {
-            let agg = aggregator.read();
-            disassemble::disassemble(r, &mut hl, |addr| agg.self_count(addr, tid))
-        }
+        Some(r) => disassemble::disassemble(r, &mut hl, |addr| self_count(addr)),
         None => Vec::new(),
     };
 

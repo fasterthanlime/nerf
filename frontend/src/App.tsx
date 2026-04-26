@@ -12,18 +12,35 @@ import { SiRust, SiC, SiCplusplus } from "react-icons/si";
 import {
   connectProfiler,
   type AnnotatedView,
+  type LiveFilter,
   type ProfilerClient,
   type ThreadInfo,
   type ThreadsUpdate,
   type TopEntry,
   type TopSort,
   type TopUpdate,
+  type ViewParams,
 } from "./generated/profiler.generated.ts";
 import { Flamegraph } from "./Flamegraph.tsx";
 import { Neighbors } from "./Neighbors.tsx";
 import { Timeline } from "./Timeline.tsx";
 
 type Status = "pending" | "ok" | "err";
+
+export const EMPTY_FILTER: LiveFilter = {
+  time_range: null,
+  exclude_symbols: [],
+};
+
+/// Bundle thread/filter knobs for a subscription. Centralising this so
+/// every subscriber uses identical defaults; later we can thread a
+/// filter object down from the UI (timeline brush, exclude pills, etc).
+export function viewParams(
+  tid: number | null,
+  filter: LiveFilter = EMPTY_FILTER,
+): ViewParams {
+  return { tid, filter };
+}
 
 function defaultUrl(): string {
   const params = new URLSearchParams(window.location.search);
@@ -119,7 +136,7 @@ export function App() {
         const sortArg: TopSort =
           sort === "self" ? { tag: "BySelf" } : { tag: "ByTotal" };
         console.debug("App: subscribeTop", { sort: sortArg, tid: selectedTid });
-        await c.subscribeTop(50, sortArg, selectedTid, tx).catch((err) => {
+        await c.subscribeTop(50, sortArg, viewParams(selectedTid), tx).catch((err) => {
           console.debug("App: subscribeTop call failed", err);
           if (!cancelled) {
             setStatus("err");
@@ -740,7 +757,7 @@ function Annotation({
     setErr(null);
 
     const [tx, rx] = channel<AnnotatedView>();
-    client.subscribeAnnotated(address, tid, tx).catch((e) => {
+    client.subscribeAnnotated(address, viewParams(tid), tx).catch((e) => {
       if (!cancelled) setErr(String(e));
     });
 

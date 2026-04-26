@@ -11,6 +11,26 @@ export type TopSort =
   | { tag: 'BySelf' }
   | { tag: 'ByTotal' };
 
+export interface TimeRange {
+  start_ns: bigint;
+  end_ns: bigint;
+}
+
+export interface SymbolRef {
+  function_name: string | null;
+  binary: string | null;
+}
+
+export interface LiveFilter {
+  time_range: TimeRange | null;
+  exclude_symbols: SymbolRef[];
+}
+
+export interface ViewParams {
+  tid: number | null;
+  filter: LiveFilter;
+}
+
 export interface TopEntry {
   address: bigint;
   self_count: bigint;
@@ -94,14 +114,14 @@ export interface NeighborsUpdate {
 export type TopRequest = [
   number, // limit
   TopSort, // sort
-  number | null, // tid
+  ViewParams, // params
 ];
 export type TopResponse = TopEntry[];
 
 export type SubscribeTopRequest = [
   number, // limit
   TopSort, // sort
-  number | null, // tid
+  ViewParams, // params
   Tx<TopUpdate>, // output
 ];
 export type SubscribeTopResponse = void;
@@ -111,13 +131,13 @@ export type TotalSamplesResponse = bigint;
 
 export type SubscribeAnnotatedRequest = [
   bigint, // address
-  number | null, // tid
+  ViewParams, // params
   Tx<AnnotatedView>, // output
 ];
 export type SubscribeAnnotatedResponse = void;
 
 export type SubscribeFlamegraphRequest = [
-  number | null, // tid
+  ViewParams, // params
   Tx<FlamegraphUpdate>, // output
 ];
 export type SubscribeFlamegraphResponse = void;
@@ -133,7 +153,7 @@ export type SubscribeTimelineResponse = void;
 
 export type SubscribeNeighborsRequest = [
   bigint, // address
-  number | null, // tid
+  ViewParams, // params
   Tx<NeighborsUpdate>, // output
 ];
 export type SubscribeNeighborsResponse = void;
@@ -141,47 +161,21 @@ export type SubscribeNeighborsResponse = void;
 // Caller interface for Profiler
 export interface ProfilerCaller {
   /**
-   * Snapshot of the top-N functions, ranked by `sort`. `tid` filters
-   * to one thread; `None` aggregates across all threads.
+   * Snapshot of the top-N functions, ranked by `sort`. `params`
+   * bundles thread/time/exclude filters.
    */
-  top(limit: number, sort: TopSort, tid: number | null): Promise<TopEntry[]>;
-  /**
-   * Stream periodic top-N updates to the client, ranked by `sort`.
-   * `tid` filters to one thread; `None` aggregates across all.
-   */
-  subscribeTop(limit: number, sort: TopSort, tid: number | null, output: Tx<TopUpdate>): Promise<void>;
-  /** Total number of samples observed since the server started. */
+  top(limit: number, sort: TopSort, params: ViewParams): Promise<TopEntry[]>;
+  subscribeTop(limit: number, sort: TopSort, params: ViewParams, output: Tx<TopUpdate>): Promise<void>;
   totalSamples(): Promise<bigint>;
-  /**
-   * Stream annotated disassembly for the function containing
-   * `address`. Sample counts update live; the disassembly itself
-   * only changes if the binary is unloaded/reloaded. `tid` filters
-   * the per-instruction count overlay (the disassembly bytes are
-   * the same regardless).
-   */
-  subscribeAnnotated(address: bigint, tid: number | null, output: Tx<AnnotatedView>): Promise<void>;
-  /**
-   * Stream periodic flamegraph snapshots. Nodes whose `count` is
-   * below ~0.5% of `total_samples` are pruned to bound the wire
-   * size; children are sorted hot-first.
-   */
-  subscribeFlamegraph(tid: number | null, output: Tx<FlamegraphUpdate>): Promise<void>;
-  /** Stream the live list of threads (tid, name, sample count). */
+  subscribeAnnotated(address: bigint, params: ViewParams, output: Tx<AnnotatedView>): Promise<void>;
+  subscribeFlamegraph(params: ViewParams, output: Tx<FlamegraphUpdate>): Promise<void>;
   subscribeThreads(output: Tx<ThreadsUpdate>): Promise<void>;
   /**
-   * Stream a per-thread sample-density timeline, suitable for a
-   * horizontal histogram with brush selection. Buckets are sized
-   * adaptively to keep the count under ~200 regardless of recording
-   * duration. `tid` filters to one thread; `None` aggregates across.
+   * Always relative to the full recording (no `filter`); brush
+   * selection happens on top of the unfiltered timeline.
    */
   subscribeTimeline(tid: number | null, output: Tx<TimelineUpdate>): Promise<void>;
-  /**
-   * Stream the callers and callees of the symbol containing
-   * `address`. The walker aggregates across every tree node whose
-   * resolved symbol matches the target, so multiple call sites all
-   * roll up. `tid` filters the call tree to one thread.
-   */
-  subscribeNeighbors(address: bigint, tid: number | null, output: Tx<NeighborsUpdate>): Promise<void>;
+  subscribeNeighbors(address: bigint, params: ViewParams, output: Tx<NeighborsUpdate>): Promise<void>;
 }
 
 // Client implementation for Profiler
@@ -193,33 +187,29 @@ export class ProfilerClient implements ProfilerCaller {
   }
 
   /**
-   * Snapshot of the top-N functions, ranked by `sort`. `tid` filters
-   * to one thread; `None` aggregates across all threads.
+   * Snapshot of the top-N functions, ranked by `sort`. `params`
+   * bundles thread/time/exclude filters.
    */
-  async top(limit: number, sort: TopSort, tid: number | null): Promise<TopEntry[]> {
+  async top(limit: number, sort: TopSort, params: ViewParams): Promise<TopEntry[]> {
     const descriptor = profiler_top_method;
     const sendSchemas = profiler_descriptor.send_schemas;
       const value = await this.caller.call({
         method: "Profiler.top",
-        args: { limit, sort, tid },
+        args: { limit, sort, params },
         descriptor,
         sendSchemas,
       });
       return value as TopEntry[];
   }
 
-  /**
-   * Stream periodic top-N updates to the client, ranked by `sort`.
-   * `tid` filters to one thread; `None` aggregates across all.
-   */
-  async subscribeTop(limit: number, sort: TopSort, tid: number | null, output: Tx<TopUpdate>): Promise<void> {
+  async subscribeTop(limit: number, sort: TopSort, params: ViewParams, output: Tx<TopUpdate>): Promise<void> {
     const descriptor = profiler_subscribeTop_method;
     const sendSchemas = profiler_descriptor.send_schemas;
     const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
     const prepareRetry = () => {
       const channels = bindChannelsForTypeRefs(
         argTypeRefs,
-        [limit, sort, tid, output],
+        [limit, sort, params, output],
         this.caller.getChannelAllocator(),
         this.caller.getChannelRegistry(),
         sendSchemas.schemas,
@@ -230,17 +220,16 @@ export class ProfilerClient implements ProfilerCaller {
     const { channels } = prepareRetry();
       const value = await this.caller.call({
         method: "Profiler.subscribeTop",
-        args: { limit, sort, tid, output },
+        args: { limit, sort, params, output },
         descriptor,
         sendSchemas,
         channels,
         prepareRetry,
-        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [limit, sort, tid, output], sendSchemas.schemas),
+        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [limit, sort, params, output], sendSchemas.schemas),
       });
       return value as void;
   }
 
-  /** Total number of samples observed since the server started. */
   async totalSamples(): Promise<bigint> {
     const descriptor = profiler_totalSamples_method;
     const sendSchemas = profiler_descriptor.send_schemas;
@@ -253,21 +242,14 @@ export class ProfilerClient implements ProfilerCaller {
       return value as bigint;
   }
 
-  /**
-   * Stream annotated disassembly for the function containing
-   * `address`. Sample counts update live; the disassembly itself
-   * only changes if the binary is unloaded/reloaded. `tid` filters
-   * the per-instruction count overlay (the disassembly bytes are
-   * the same regardless).
-   */
-  async subscribeAnnotated(address: bigint, tid: number | null, output: Tx<AnnotatedView>): Promise<void> {
+  async subscribeAnnotated(address: bigint, params: ViewParams, output: Tx<AnnotatedView>): Promise<void> {
     const descriptor = profiler_subscribeAnnotated_method;
     const sendSchemas = profiler_descriptor.send_schemas;
     const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
     const prepareRetry = () => {
       const channels = bindChannelsForTypeRefs(
         argTypeRefs,
-        [address, tid, output],
+        [address, params, output],
         this.caller.getChannelAllocator(),
         this.caller.getChannelRegistry(),
         sendSchemas.schemas,
@@ -278,29 +260,24 @@ export class ProfilerClient implements ProfilerCaller {
     const { channels } = prepareRetry();
       const value = await this.caller.call({
         method: "Profiler.subscribeAnnotated",
-        args: { address, tid, output },
+        args: { address, params, output },
         descriptor,
         sendSchemas,
         channels,
         prepareRetry,
-        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [address, tid, output], sendSchemas.schemas),
+        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [address, params, output], sendSchemas.schemas),
       });
       return value as void;
   }
 
-  /**
-   * Stream periodic flamegraph snapshots. Nodes whose `count` is
-   * below ~0.5% of `total_samples` are pruned to bound the wire
-   * size; children are sorted hot-first.
-   */
-  async subscribeFlamegraph(tid: number | null, output: Tx<FlamegraphUpdate>): Promise<void> {
+  async subscribeFlamegraph(params: ViewParams, output: Tx<FlamegraphUpdate>): Promise<void> {
     const descriptor = profiler_subscribeFlamegraph_method;
     const sendSchemas = profiler_descriptor.send_schemas;
     const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
     const prepareRetry = () => {
       const channels = bindChannelsForTypeRefs(
         argTypeRefs,
-        [tid, output],
+        [params, output],
         this.caller.getChannelAllocator(),
         this.caller.getChannelRegistry(),
         sendSchemas.schemas,
@@ -311,17 +288,16 @@ export class ProfilerClient implements ProfilerCaller {
     const { channels } = prepareRetry();
       const value = await this.caller.call({
         method: "Profiler.subscribeFlamegraph",
-        args: { tid, output },
+        args: { params, output },
         descriptor,
         sendSchemas,
         channels,
         prepareRetry,
-        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [tid, output], sendSchemas.schemas),
+        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [params, output], sendSchemas.schemas),
       });
       return value as void;
   }
 
-  /** Stream the live list of threads (tid, name, sample count). */
   async subscribeThreads(output: Tx<ThreadsUpdate>): Promise<void> {
     const descriptor = profiler_subscribeThreads_method;
     const sendSchemas = profiler_descriptor.send_schemas;
@@ -351,10 +327,8 @@ export class ProfilerClient implements ProfilerCaller {
   }
 
   /**
-   * Stream a per-thread sample-density timeline, suitable for a
-   * horizontal histogram with brush selection. Buckets are sized
-   * adaptively to keep the count under ~200 regardless of recording
-   * duration. `tid` filters to one thread; `None` aggregates across.
+   * Always relative to the full recording (no `filter`); brush
+   * selection happens on top of the unfiltered timeline.
    */
   async subscribeTimeline(tid: number | null, output: Tx<TimelineUpdate>): Promise<void> {
     const descriptor = profiler_subscribeTimeline_method;
@@ -384,20 +358,14 @@ export class ProfilerClient implements ProfilerCaller {
       return value as void;
   }
 
-  /**
-   * Stream the callers and callees of the symbol containing
-   * `address`. The walker aggregates across every tree node whose
-   * resolved symbol matches the target, so multiple call sites all
-   * roll up. `tid` filters the call tree to one thread.
-   */
-  async subscribeNeighbors(address: bigint, tid: number | null, output: Tx<NeighborsUpdate>): Promise<void> {
+  async subscribeNeighbors(address: bigint, params: ViewParams, output: Tx<NeighborsUpdate>): Promise<void> {
     const descriptor = profiler_subscribeNeighbors_method;
     const sendSchemas = profiler_descriptor.send_schemas;
     const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
     const prepareRetry = () => {
       const channels = bindChannelsForTypeRefs(
         argTypeRefs,
-        [address, tid, output],
+        [address, params, output],
         this.caller.getChannelAllocator(),
         this.caller.getChannelRegistry(),
         sendSchemas.schemas,
@@ -408,12 +376,12 @@ export class ProfilerClient implements ProfilerCaller {
     const { channels } = prepareRetry();
       const value = await this.caller.call({
         method: "Profiler.subscribeNeighbors",
-        args: { address, tid, output },
+        args: { address, params, output },
         descriptor,
         sendSchemas,
         channels,
         prepareRetry,
-        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [address, tid, output], sendSchemas.schemas),
+        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [address, params, output], sendSchemas.schemas),
       });
       return value as void;
   }
@@ -435,14 +403,14 @@ export async function connectProfiler(
 
 // Handler interface for Profiler
 export interface ProfilerHandler {
-  top(limit: number, sort: TopSort, tid: number | null): Promise<TopEntry[]> | TopEntry[];
-  subscribeTop(limit: number, sort: TopSort, tid: number | null, output: Tx<TopUpdate>): Promise<void> | void;
+  top(limit: number, sort: TopSort, params: ViewParams): Promise<TopEntry[]> | TopEntry[];
+  subscribeTop(limit: number, sort: TopSort, params: ViewParams, output: Tx<TopUpdate>): Promise<void> | void;
   totalSamples(): Promise<bigint> | bigint;
-  subscribeAnnotated(address: bigint, tid: number | null, output: Tx<AnnotatedView>): Promise<void> | void;
-  subscribeFlamegraph(tid: number | null, output: Tx<FlamegraphUpdate>): Promise<void> | void;
+  subscribeAnnotated(address: bigint, params: ViewParams, output: Tx<AnnotatedView>): Promise<void> | void;
+  subscribeFlamegraph(params: ViewParams, output: Tx<FlamegraphUpdate>): Promise<void> | void;
   subscribeThreads(output: Tx<ThreadsUpdate>): Promise<void> | void;
   subscribeTimeline(tid: number | null, output: Tx<TimelineUpdate>): Promise<void> | void;
-  subscribeNeighbors(address: bigint, tid: number | null, output: Tx<NeighborsUpdate>): Promise<void> | void;
+  subscribeNeighbors(address: bigint, params: ViewParams, output: Tx<NeighborsUpdate>): Promise<void> | void;
 }
 
 // Dispatcher for Profiler
@@ -460,14 +428,14 @@ export class ProfilerDispatcher implements Dispatcher {
   async dispatch(_context: RequestContext, method: MethodDescriptor, args: unknown[], call: VoxCall): Promise<void> {
     if (method.id === 0x4eb5e594c5e49e21n) {
       try {
-        const result = await this.handler.top(args[0] as number, args[1] as TopSort, args[2] as number | null);
+        const result = await this.handler.top(args[0] as number, args[1] as TopSort, args[2] as ViewParams);
         call.reply(result);
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
       }
     } else if (method.id === 0x5e5b065bf333971bn) {
       try {
-        const result = await this.handler.subscribeTop(args[0] as number, args[1] as TopSort, args[2] as number | null, args[3] as Tx<TopUpdate>);
+        const result = await this.handler.subscribeTop(args[0] as number, args[1] as TopSort, args[2] as ViewParams, args[3] as Tx<TopUpdate>);
         (args[3] as { close(): void }).close(); // close output before reply
         call.reply(result);
       } catch (error) {
@@ -482,7 +450,7 @@ export class ProfilerDispatcher implements Dispatcher {
       }
     } else if (method.id === 0xbd08d48f35f68c69n) {
       try {
-        const result = await this.handler.subscribeAnnotated(args[0] as bigint, args[1] as number | null, args[2] as Tx<AnnotatedView>);
+        const result = await this.handler.subscribeAnnotated(args[0] as bigint, args[1] as ViewParams, args[2] as Tx<AnnotatedView>);
         (args[2] as { close(): void }).close(); // close output before reply
         call.reply(result);
       } catch (error) {
@@ -490,7 +458,7 @@ export class ProfilerDispatcher implements Dispatcher {
       }
     } else if (method.id === 0x6889c2c730466af0n) {
       try {
-        const result = await this.handler.subscribeFlamegraph(args[0] as number | null, args[1] as Tx<FlamegraphUpdate>);
+        const result = await this.handler.subscribeFlamegraph(args[0] as ViewParams, args[1] as Tx<FlamegraphUpdate>);
         (args[1] as { close(): void }).close(); // close output before reply
         call.reply(result);
       } catch (error) {
@@ -514,7 +482,7 @@ export class ProfilerDispatcher implements Dispatcher {
       }
     } else if (method.id === 0x42acdf6aa85cc2d3n) {
       try {
-        const result = await this.handler.subscribeNeighbors(args[0] as bigint, args[1] as number | null, args[2] as Tx<NeighborsUpdate>);
+        const result = await this.handler.subscribeNeighbors(args[0] as bigint, args[1] as ViewParams, args[2] as Tx<NeighborsUpdate>);
         (args[2] as { close(): void }).close(); // close output before reply
         call.reply(result);
       } catch (error) {
@@ -536,10 +504,14 @@ export const profiler_send_schemas: import("@bearcove/vox-core").ServiceSendSche
     [0x4cf4b2aeb98a1939n, { id: 0x4cf4b2aeb98a1939n, type_params: ['E'], kind: { tag: 'enum', name: 'VoxError', variants: [{ name: 'User', index: 0, payload: { tag: 'newtype', type_ref: { tag: 'var', name: 'E' } } }, { name: 'UnknownMethod', index: 1, payload: { tag: 'unit' } }, { name: 'InvalidPayload', index: 2, payload: { tag: 'newtype', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] } } }, { name: 'Cancelled', index: 3, payload: { tag: 'unit' } }, { name: 'ConnectionClosed', index: 4, payload: { tag: 'unit' } }, { name: 'SessionShutdown', index: 5, payload: { tag: 'unit' } }, { name: 'SendFailed', index: 6, payload: { tag: 'unit' } }, { name: 'Indeterminate', index: 7, payload: { tag: 'unit' } }] } }],
     [0xa9bc52fb11aa78c0n, { id: 0xa9bc52fb11aa78c0n, type_params: [], kind: { tag: 'enum', name: 'TopSort', variants: [{ name: 'BySelf', index: 0, payload: { tag: 'unit' } }, { name: 'ByTotal', index: 1, payload: { tag: 'unit' } }] } }],
     [0xdcafd4de6b7969bbn, { id: 0xdcafd4de6b7969bbn, type_params: ['T'], kind: { tag: 'option', element: { tag: 'var', name: 'T' } } }],
-    [0xaa510ab07d34f141n, { id: 0xaa510ab07d34f141n, type_params: ['T0', 'T1', 'T2'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }, { tag: 'var', name: 'T2' }] } }],
     [0xd9356298b81639acn, { id: 0xd9356298b81639acn, type_params: [], kind: { tag: 'primitive', primitive_type: 'u64' } }],
-    [0xed0cf71db5772b63n, { id: 0xed0cf71db5772b63n, type_params: [], kind: { tag: 'struct', name: 'TopEntry', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_count', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_count', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }] } }],
+    [0x68892f74829bd154n, { id: 0x68892f74829bd154n, type_params: [], kind: { tag: 'struct', name: 'TimeRange', fields: [{ name: 'start_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'end_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0xbc88382e830f9c36n, { id: 0xbc88382e830f9c36n, type_params: [], kind: { tag: 'struct', name: 'SymbolRef', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }] } }],
     [0x0a96b404b4d79d67n, { id: 0x0a96b404b4d79d67n, type_params: ['T'], kind: { tag: 'list', element: { tag: 'var', name: 'T' } } }],
+    [0xce2c9daef1e9c914n, { id: 0xce2c9daef1e9c914n, type_params: [], kind: { tag: 'struct', name: 'LiveFilter', fields: [{ name: 'time_range', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x68892f74829bd154n, args: [] }] }, required: true }, { name: 'exclude_symbols', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xbc88382e830f9c36n, args: [] }] }, required: true }] } }],
+    [0x6f5fed68b5ace623n, { id: 0x6f5fed68b5ace623n, type_params: [], kind: { tag: 'struct', name: 'ViewParams', fields: [{ name: 'tid', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'filter', type_ref: { tag: 'concrete', type_id: 0xce2c9daef1e9c914n, args: [] }, required: true }] } }],
+    [0xaa510ab07d34f141n, { id: 0xaa510ab07d34f141n, type_params: ['T0', 'T1', 'T2'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }, { tag: 'var', name: 'T2' }] } }],
+    [0xed0cf71db5772b63n, { id: 0xed0cf71db5772b63n, type_params: [], kind: { tag: 'struct', name: 'TopEntry', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_count', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_count', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }] } }],
     [0xc46f9dceb72dbe91n, { id: 0xc46f9dceb72dbe91n, type_params: [], kind: { tag: 'struct', name: 'TopUpdate', fields: [{ name: 'total_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'entries', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xed0cf71db5772b63n, args: [] }] }, required: true }] } }],
     [0xc886545a493d06ebn, { id: 0xc886545a493d06ebn, type_params: ['T'], kind: { tag: 'channel', direction: 'tx', element: { tag: 'var', name: 'T' } } }],
     [0x915c6fb5b64f270bn, { id: 0x915c6fb5b64f270bn, type_params: ['T0', 'T1', 'T2', 'T3'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }, { tag: 'var', name: 'T2' }, { tag: 'var', name: 'T3' }] } }],
@@ -558,14 +530,14 @@ export const profiler_send_schemas: import("@bearcove/vox-core").ServiceSendSche
     [0x712cac5b357f2eacn, { id: 0x712cac5b357f2eacn, type_params: [], kind: { tag: 'struct', name: 'NeighborsUpdate', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'own_count', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'callers_tree', type_ref: { tag: 'concrete', type_id: 0x956b1e0d99b221b7n, args: [] }, required: true }, { name: 'callees_tree', type_ref: { tag: 'concrete', type_id: 0x956b1e0d99b221b7n, args: [] }, required: true }] } }],
   ]),
   methods: new Map<bigint, import("@bearcove/vox-core").MethodSendSchemas>([
-    [0x4eb5e594c5e49e21n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xed0cf71db5772b63n, args: [] }] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0x5e5b065bf333971bn, { argsRootRef: { tag: 'concrete', type_id: 0x915c6fb5b64f270bn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xc46f9dceb72dbe91n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x4eb5e594c5e49e21n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xed0cf71db5772b63n, args: [] }] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x5e5b065bf333971bn, { argsRootRef: { tag: 'concrete', type_id: 0x915c6fb5b64f270bn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xc46f9dceb72dbe91n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x07d9472d620ba563n, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0xbd08d48f35f68c69n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x0eb507355000e9c0n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0x6889c2c730466af0n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x50264d97ef4e7f84n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xbd08d48f35f68c69n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x0eb507355000e9c0n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x6889c2c730466af0n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x50264d97ef4e7f84n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xbf5f73ea223d9f7dn, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x1d9ed64b1701f95dn, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xc3381210c17fc3c4n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x54a3a213b0250c32n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0x42acdf6aa85cc2d3n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x712cac5b357f2eacn, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x42acdf6aa85cc2d3n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x712cac5b357f2eacn, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
   ]),
 };
 

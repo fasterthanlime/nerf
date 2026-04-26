@@ -84,6 +84,40 @@ pub struct TimelineBucket {
     pub count: u64,
 }
 
+/// A pair of (start, end) timestamps in ns, both relative to the
+/// recording start (the timestamp of the first sample). End-exclusive.
+#[derive(Clone, Debug, Facet)]
+pub struct TimeRange {
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct SymbolRef {
+    pub function_name: Option<String>,
+    pub binary: Option<String>,
+}
+
+/// Filter applied at query time over the raw sample log. When all
+/// fields are at their defaults, the server hits the fast pre-aggregated
+/// path; any non-default field forces re-aggregation.
+#[derive(Clone, Debug, Facet)]
+pub struct LiveFilter {
+    pub time_range: Option<TimeRange>,
+    /// Drop any sample whose stack contains *any* of these symbols.
+    pub exclude_symbols: Vec<SymbolRef>,
+}
+
+/// Bundle of "what to look at" knobs shared by every view
+/// subscription. Bundled into one struct because vox/facet's tuple
+/// bound caps method arities at 4.
+#[derive(Clone, Debug, Facet)]
+pub struct ViewParams {
+    /// Filter to one thread's samples; `None` aggregates across all.
+    pub tid: Option<u32>,
+    pub filter: LiveFilter,
+}
+
 #[derive(Clone, Debug, Facet)]
 pub struct TimelineUpdate {
     /// Width of each bucket in nanoseconds.
@@ -171,65 +205,52 @@ pub struct AnnotatedView {
 
 #[vox::service]
 pub trait Profiler {
-    /// Snapshot of the top-N functions, ranked by `sort`. `tid` filters
-    /// to one thread; `None` aggregates across all threads.
-    async fn top(&self, limit: u32, sort: TopSort, tid: Option<u32>) -> Vec<TopEntry>;
+    /// Snapshot of the top-N functions, ranked by `sort`. `params`
+    /// bundles thread/time/exclude filters.
+    async fn top(
+        &self,
+        limit: u32,
+        sort: TopSort,
+        params: ViewParams,
+    ) -> Vec<TopEntry>;
 
-    /// Stream periodic top-N updates to the client, ranked by `sort`.
-    /// `tid` filters to one thread; `None` aggregates across all.
     async fn subscribe_top(
         &self,
         limit: u32,
         sort: TopSort,
-        tid: Option<u32>,
+        params: ViewParams,
         output: vox::Tx<TopUpdate>,
     );
 
-    /// Total number of samples observed since the server started.
     async fn total_samples(&self) -> u64;
 
-    /// Stream annotated disassembly for the function containing
-    /// `address`. Sample counts update live; the disassembly itself
-    /// only changes if the binary is unloaded/reloaded. `tid` filters
-    /// the per-instruction count overlay (the disassembly bytes are
-    /// the same regardless).
     async fn subscribe_annotated(
         &self,
         address: u64,
-        tid: Option<u32>,
+        params: ViewParams,
         output: vox::Tx<AnnotatedView>,
     );
 
-    /// Stream periodic flamegraph snapshots. Nodes whose `count` is
-    /// below ~0.5% of `total_samples` are pruned to bound the wire
-    /// size; children are sorted hot-first.
     async fn subscribe_flamegraph(
         &self,
-        tid: Option<u32>,
+        params: ViewParams,
         output: vox::Tx<FlamegraphUpdate>,
     );
 
-    /// Stream the live list of threads (tid, name, sample count).
     async fn subscribe_threads(&self, output: vox::Tx<ThreadsUpdate>);
 
-    /// Stream a per-thread sample-density timeline, suitable for a
-    /// horizontal histogram with brush selection. Buckets are sized
-    /// adaptively to keep the count under ~200 regardless of recording
-    /// duration. `tid` filters to one thread; `None` aggregates across.
+    /// Always relative to the full recording (no `filter`); brush
+    /// selection happens on top of the unfiltered timeline.
     async fn subscribe_timeline(
         &self,
         tid: Option<u32>,
         output: vox::Tx<TimelineUpdate>,
     );
 
-    /// Stream the callers and callees of the symbol containing
-    /// `address`. The walker aggregates across every tree node whose
-    /// resolved symbol matches the target, so multiple call sites all
-    /// roll up. `tid` filters the call tree to one thread.
     async fn subscribe_neighbors(
         &self,
         address: u64,
-        tid: Option<u32>,
+        params: ViewParams,
         output: vox::Tx<NeighborsUpdate>,
     );
 }

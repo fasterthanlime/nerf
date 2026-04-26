@@ -9,6 +9,42 @@ pub struct RawTopEntry {
     pub total_count: u64,
 }
 
+/// Result of `Aggregator::aggregate_filtered`: same shape as the
+/// per-thread fields but built fresh from raw samples that pass a
+/// predicate. The flame root is owned (no Cow) since it's freshly
+/// constructed.
+pub struct FilteredAggregation {
+    pub self_counts: HashMap<u64, u64>,
+    pub total_counts: HashMap<u64, u64>,
+    pub total_samples: u64,
+    pub flame_root: StackNode,
+}
+
+impl FilteredAggregation {
+    pub fn top_raw(&self, limit: usize) -> Vec<RawTopEntry> {
+        let mut entries: Vec<RawTopEntry> = self
+            .total_counts
+            .iter()
+            .map(|(&address, &total_count)| RawTopEntry {
+                address,
+                self_count: self.self_counts.get(&address).copied().unwrap_or(0),
+                total_count,
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.self_count
+                .cmp(&a.self_count)
+                .then_with(|| b.total_count.cmp(&a.total_count))
+        });
+        entries.truncate(limit);
+        entries
+    }
+
+    pub fn self_count(&self, address: u64) -> u64 {
+        self.self_counts.get(&address).copied().unwrap_or(0)
+    }
+}
+
 /// Aggregated state for one specific thread, plus a capped log of raw
 /// samples (timestamp + stack). The pre-aggregated maps + tree make
 /// no-filter queries cheap; the raw log lets us re-aggregate over a
@@ -104,7 +140,7 @@ pub struct Aggregator {
 }
 
 #[derive(Default)]
-pub(crate) struct StackNode {
+pub struct StackNode {
     pub(crate) count: u64,
     pub(crate) children: HashMap<u64, StackNode>,
 }
@@ -127,6 +163,56 @@ impl Aggregator {
 
     pub fn last_sample_ns(&self) -> Option<u64> {
         self.last_sample_ns
+    }
+
+    /// Filter-aware re-aggregation. Walks the raw sample log,
+    /// applies the predicate to each sample, and rebuilds the
+    /// aggregations we need for top-N / flamegraph / neighbors. When
+    /// the predicate accepts every sample the result is identical to
+    /// the pre-aggregated state (just slower); the fast path bypasses
+    /// this.
+    pub fn aggregate_filtered<P>(
+        &self,
+        tid: Option<u32>,
+        mut predicate: P,
+    ) -> FilteredAggregation
+    where
+        P: FnMut(&RawSample) -> bool,
+    {
+        let mut self_counts: HashMap<u64, u64> = HashMap::new();
+        let mut total_counts: HashMap<u64, u64> = HashMap::new();
+        let mut total_samples: u64 = 0;
+        let mut flame_root = StackNode::default();
+
+        for (_tid, sample) in self.iter_samples(tid) {
+            if !predicate(sample) {
+                continue;
+            }
+            total_samples += 1;
+            if let Some(&leaf) = sample.stack.first() {
+                *self_counts.entry(leaf).or_insert(0) += 1;
+            }
+            let mut seen: smallset::SmallSet = Default::default();
+            for &addr in sample.stack.iter() {
+                if seen.insert(addr) {
+                    *total_counts.entry(addr).or_insert(0) += 1;
+                }
+            }
+            // Build the call tree rooted at the synthetic node, leaf-first
+            // input → walk reversed for caller-first descent.
+            let mut node = &mut flame_root;
+            for &addr in sample.stack.iter().rev() {
+                node = node.children.entry(addr).or_default();
+                node.count += 1;
+            }
+        }
+
+        FilteredAggregation {
+            self_counts,
+            total_counts,
+            total_samples,
+            flame_root,
+        }
     }
 
     /// Iterate raw samples (timestamped + stacks) for a single thread,

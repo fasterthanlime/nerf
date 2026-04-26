@@ -5,7 +5,12 @@ import type {
   NeighborsUpdate,
   ProfilerClient,
 } from "./generated/profiler.generated.ts";
-import { objKindOf, type ContextMenuTarget, type ObjKind } from "./App.tsx";
+import {
+  objKindOf,
+  viewParams,
+  type ContextMenuTarget,
+  type ObjKind,
+} from "./App.tsx";
 
 const ROW_H = 16;
 
@@ -187,7 +192,7 @@ export function Neighbors({
     setUpdate(null);
     latestRef.current = null;
     const [tx, rx] = channel<NeighborsUpdate>();
-    client.subscribeNeighbors(address, tid, tx).catch(() => {});
+    client.subscribeNeighbors(address, viewParams(tid), tx).catch(() => {});
     (async () => {
       for await (const next of rx) {
         if (cancelled) break;
