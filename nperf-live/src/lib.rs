@@ -924,7 +924,9 @@ fn compute_neighbors_update(
     callees.is_main = target_resolved.as_ref().map(|r| r.is_main).unwrap_or(false);
     callees.language = target_language;
 
-    let threshold = (own_count / 200).max(1);
+    // Same lenient 0.05% threshold as the main flamegraph so the
+    // family tree shows small but non-trivial neighbours.
+    let threshold = (own_count / 2000).max(1);
     let callers_tree = to_flame_node(callers, target_key.clone(), threshold);
     let callees_tree = to_flame_node(callees, target_key.clone(), threshold);
 
@@ -944,7 +946,13 @@ fn compute_flame_update(
     flame_root: &aggregator::StackNode,
     binaries: &BinaryRegistry,
 ) -> FlamegraphUpdate {
-    let threshold = (total / 200).max(1);
+    // 0.05% of total. Lower than the previous 0.5% so that when the
+    // user focuses into a smaller subtree (say 30k of 750k samples)
+    // there's still meaningful per-callsite detail instead of one
+    // big "(N small frames)" cell. Bumps the wire payload roughly
+    // 5-10x but the live UI handles it; the residue cell still
+    // catches the truly-tiny tail.
+    let threshold = (total / 2000).max(1);
     let (mut children, residue) =
         build_children_with_residue(&flame_root.children, threshold, binaries);
     for c in &mut children {

@@ -22,7 +22,7 @@ export function Timeline({
   onRangeChange: (r: TimeRange | null) => void;
 }) {
   const [update, setUpdate] = useState<TimelineUpdate | null>(null);
-  const barsRef = useRef<HTMLDivElement | null>(null);
+  const barsRef = useRef<SVGSVGElement | null>(null);
   /// Live drag state: start/current x as fractions of the bars width.
   /// `null` when the user isn't currently dragging.
   const [drag, setDrag] = useState<{ x0: number; x1: number } | null>(null);
@@ -105,11 +105,30 @@ export function Timeline({
         }
       : null;
 
+  // Build the area-chart path. Each bucket center sits at
+  // (i + 0.5) / N along x; y is inverted (0 at top, 100 at bottom).
+  // We start at the bottom-left, climb to each bucket's height,
+  // then close back at the bottom-right -- producing a single
+  // filled area instead of the discrete bars we used to draw.
+  const n = update.buckets.length;
+  const points: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const x = ((i + 0.5) / n) * 100;
+    const y = max === 0n ? 100 : 100 - (Number(update.buckets[i].count) / maxF) * 100;
+    points.push(`${x.toFixed(3)},${y.toFixed(3)}`);
+  }
+  const areaD =
+    n === 0
+      ? ""
+      : `M 0,100 L ${points.join(" L ")} L 100,100 Z`;
+
   return (
     <div className="timeline">
-      <div
+      <svg
         ref={barsRef}
-        className="timeline-bars"
+        className="timeline-graph"
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
         onMouseUp={finishDrag}
@@ -117,30 +136,20 @@ export function Timeline({
           if (drag) finishDrag(e);
         }}
       >
-        {update.buckets.map((b, i) => {
-          const h = max === 0n ? 0 : Math.round((Number(b.count) / maxF) * 100);
-          return (
-            <div
-              key={i}
-              className="timeline-bar"
-              style={{ height: `${h}%` }}
-              title={`${(Number(b.start_ns) / 1e9).toFixed(2)}s · ${b.count.toString()} samples`}
-            />
-          );
-        })}
+        {areaD && <path className="timeline-area" d={areaD} />}
         {overlay && (
-          <div
+          <rect
             className="timeline-brush"
-            style={{
-              left: `${overlay.lo * 100}%`,
-              width: `${(overlay.hi - overlay.lo) * 100}%`,
-            }}
+            x={overlay.lo * 100}
+            y={0}
+            width={(overlay.hi - overlay.lo) * 100}
+            height={100}
           />
         )}
-      </div>
+      </svg>
       <div className="timeline-footer">
         {update.total_samples.toLocaleString()} samples · {durSec.toFixed(1)}s
-        elapsed · bucket {(Number(update.bucket_size_ns) / 1e6).toFixed(0)}ms
+        elapsed
         {range && (
           <>
             {" · "}
