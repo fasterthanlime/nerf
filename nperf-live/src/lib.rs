@@ -133,20 +133,77 @@ fn build_top_entries(
     binaries: &Arc<RwLock<BinaryRegistry>>,
     limit: usize,
 ) -> Vec<TopEntry> {
-    let raw = aggregator.read().top_raw(limit);
+    use std::collections::HashMap;
+
+    // Pull *all* per-address counts. We're going to collapse multiple
+    // addresses inside one symbol into a single row, so truncating to
+    // `limit` here would miss the symbol totals.
+    let raw = aggregator.read().top_raw(usize::MAX);
     let binaries = binaries.read();
-    raw.into_iter()
-        .map(|e| {
-            let resolved = binaries.lookup_symbol(e.address);
-            TopEntry {
+
+    // Group key: (function_name, binary_basename). When unresolved (no
+    // containing image), each address is its own group (keyed by its
+    // hex form so it stays unique).
+    struct Agg {
+        address: u64,
+        /// Self-count of `address` alone — used to decide which address
+        /// to keep as the group's representative when a hotter one comes
+        /// in. Not what we report; that's `self_total`.
+        representative_self: u64,
+        self_total: u64,
+        total_total: u64,
+        function_name: Option<String>,
+        binary: Option<String>,
+    }
+    let mut groups: HashMap<(String, String), Agg> = HashMap::new();
+    for e in raw {
+        let (fn_name, bin) = match binaries.lookup_symbol(e.address) {
+            Some((n, b)) => (Some(n), Some(b)),
+            None => (None, None),
+        };
+        // Unresolved entries get their own group (keyed by address) so
+        // we don't collapse different unknown rows into one.
+        let key: (String, String) = match (&fn_name, &bin) {
+            (Some(n), Some(b)) => (n.clone(), b.clone()),
+            _ => (format!("{:#x}", e.address), String::new()),
+        };
+        groups
+            .entry(key)
+            .and_modify(|g| {
+                g.self_total += e.self_count;
+                g.total_total += e.total_count;
+                // Keep the hottest address as the representative — clicking
+                // it opens the same function's disassembly anyway, but
+                // starting at the hottest line is a friendlier default
+                // scroll position.
+                if e.self_count > g.representative_self {
+                    g.address = e.address;
+                    g.representative_self = e.self_count;
+                }
+            })
+            .or_insert(Agg {
                 address: e.address,
-                self_count: e.self_count,
-                total_count: e.total_count,
-                function_name: resolved.as_ref().map(|(name, _)| name.clone()),
-                binary: resolved.map(|(_, bin)| bin),
-            }
+                representative_self: e.self_count,
+                self_total: e.self_count,
+                total_total: e.total_count,
+                function_name: fn_name,
+                binary: bin,
+            });
+    }
+
+    let mut out: Vec<TopEntry> = groups
+        .into_values()
+        .map(|g| TopEntry {
+            address: g.address,
+            self_count: g.self_total,
+            total_count: g.total_total,
+            function_name: g.function_name,
+            binary: g.binary,
         })
-        .collect()
+        .collect();
+    out.sort_by(|a, b| b.self_count.cmp(&a.self_count));
+    out.truncate(limit);
+    out
 }
 
 fn build_annotated_view(

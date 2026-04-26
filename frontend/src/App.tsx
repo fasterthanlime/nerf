@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { channel } from "@bearcove/vox-core";
 import {
   connectProfiler,
@@ -21,14 +21,20 @@ export function App() {
   const [status, setStatus] = useState<Status>("pending");
   const [error, setError] = useState<string | null>(null);
   const [client, setClient] = useState<ProfilerClient | null>(null);
-  const [update, setUpdate] = useState<TopUpdate | null>(null);
+  const [displayed, setDisplayed] = useState<TopUpdate | null>(null);
   const [selected, setSelected] = useState<bigint | null>(null);
+  const [frozen, setFrozen] = useState(false);
+  // Latest update kept in a ref so the frozen-gate logic can pull the
+  // most recent snapshot when the mouse leaves without re-running the
+  // subscribe effect.
+  const latest = useRef<TopUpdate | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setStatus("pending");
     setError(null);
-    setUpdate(null);
+    latest.current = null;
+    setDisplayed(null);
     setClient(null);
     setSelected(null);
 
@@ -49,7 +55,12 @@ export function App() {
 
         for await (const next of rx) {
           if (cancelled) break;
-          setUpdate(next);
+          latest.current = next;
+          // While frozen we accumulate into `latest` but don't render.
+          // The mouse-leave handler will pull the freshest one.
+          // Use a functional update so we can read the *current* frozen
+          // value without it being a dep.
+          setDisplayed((prev) => (frozenRef.current ? prev : next));
         }
       } catch (err) {
         if (cancelled) return;
@@ -63,37 +74,61 @@ export function App() {
     };
   }, [committedUrl]);
 
+  // Mirror `frozen` into a ref so the rx loop can check it without re-running.
+  const frozenRef = useRef(frozen);
+  useEffect(() => {
+    frozenRef.current = frozen;
+    // When unfreezing, immediately apply whatever the latest snapshot is.
+    if (!frozen && latest.current) {
+      setDisplayed(latest.current);
+    }
+  }, [frozen]);
+
   return (
-    <>
-      <h1 style={{ fontSize: 18, margin: "0 0 1rem" }}>nperf live</h1>
-      <div className="connection">
-        <span className={`dot ${status}`} />
-        <input
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") setCommittedUrl(url);
-          }}
-        />
-        <button onClick={() => setCommittedUrl(url)}>connect</button>
-        {error && <span style={{ color: "#d35f5f" }}>{error}</span>}
-      </div>
-      <div className="meta">
-        {update
-          ? `${update.total_samples.toLocaleString()} samples · ${update.entries.length} unique addresses`
-          : "waiting for samples..."}
-      </div>
-      <div className="split">
-        <TopTable
-          entries={update?.entries ?? []}
-          selected={selected}
-          onSelect={setSelected}
-        />
-        {client && selected !== null && (
-          <Annotation client={client} address={selected} key={String(selected)} />
-        )}
-      </div>
-    </>
+    <div className="shell">
+      <header className="topbar">
+        <h1>nperf live</h1>
+        <div className="connection">
+          <span className={`dot ${status}`} />
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") setCommittedUrl(url);
+            }}
+          />
+          <button onClick={() => setCommittedUrl(url)}>connect</button>
+          {error && <span className="err-text">{error}</span>}
+          <span className="spacer" />
+          <span className="meta">
+            {displayed
+              ? `${displayed.total_samples.toLocaleString()} samples · ${displayed.entries.length} symbols`
+              : "waiting for samples..."}
+          </span>
+        </div>
+      </header>
+      <main className="split">
+        <section
+          className={`pane top-pane${frozen ? " frozen" : ""}`}
+          onMouseEnter={() => setFrozen(true)}
+          onMouseLeave={() => setFrozen(false)}
+        >
+          {frozen && <div className="frozen-badge">paused (hover)</div>}
+          <TopTable
+            entries={displayed?.entries ?? []}
+            selected={selected}
+            onSelect={setSelected}
+          />
+        </section>
+        <section className="pane ann-pane">
+          {client && selected !== null ? (
+            <Annotation client={client} address={selected} key={String(selected)} />
+          ) : (
+            <div className="placeholder">click a row to see disassembly</div>
+          )}
+        </section>
+      </main>
+    </div>
   );
 }
 
@@ -107,13 +142,13 @@ function TopTable({
   onSelect: (a: bigint) => void;
 }) {
   return (
-    <table>
+    <table className="top-table">
       <thead>
         <tr>
           <th>function</th>
           <th>binary</th>
-          <th style={{ textAlign: "right" }}>self</th>
-          <th style={{ textAlign: "right" }}>total</th>
+          <th className="num-h">self</th>
+          <th className="num-h">total</th>
         </tr>
       </thead>
       <tbody>
@@ -174,22 +209,26 @@ function Annotation({
     <div className="annotation">
       <div className="ann-header">
         {view ? view.function_name : "loading..."}
-        {err && <span style={{ color: "#d35f5f" }}> · {err}</span>}
+        {err && <span className="err-text"> · {err}</span>}
       </div>
-      <table className="asm">
-        <tbody>
-          {view?.lines.map((line) => (
-            <tr key={String(line.address)}>
-              <td className="num">{line.self_count.toString()}</td>
-              <td className="addr">0x{line.address.toString(16)}</td>
-              <td
-                className="asm-line"
-                dangerouslySetInnerHTML={{ __html: line.html }}
-              />
-            </tr>
-          )) ?? null}
-        </tbody>
-      </table>
+      <div className="ann-body">
+        <table className="asm">
+          <tbody>
+            {view?.lines.map((line) => (
+              <tr key={String(line.address)}>
+                <td className="num">
+                  {line.self_count > 0n ? line.self_count.toString() : ""}
+                </td>
+                <td className="addr">0x{line.address.toString(16)}</td>
+                <td
+                  className="asm-line"
+                  dangerouslySetInnerHTML={{ __html: line.html }}
+                />
+              </tr>
+            )) ?? null}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

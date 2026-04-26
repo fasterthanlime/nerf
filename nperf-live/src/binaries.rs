@@ -105,11 +105,15 @@ impl BinaryRegistry {
         }
     }
 
-    pub fn insert(&mut self, binary: LoadedBinary) {
+    pub fn insert(&mut self, mut binary: LoadedBinary) {
         self.by_base.retain(|b| b.base_avma != binary.base_avma);
         if self.dyld_arch.is_none() {
             self.dyld_arch = binary.arch.clone();
         }
+        // Sort the symbol table once so lookup_symbol can binary-search.
+        // System dylibs have thousands of symbols and we resolve every
+        // sampled address on every top-N tick.
+        binary.symbols.sort_by_key(|s| s.start_svma);
         self.by_base.push(binary);
     }
 
@@ -127,14 +131,21 @@ impl BinaryRegistry {
             .find(|b| address >= b.base_avma && address < b.avma_end)?;
         let svma = svma_for(binary, address);
         let basename = short_path(&binary.path).to_owned();
-        let name = binary
-            .symbols
-            .iter()
-            .find(|s| svma >= s.start_svma && svma < s.end_svma)
-            .map(|s| {
-                let raw = String::from_utf8_lossy(&s.name).into_owned();
-                demangle_name(&raw)
-            });
+        // Symbols are sorted by start_svma at insert time. partition_point
+        // gives us the first symbol whose start_svma > svma; the candidate
+        // containing svma is the one before that (if its end_svma > svma).
+        let idx = binary.symbols.partition_point(|s| s.start_svma <= svma);
+        let name = if idx > 0 {
+            let candidate = &binary.symbols[idx - 1];
+            if svma < candidate.end_svma {
+                let raw = String::from_utf8_lossy(&candidate.name).into_owned();
+                Some(demangle_name(&raw))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         name.map(|n| (n, basename.clone())).or_else(|| {
             // Binary is mapped but no symbol for this address — still
             // useful to show the basename so the user knows where the
