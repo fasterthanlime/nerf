@@ -420,6 +420,11 @@ fn drain_loop<S: SampleSink>(
                         est.observe(avma);
                     }
                 }
+                offcpu.note_sample(
+                    sample.tid,
+                    sample.user_backtrace,
+                    sample.kernel_backtrace,
+                );
                 sink.on_sample(SampleEvent {
                     timestamp_ns: sample.timestamp_ns,
                     pid: opts.pid,
@@ -428,6 +433,28 @@ fn drain_loop<S: SampleSink>(
                     kernel_backtrace: sample.kernel_backtrace,
                 });
             });
+        }
+
+        // Expand any off-CPU intervals that closed in this batch
+        // into synthetic wall-clock samples spaced at the PET sample
+        // period. The stack is frozen from the last on-CPU sample
+        // for the thread, so a thread blocked deep inside
+        // `mach_msg_overwrite_trap` lights up that frame for the
+        // entire blocked interval rather than disappearing from the
+        // flame graph the way it would in a CPU-only profiler.
+        let period_ns = (1_000_000_000u64 / opts.frequency_hz.max(1) as u64).max(1);
+        for interval in offcpu.drain_pending() {
+            let mut ts = interval.off_ns;
+            while ts < interval.on_ns {
+                sink.on_sample(SampleEvent {
+                    timestamp_ns: ts,
+                    pid: opts.pid,
+                    tid: interval.tid,
+                    backtrace: &interval.user_stack,
+                    kernel_backtrace: &interval.kernel_stack,
+                });
+                ts = ts.saturating_add(period_ns);
+            }
         }
     }
 

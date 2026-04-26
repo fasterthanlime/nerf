@@ -13,13 +13,14 @@
 //!   - who went off-CPU is the *previous* on-going thread on the
 //!     same cpuid; we track the per-cpu current tid for that.
 //!
-//! From this we can derive per-thread off-CPU intervals: time from
-//! when a thread last went off-CPU until it next came back. Sum
-//! those and you get total off-CPU time per thread.
-//!
-//! This module currently only tracks the bookkeeping + summary. The
-//! actual emission of off-CPU samples (with stacks borrowed from the
-//! preceding PET tick) is a follow-up.
+//! Off-CPU stacks are borrowed from the most recent PET sample for
+//! the thread. kperf doesn't sample on context switches (we'd need
+//! a kperf-on-kdbg trigger action for that, which is a TODO), so
+//! the "where" of an off-CPU interval is approximated by "where the
+//! thread was at the previous on-CPU sample." Good enough to show
+//! e.g. an audio thread blocked in `mach_msg_overwrite_trap` --
+//! that frame survives across the deschedule and is on the stack
+//! at every PET tick leading up to it.
 
 use std::collections::HashMap;
 
@@ -29,25 +30,53 @@ use crate::kdebug::{kdbg_code, kdbg_subclass, mach_sched, KdBuf, KDBG_TIMESTAMP_
 pub struct OffCpuTracker {
     /// Last-known on-CPU thread per cpuid. Mapping cpuid -> tid.
     on_cpu: HashMap<u32, u64>,
-    /// Per-thread accumulated off-CPU duration (ns) and the timestamp
-    /// of the most recent off->on transition we still need to close
-    /// (None once it's already on-CPU).
+    /// Per-thread state: cached on-CPU stack + accumulated off-CPU
+    /// duration + timestamp of the most recent off->on transition we
+    /// still need to close (None once the thread is on-CPU).
     threads: HashMap<u64, ThreadState>,
     sched_count: u64,
     stkhandoff_count: u64,
     makerunnable_count: u64,
+    /// Closed off-CPU intervals waiting to be expanded into samples
+    /// by the drain loop.
+    pending: Vec<OffCpuInterval>,
 }
 
 #[derive(Default)]
 struct ThreadState {
     total_off_ns: u64,
-    /// Timestamp the thread last went off-CPU. `None` while on-CPU.
     last_off_ns: Option<u64>,
+    /// Last on-CPU stack we sampled for this thread; used as the
+    /// stack for synthetic off-CPU samples until the thread runs
+    /// again and gets a fresh sample.
+    last_user_stack: Vec<u64>,
+    last_kernel_stack: Vec<u64>,
+}
+
+/// One closed off-CPU interval, ready to be expanded into N
+/// synthetic samples at the kperf sampling period.
+pub struct OffCpuInterval {
+    pub tid: u32,
+    pub off_ns: u64,
+    pub on_ns: u64,
+    pub user_stack: Vec<u64>,
+    pub kernel_stack: Vec<u64>,
 }
 
 impl OffCpuTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cache the most recent on-CPU stack for a thread. Called on
+    /// every kperf PET sample. The cached stack is what we attribute
+    /// any subsequent off-CPU interval to.
+    pub fn note_sample(&mut self, tid: u32, user: &[u64], kernel: &[u64]) {
+        let st = self.threads.entry(tid as u64).or_default();
+        st.last_user_stack.clear();
+        st.last_user_stack.extend_from_slice(user);
+        st.last_kernel_stack.clear();
+        st.last_kernel_stack.extend_from_slice(kernel);
     }
 
     pub fn feed(&mut self, rec: &KdBuf) {
@@ -76,11 +105,27 @@ impl OffCpuTracker {
                 }
 
                 // The new on-coming thread closes its off-CPU
-                // interval (if any).
+                // interval (if any). Push to pending so the drain
+                // loop can synthesize wall-clock samples covering the
+                // gap.
                 if new_tid != 0 {
                     let st = self.threads.entry(new_tid).or_default();
                     if let Some(off_ns) = st.last_off_ns.take() {
-                        st.total_off_ns = st.total_off_ns.saturating_add(ts.saturating_sub(off_ns));
+                        let interval_ns = ts.saturating_sub(off_ns);
+                        st.total_off_ns = st.total_off_ns.saturating_add(interval_ns);
+                        // Only emit synthetic samples if we have a
+                        // stack to attribute them to. Without a prior
+                        // on-CPU sample for this thread we'd just be
+                        // emitting empty stacks.
+                        if !st.last_user_stack.is_empty() || !st.last_kernel_stack.is_empty() {
+                            self.pending.push(OffCpuInterval {
+                                tid: new_tid as u32,
+                                off_ns,
+                                on_ns: ts,
+                                user_stack: st.last_user_stack.clone(),
+                                kernel_stack: st.last_kernel_stack.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -89,6 +134,13 @@ impl OffCpuTracker {
             }
             _ => {}
         }
+    }
+
+    /// Take any closed off-CPU intervals that haven't been expanded
+    /// into samples yet. Caller is expected to drain into a sample
+    /// sink at the kperf sampling cadence.
+    pub fn drain_pending(&mut self) -> Vec<OffCpuInterval> {
+        std::mem::take(&mut self.pending)
     }
 
     pub fn log_summary(&self) {
