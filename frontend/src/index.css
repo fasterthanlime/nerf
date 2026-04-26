@@ -258,6 +258,25 @@ table.top-table tr.match {
   background: #232730;
 }
 
+.context-menu-header {
+  padding: 6px 12px;
+  border-bottom: 1px solid #2a2e34;
+  margin-bottom: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #d3b75f;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.context-menu-sub {
+  color: #6c7480;
+  font-size: 10px;
+  margin-top: 2px;
+}
+
 .err-text {
   color: #d35f5f;
 }
@@ -566,19 +585,51 @@ table.top-table tr.main .fn-line .fn-name {
 
 /* ---------- annotation pane ---------- */
 
-.ann-stack {
+.ann-tabs {
   display: flex;
   flex-direction: column;
   height: 100%;
   min-height: 0;
 }
 
-.ann-stack > .neighbors {
+.tab-strip {
   flex: 0 0 auto;
+  display: flex;
+  background: #0a0b0d;
   border-bottom: 1px solid #232629;
 }
 
-.ann-stack > .annotation {
+.tab-strip .tab {
+  background: transparent;
+  color: #9aa0a6;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+}
+
+.tab-strip .tab:hover {
+  color: #e6e8eb;
+}
+
+.tab-strip .tab.active {
+  color: #d3b75f;
+  border-bottom-color: #d3b75f;
+}
+
+.tab-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.tab-body > .annotation,
+.tab-body > .neighbors {
   flex: 1 1 auto;
   min-height: 0;
 }

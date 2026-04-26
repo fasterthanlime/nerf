@@ -5,7 +5,7 @@ import type {
   NeighborsUpdate,
   ProfilerClient,
 } from "./generated/profiler.generated.ts";
-import { objKindOf, type ObjKind } from "./App.tsx";
+import { objKindOf, type ContextMenuTarget, type ObjKind } from "./App.tsx";
 
 const ROW_H = 16;
 
@@ -98,6 +98,7 @@ function FamilyChart({
   matchText,
   hiddenKinds,
   onSelectAddress,
+  onContextMenu,
   empty,
 }: {
   root: FlameNode;
@@ -105,6 +106,7 @@ function FamilyChart({
   matchText: ((t: string) => boolean) | null;
   hiddenKinds: Set<ObjKind>;
   onSelectAddress: (a: bigint) => void;
+  onContextMenu: (t: ContextMenuTarget) => void;
   empty: string;
 }) {
   const { boxes, depth } = layout(root, hiddenKinds, true);
@@ -136,6 +138,18 @@ function FamilyChart({
             onClick={() => {
               if (b.node.address !== 0n) onSelectAddress(b.node.address);
             }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              if (b.node.address === 0n) return;
+              onContextMenu({
+                x: e.clientX,
+                y: e.clientY,
+                address: b.node.address,
+                functionName: b.node.function_name,
+                binary: b.node.binary,
+                kind: objKindOf(b.node),
+              });
+            }}
             title={`${labelFor(b.node)} · ${b.node.count.toString()}/${total.toString()} · ${pct(b.node.count, total)}`}
           >
             {widthPct > 2 ? labelFor(b.node) : ""}
@@ -153,6 +167,7 @@ export function Neighbors({
   matchText,
   hiddenKinds,
   onSelectAddress,
+  onContextMenu,
 }: {
   client: ProfilerClient;
   address: bigint;
@@ -160,6 +175,7 @@ export function Neighbors({
   matchText: ((t: string) => boolean) | null;
   hiddenKinds: Set<ObjKind>;
   onSelectAddress: (a: bigint) => void;
+  onContextMenu: (t: ContextMenuTarget) => void;
 }) {
   const [update, setUpdate] = useState<NeighborsUpdate | null>(null);
   const [frozen, setFrozen] = useState(false);
@@ -209,6 +225,7 @@ export function Neighbors({
           matchText={matchText}
           hiddenKinds={hiddenKinds}
           onSelectAddress={onSelectAddress}
+          onContextMenu={onContextMenu}
           empty="(no caller info — sampled at top of stack)"
         />
       </div>
@@ -229,6 +246,7 @@ export function Neighbors({
           matchText={matchText}
           hiddenKinds={hiddenKinds}
           onSelectAddress={onSelectAddress}
+          onContextMenu={onContextMenu}
           empty="(no callees — leaf function or kernel call)"
         />
       </div>

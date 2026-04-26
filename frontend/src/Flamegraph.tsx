@@ -5,7 +5,7 @@ import type {
   FlamegraphUpdate,
   ProfilerClient,
 } from "./generated/profiler.generated.ts";
-import { objKindOf, type ObjKind } from "./App.tsx";
+import { objKindOf, type ContextMenuTarget, type ObjKind } from "./App.tsx";
 
 const ROW_H = 18;
 
@@ -109,25 +109,25 @@ export function Flamegraph({
   tid,
   matchText,
   hiddenKinds,
+  focusKey,
+  onFocusKeyChange,
   onSelectAddress,
   onFrozenChange,
+  onContextMenu,
 }: {
   client: ProfilerClient;
   tid: number | null;
   matchText: ((t: string) => boolean) | null;
   hiddenKinds: Set<ObjKind>;
+  focusKey: string | null;
+  onFocusKeyChange: (k: string | null) => void;
   onSelectAddress: (a: bigint) => void;
   onFrozenChange?: (frozen: boolean) => void;
+  onContextMenu: (t: ContextMenuTarget) => void;
 }) {
   const [update, setUpdate] = useState<FlamegraphUpdate | null>(null);
   const [hover, setHover] = useState<Box | null>(null);
   const [frozen, setFrozen] = useState(false);
-  const [focusKey, setFocusKey] = useState<string | null>(null);
-  const [menu, setMenu] = useState<{
-    x: number;
-    y: number;
-    box: Box;
-  } | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const frozenRef = useRef(false);
   const latestRef = useRef<FlamegraphUpdate | null>(null);
@@ -136,7 +136,7 @@ export function Flamegraph({
     let cancelled = false;
     setUpdate(null);
     latestRef.current = null;
-    setFocusKey(null);
+    onFocusKeyChange(null);
     const [tx, rx] = channel<FlamegraphUpdate>();
     client.subscribeFlamegraph(tid, tx).catch(() => {});
     (async () => {
@@ -158,20 +158,6 @@ export function Flamegraph({
     }
     onFrozenChange?.(frozen);
   }, [frozen, onFrozenChange]);
-
-  // Close the context menu on any outside click / scroll / key.
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    window.addEventListener("click", close);
-    window.addEventListener("scroll", close, true);
-    window.addEventListener("keydown", close);
-    return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("scroll", close, true);
-      window.removeEventListener("keydown", close);
-    };
-  }, [menu]);
 
   if (!update) {
     return <div className="flame placeholder">building flamegraph…</div>;
@@ -221,7 +207,15 @@ export function Flamegraph({
               }}
               onContextMenu={(e) => {
                 e.preventDefault();
-                setMenu({ x: e.clientX, y: e.clientY, box: b });
+                onContextMenu({
+                  x: e.clientX,
+                  y: e.clientY,
+                  address: b.node.address,
+                  functionName: b.node.function_name,
+                  binary: b.node.binary,
+                  kind: b.node.address === 0n ? undefined : objKindOf(b.node),
+                  flameKey: b.key,
+                });
               }}
               title={`${labelFor(b.node)} · ${b.node.count.toString()}/${total.toString()}`}
             >
@@ -234,7 +228,7 @@ export function Flamegraph({
         {focusKey && (
           <button
             className="flame-reset"
-            onClick={() => setFocusKey(null)}
+            onClick={() => onFocusKeyChange(null)}
             title="clear focus and show the full tree"
           >
             ↩ reset focus
@@ -255,34 +249,6 @@ export function Flamegraph({
           </span>
         )}
       </div>
-      {menu && (
-        <div
-          className="context-menu"
-          style={{ top: menu.y, left: menu.x }}
-          // stop the outer window click handler from immediately closing us
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            onClick={() => {
-              setFocusKey(menu.box.key);
-              setMenu(null);
-            }}
-          >
-            Focus this subtree
-          </button>
-          <button
-            onClick={() => {
-              if (menu.box.node.address !== 0n) {
-                onSelectAddress(menu.box.node.address);
-              }
-              setMenu(null);
-            }}
-          >
-            Open disassembly
-          </button>
-        </div>
-      )}
     </div>
   );
 }

@@ -48,6 +48,25 @@ export function App() {
   const [search, setSearch] = useState("");
   const [regexMode, setRegexMode] = useState(false);
   const [hiddenKinds, setHiddenKinds] = useState<Set<ObjKind>>(new Set());
+  const [paneTab, setPaneTab] = useState<PaneTab>("asm");
+  const [flameFocusKey, setFlameFocusKey] = useState<string | null>(null);
+  const [menu, setMenu] = useState<ContextMenuTarget | null>(null);
+
+  // Close the context menu on any outside click / scroll / key.
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", close);
+    };
+  }, [menu]);
+
+  const openMenu = (target: ContextMenuTarget) => setMenu(target);
 
   // Compile a matcher once per (search, regexMode) change. Returns
   // `null` when the input is empty or regex compilation failed —
@@ -232,8 +251,11 @@ export function App() {
             tid={selectedTid}
             matchText={matchText}
             hiddenKinds={hiddenKinds}
+            focusKey={flameFocusKey}
+            onFocusKeyChange={setFlameFocusKey}
             onSelectAddress={setSelected}
             onFrozenChange={setFlameFrozen}
+            onContextMenu={openMenu}
           />
         </section>
       )}
@@ -252,36 +274,157 @@ export function App() {
             onSort={setSort}
             matchText={matchText}
             hiddenKinds={hiddenKinds}
+            onContextMenu={openMenu}
           />
         </section>
         <section className="pane ann-pane">
           {client && selected !== null ? (
-            <div className="ann-stack" key={String(selected)}>
-              <Neighbors
-                client={client}
-                address={selected}
-                tid={selectedTid}
-                matchText={matchText}
-                hiddenKinds={hiddenKinds}
-                onSelectAddress={setSelected}
-              />
-              <Annotation
-                client={client}
-                address={selected}
-                tid={selectedTid}
-              />
+            <div className="ann-tabs" key={String(selected)}>
+              <div className="tab-strip" role="tablist">
+                <button
+                  className={`tab${paneTab === "asm" ? " active" : ""}`}
+                  onClick={() => setPaneTab("asm")}
+                  role="tab"
+                  aria-selected={paneTab === "asm"}
+                >
+                  disassembly
+                </button>
+                <button
+                  className={`tab${paneTab === "neighbors" ? " active" : ""}`}
+                  onClick={() => setPaneTab("neighbors")}
+                  role="tab"
+                  aria-selected={paneTab === "neighbors"}
+                >
+                  family tree
+                </button>
+              </div>
+              <div className="tab-body">
+                {paneTab === "asm" ? (
+                  <Annotation
+                    client={client}
+                    address={selected}
+                    tid={selectedTid}
+                  />
+                ) : (
+                  <Neighbors
+                    client={client}
+                    address={selected}
+                    tid={selectedTid}
+                    matchText={matchText}
+                    hiddenKinds={hiddenKinds}
+                    onSelectAddress={setSelected}
+                    onContextMenu={openMenu}
+                  />
+                )}
+              </div>
             </div>
           ) : (
             <div className="placeholder">click a row to see disassembly</div>
           )}
         </section>
       </main>
+      {menu && (
+        <div
+          className="context-menu"
+          style={{ top: menu.y, left: menu.x }}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="context-menu-header">
+            {menu.functionName ?? `0x${menu.address.toString(16)}`}
+            {menu.binary && (
+              <div className="context-menu-sub">{menu.binary}</div>
+            )}
+          </div>
+          <button
+            onClick={() => {
+              setSelected(menu.address);
+              setPaneTab("asm");
+              setMenu(null);
+            }}
+          >
+            Open disassembly
+          </button>
+          <button
+            onClick={() => {
+              setSelected(menu.address);
+              setPaneTab("neighbors");
+              setMenu(null);
+            }}
+          >
+            Open family tree
+          </button>
+          {menu.flameKey && (
+            <button
+              onClick={() => {
+                setFlameFocusKey(menu.flameKey!);
+                setMenu(null);
+              }}
+            >
+              Focus subtree in flamegraph
+            </button>
+          )}
+          {menu.functionName && (
+            <button
+              onClick={() => {
+                setSearch(`^${escapeRegex(menu.functionName!)}$`);
+                setRegexMode(true);
+                setMenu(null);
+              }}
+            >
+              Search exact symbol
+            </button>
+          )}
+          {menu.kind && menu.kind !== "main" && (
+            <button
+              onClick={() => {
+                const k = menu.kind!;
+                setHiddenKinds((prev) => {
+                  const next = new Set(prev);
+                  next.add(k);
+                  return next;
+                });
+                setMenu(null);
+              }}
+            >
+              Hide all "{KIND_LABEL[menu.kind]}" rows
+            </button>
+          )}
+          {menu.functionName && (
+            <button
+              onClick={() => {
+                navigator.clipboard?.writeText(menu.functionName!);
+                setMenu(null);
+              }}
+            >
+              Copy symbol name
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
+export type ContextMenuTarget = {
+  x: number;
+  y: number;
+  address: bigint;
+  functionName: string | null;
+  binary: string | null;
+  kind?: ObjKind;
+  /// Only set when the source surface is a flamegraph; lets the menu
+  /// offer "Focus subtree in flamegraph".
+  flameKey?: string;
+};
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 type LangKind = "rust" | "c" | "cpp" | "asm" | "unknown";
 export type ObjKind = "main" | "system" | "dylib" | "unknown";
+type PaneTab = "asm" | "neighbors";
 
 function langOf(fn: string | null | undefined): LangKind {
   if (!fn) return "unknown";
@@ -414,6 +557,7 @@ function TopTable({
   onSort,
   matchText,
   hiddenKinds,
+  onContextMenu,
 }: {
   entries: TopEntry[];
   totalSamples: bigint;
@@ -423,6 +567,7 @@ function TopTable({
   onSort: (s: SortKey) => void;
   matchText: ((t: string) => boolean) | null;
   hiddenKinds: Set<ObjKind>;
+  onContextMenu: (t: ContextMenuTarget) => void;
 }) {
   const visible = entries.filter((e) => !hiddenKinds.has(objKindOf(e)));
   return (
@@ -462,6 +607,17 @@ function TopTable({
                 (entryMatches(e, matchText) ? "match" : "")
               }
               onClick={() => onSelect(e.address)}
+              onContextMenu={(ev) => {
+                ev.preventDefault();
+                onContextMenu({
+                  x: ev.clientX,
+                  y: ev.clientY,
+                  address: e.address,
+                  functionName: e.function_name,
+                  binary: e.binary,
+                  kind: obj,
+                });
+              }}
             >
               <td className="entry">
                 <div className="entry-line fn-line">
