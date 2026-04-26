@@ -1242,6 +1242,12 @@ table.top-table tr.main .fn-line .fn-name {
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
+  background: var(--bg-pane);
+  /* Section headers stay visible while scrolling through long
+     caller/callee chains (sticks under the family-target chip). */
+  position: sticky;
+  top: 27px;
+  z-index: 1;
 }
 
 .family-empty {
@@ -1268,6 +1274,13 @@ table.top-table tr.main .fn-line .fn-name {
   align-items: baseline;
   white-space: nowrap;
   overflow: hidden;
+  /* Pin to the top of the scrolling pane so the symbol name stays
+     visible while you scroll through deep callers/callees. Without
+     this, scrolling into callees hides the target's name and you
+     lose the "what am I looking at" anchor. */
+  position: sticky;
+  top: 0;
+  z-index: 2;
 }
 
 .family-target-label {
