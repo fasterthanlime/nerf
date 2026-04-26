@@ -48,13 +48,44 @@ struct ProcRegionInfo {
     pri_size: u64,
 }
 
-/// Mirror of `<sys/proc_info.h>` `struct vnode_info`. We don't read any
-/// of `vnode_stat`, so it's an opaque 144-byte pad (same size + align
-/// as the C struct).
+/// Mirror of `<sys/proc_info.h>` `struct vinfo_stat`. We don't read
+/// any of these fields; they're declared so the layout matches the
+/// kernel exactly (in particular, `vst_dev` is uint32_t, not uint64_t
+/// -- a transcription error here truncates every path returned in
+/// `proc_regionwithpathinfo` by 8 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct VinfoStat {
+    vst_dev: u32,
+    vst_mode: u16,
+    vst_nlink: u16,
+    vst_ino: u64,
+    vst_uid: u32,
+    vst_gid: u32,
+    vst_atime: i64,
+    vst_atimensec: i64,
+    vst_mtime: i64,
+    vst_mtimensec: i64,
+    vst_ctime: i64,
+    vst_ctimensec: i64,
+    vst_birthtime: i64,
+    vst_birthtimensec: i64,
+    vst_size: i64,
+    vst_blocks: i64,
+    vst_blksize: i32,
+    vst_flags: u32,
+    vst_gen: u32,
+    vst_rdev: u32,
+    vst_qspare: [i64; 2],
+}
+
+/// Mirror of `<sys/proc_info.h>` `struct vnode_info`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct VnodeInfo {
-    vi_stat_pad: [u64; 18], // 144 bytes; vnode_stat is 8-byte aligned
+    vi_stat: VinfoStat,
     vi_type: i32,
     vi_pad: i32,
     vi_fsid: [i32; 2],
@@ -75,6 +106,16 @@ struct ProcRegionWithPathInfo {
     prp_prinfo: ProcRegionInfo,
     prp_vip: VnodeInfoPath,
 }
+
+// Catch any future struct drift before we ship a silently-truncated
+// path bug again.
+const _: () = {
+    assert!(std::mem::size_of::<VinfoStat>() == 136);
+    assert!(std::mem::size_of::<VnodeInfo>() == 152);
+    assert!(std::mem::size_of::<VnodeInfoPath>() == 1176);
+    assert!(std::mem::size_of::<ProcRegionInfo>() == 96);
+    assert!(std::mem::size_of::<ProcRegionWithPathInfo>() == 1272);
+};
 
 const VM_PROT_READ: u32 = 0x1;
 #[allow(dead_code)]

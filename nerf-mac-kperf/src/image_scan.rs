@@ -52,12 +52,25 @@ impl ImageScanner {
     pub fn rescan<S: SampleSink>(&mut self, pid: u32, sink: &mut S) {
         let regions = libproc::enumerate_regions(pid);
         let exec_count = regions.iter().filter(|r| r.is_executable && !r.path.is_empty()).count();
-        if self.known.is_empty() {
+        let first_scan = self.known.is_empty();
+        if first_scan {
             log::info!(
-                "image_scan: pid={pid} -> {} total regions, {} vnode-backed executable",
+                "image_scan: pid={pid} -> {} regions returned, {} vnode-backed executable",
                 regions.len(),
                 exec_count
             );
+            // Surface the distinct executable paths so we can tell at a
+            // glance whether shared-cache dylibs come through as their
+            // install names, as the cache file itself, or not at all.
+            let mut distinct: std::collections::BTreeSet<&str> = Default::default();
+            for r in &regions {
+                if r.is_executable && !r.path.is_empty() {
+                    distinct.insert(r.path.as_str());
+                }
+            }
+            for path in &distinct {
+                log::info!("image_scan: exec path {path}");
+            }
         }
 
         // Build the current set: one entry per (path, base_avma) for
@@ -95,8 +108,15 @@ impl ImageScanner {
             }
         }
 
+        let to_add_count = to_add.len();
+        let mut with_symbols = 0u32;
+        let mut total_symbols = 0usize;
         for (path, base_avma, region_size) in to_add {
             let img = build_image(&path, base_avma, region_size, self.shared_cache.as_ref());
+            if !img.symbols.is_empty() {
+                with_symbols += 1;
+                total_symbols += img.symbols.len();
+            }
             sink.on_binary_loaded(BinaryLoadedEvent {
                 pid,
                 base_avma: img.base_avma,
@@ -109,6 +129,12 @@ impl ImageScanner {
                 symbols: &img.symbols,
             });
             self.known.insert((path, base_avma), img);
+        }
+        if first_scan {
+            log::info!(
+                "image_scan: emitted {to_add_count} BinaryLoaded ({with_symbols} with symbols, \
+                 {total_symbols} total symbols)"
+            );
         }
     }
 }
