@@ -7,6 +7,7 @@ import {
   LuBinary,
   LuSettings,
   LuPause,
+  LuPlay,
   LuSun,
   LuMoon,
   LuChevronDown,
@@ -97,6 +98,8 @@ export function App() {
   const [filter, setFilter] = useState<LiveFilter>(EMPTY_FILTER);
   const [pmuMetric, setPmuMetric] = useState<PmuMetric>("ipc");
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [paused, setPaused] = useState(false);
+  const [editingUrl, setEditingUrl] = useState(false);
 
   // Reflect the theme onto the <html> element so the CSS tokens flip,
   // and persist the user's choice across reloads.
@@ -301,15 +304,61 @@ export function App() {
               <span className={`dot ${status}`} />
             )}
           </span>
-          <input
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") setCommittedUrl(url);
-            }}
-          />
-          <button onClick={() => setCommittedUrl(url)}>connect</button>
+          {status === "ok" && !editingUrl ? (
+            <button
+              type="button"
+              className="url-display"
+              onClick={() => setEditingUrl(true)}
+              title={`connected to ${committedUrl} — click to change`}
+            >
+              {committedUrl.replace(/^ws:\/\//, "")}
+            </button>
+          ) : (
+            <>
+              <input
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    setCommittedUrl(url);
+                    setEditingUrl(false);
+                  }
+                }}
+                autoFocus={editingUrl}
+                onBlur={() => {
+                  if (status === "ok") setEditingUrl(false);
+                }}
+              />
+              <button
+                onClick={() => {
+                  setCommittedUrl(url);
+                  setEditingUrl(false);
+                }}
+              >
+                connect
+              </button>
+            </>
+          )}
           {error && <span className="err-text">{error}</span>}
+          {client && (
+            <button
+              type="button"
+              className={`pause-toggle${paused ? " active" : ""}`}
+              onClick={() => {
+                const next = !paused;
+                setPaused(next);
+                client.setPaused(next).catch(() => {});
+              }}
+              title={
+                paused
+                  ? "ingestion paused — click to resume sampling"
+                  : "click to freeze the live view (target keeps running, no new samples flow)"
+              }
+            >
+              {paused ? <LuPlay /> : <LuPause />}
+              {paused ? "paused" : "pause"}
+            </button>
+          )}
           <ThreadSwitcher
             threads={threads}
             selectedTid={selectedTid}

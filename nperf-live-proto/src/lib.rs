@@ -339,6 +339,15 @@ pub trait Profiler {
         wakee_tid: u32,
         output: vox::Tx<WakersUpdate>,
     );
+
+    /// Pause / resume live ingestion. While paused, new samples and
+    /// wakeup edges from the recorder get dropped before reaching
+    /// the aggregator -- frozen views, no client churn -- but the
+    /// recorder keeps running underneath, the binary registry keeps
+    /// updating, and disassembly / source / annotation queries
+    /// continue to work against the existing (frozen) data.
+    async fn set_paused(&self, paused: bool);
+    async fn is_paused(&self) -> bool;
 }
 
 /// All service descriptors exposed by nperf-live; the codegen iterates over

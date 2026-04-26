@@ -223,6 +223,53 @@ body {
   background: var(--bg-button-hover);
 }
 
+/* Compact connected-URL display: looks like a chip, click to switch
+   back to edit mode. Lets us reclaim a lot of horizontal space in
+   the steady state. */
+.connection .url-display {
+  background: transparent;
+  border: 1px dashed var(--border-soft);
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.connection .url-display:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+  background: var(--bg-input);
+}
+
+.connection .pause-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-button);
+  border: 1px solid var(--border-mid);
+  color: var(--text-primary);
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.connection .pause-toggle.active {
+  background: var(--accent);
+  color: var(--bg-base);
+  border-color: var(--accent);
+}
+
+.connection .pause-toggle:hover {
+  background: var(--bg-button-hover);
+}
+
+.connection .pause-toggle.active:hover {
+  background: color-mix(in srgb, var(--accent) 80%, var(--bg-base));
+}
+
 .connection .spacer {
   flex: 1;
 }
@@ -446,19 +493,27 @@ button.regex-toggle.active {
 
 .kind-filter {
   display: inline-flex;
-  align-items: center;
-  gap: 4px;
+  align-items: stretch;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  background: var(--bg-input);
+  overflow: hidden;
 }
 
 .kind-pill {
-  background: var(--bg-input);
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
+  background: transparent;
+  border: 0;
+  border-left: 1px solid var(--border-soft);
+  border-radius: 0;
   padding: 2px 10px;
   font: inherit;
   font-size: 11px;
   cursor: pointer;
   user-select: none;
+}
+
+.kind-pill:first-child {
+  border-left: 0;
 }
 
 .kind-pill:hover {
@@ -467,7 +522,6 @@ button.regex-toggle.active {
 
 .kind-pill.off {
   opacity: 0.4;
-  text-decoration: line-through;
 }
 
 /* Active-pill colors mirror the inline icon palette. */
@@ -1006,9 +1060,11 @@ table.top-table td.num .num-line {
 }
 
 table.top-table td.num .num-bar {
-  height: 3px;
+  height: 2px;
+  width: 5em;
+  margin-left: auto;
   background: var(--row-divider);
-  border-radius: 2px;
+  border-radius: 1px;
   margin-top: 4px;
   overflow: hidden;
 }

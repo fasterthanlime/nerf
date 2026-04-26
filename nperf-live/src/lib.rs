@@ -69,10 +69,18 @@ pub(crate) enum LiveEvent {
 #[derive(Clone)]
 pub struct LiveSinkImpl {
     tx: mpsc::UnboundedSender<LiveEvent>,
+    /// Set by the `set_paused` RPC. While `true` we drop incoming
+    /// sample / wakeup events on the floor instead of enqueuing them
+    /// for the aggregator; binary registry + thread-name updates
+    /// keep flowing so already-frozen data still resolves cleanly.
+    paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LiveSink for LiveSinkImpl {
     fn on_sample(&self, event: &SampleEvent) {
+        if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let user_addrs: Vec<u64> = event.user_backtrace.iter().map(|f| f.address).collect();
         let _ = self.tx.send(LiveEvent::Sample {
             tid: event.tid,
@@ -129,6 +137,9 @@ impl LiveSink for LiveSinkImpl {
     }
 
     fn on_wakeup(&self, event: &LiveWakeupEvent) {
+        if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let _ = self.tx.send(LiveEvent::Wakeup {
             timestamp_ns: event.timestamp,
             waker_tid: event.waker_tid,
@@ -147,6 +158,10 @@ pub struct LiveServer {
     /// (interior `LazyCell`s), so we use a `Mutex` rather than `RwLock`.
     /// Be careful not to hold this guard across `.await`.
     pub source: Arc<parking_lot::Mutex<source::SourceResolver>>,
+    /// Shared with the LiveSinkImpl on the recorder side -- when set,
+    /// new samples and wakeup edges get dropped before they reach
+    /// the aggregator. Drives the "Pause" button in the live UI.
+    pub paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Profiler for LiveServer {
@@ -379,6 +394,16 @@ impl Profiler for LiveServer {
                 }
             }
         });
+    }
+
+    async fn set_paused(&self, paused: bool) {
+        self.paused
+            .store(paused, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(paused, "set_paused");
+    }
+
+    async fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn subscribe_threads(&self, output: vox::Tx<ThreadsUpdate>) {
@@ -1139,10 +1164,13 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
     tracing::info!("nperf-live listening on ws://{}", local);
     eprintln!("nperf-live: listening on ws://{}", local);
 
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let server = LiveServer {
         aggregator,
         binaries,
         source: Arc::new(parking_lot::Mutex::new(source::SourceResolver::new())),
+        paused: paused.clone(),
     };
     let dispatcher = ProfilerDispatcher::new(server);
     let handle = tokio::spawn(async move {
@@ -1151,5 +1179,5 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
         }
     });
 
-    Ok((LiveSinkImpl { tx }, handle))
+    Ok((LiveSinkImpl { tx, paused }, handle))
 }

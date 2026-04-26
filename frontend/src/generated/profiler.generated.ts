@@ -201,6 +201,12 @@ export type SubscribeWakersRequest = [
 ];
 export type SubscribeWakersResponse = void;
 
+export type SetPausedRequest = [boolean];
+export type SetPausedResponse = void;
+
+export type IsPausedRequest = [];
+export type IsPausedResponse = boolean;
+
 // Caller interface for Profiler
 export interface ProfilerCaller {
   /**
@@ -227,6 +233,16 @@ export interface ProfilerCaller {
    * threads).
    */
   subscribeWakers(wakeeTid: number, output: Tx<WakersUpdate>): Promise<void>;
+  /**
+   * Pause / resume live ingestion. While paused, new samples and
+   * wakeup edges from the recorder get dropped before reaching
+   * the aggregator -- frozen views, no client churn -- but the
+   * recorder keeps running underneath, the binary registry keeps
+   * updating, and disassembly / source / annotation queries
+   * continue to work against the existing (frozen) data.
+   */
+  setPaused(paused: boolean): Promise<void>;
+  isPaused(): Promise<boolean>;
 }
 
 // Client implementation for Profiler
@@ -472,6 +488,38 @@ export class ProfilerClient implements ProfilerCaller {
       return value as void;
   }
 
+  /**
+   * Pause / resume live ingestion. While paused, new samples and
+   * wakeup edges from the recorder get dropped before reaching
+   * the aggregator -- frozen views, no client churn -- but the
+   * recorder keeps running underneath, the binary registry keeps
+   * updating, and disassembly / source / annotation queries
+   * continue to work against the existing (frozen) data.
+   */
+  async setPaused(paused: boolean): Promise<void> {
+    const descriptor = profiler_setPaused_method;
+    const sendSchemas = profiler_descriptor.send_schemas;
+      const value = await this.caller.call({
+        method: "Profiler.setPaused",
+        args: { paused },
+        descriptor,
+        sendSchemas,
+      });
+      return value as void;
+  }
+
+  async isPaused(): Promise<boolean> {
+    const descriptor = profiler_isPaused_method;
+    const sendSchemas = profiler_descriptor.send_schemas;
+      const value = await this.caller.call({
+        method: "Profiler.isPaused",
+        args: {},
+        descriptor,
+        sendSchemas,
+      });
+      return value as boolean;
+  }
+
 }
 
 /**
@@ -498,6 +546,8 @@ export interface ProfilerHandler {
   subscribeTimeline(tid: number | null, output: Tx<TimelineUpdate>): Promise<void> | void;
   subscribeNeighbors(address: bigint, params: ViewParams, output: Tx<NeighborsUpdate>): Promise<void> | void;
   subscribeWakers(wakeeTid: number, output: Tx<WakersUpdate>): Promise<void> | void;
+  setPaused(paused: boolean): Promise<void> | void;
+  isPaused(): Promise<boolean> | boolean;
 }
 
 // Dispatcher for Profiler
@@ -583,6 +633,20 @@ export class ProfilerDispatcher implements Dispatcher {
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
       }
+    } else if (method.id === 0x0ffcbbadd058c8f7n) {
+      try {
+        const result = await this.handler.setPaused(args[0] as boolean);
+        call.reply(result);
+      } catch (error) {
+        call.replyInternalError(error instanceof Error ? error.message : String(error));
+      }
+    } else if (method.id === 0xfbcae644722d364en) {
+      try {
+        const result = await this.handler.isPaused();
+        call.reply(result);
+      } catch (error) {
+        call.replyInternalError(error instanceof Error ? error.message : String(error));
+      }
     }
   }
 }
@@ -637,6 +701,8 @@ export const profiler_send_schemas: import("@bearcove/vox-core").ServiceSendSche
     [0xc3381210c17fc3c4n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x54a3a213b0250c32n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x42acdf6aa85cc2d3n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6353fa11ad0f6f57n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x46763dea0f7d31fen, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xc6ab2f2a4444e87cn, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x5ce6ea672e206d3en, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x0ffcbbadd058c8f7n, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xfbcae644722d364en, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
   ]),
 };
 
@@ -694,6 +760,18 @@ export const profiler_subscribeWakers_method: MethodDescriptor = {
   retry: { persist: false, idem: false },
 };
 
+export const profiler_setPaused_method: MethodDescriptor = {
+  name: 'setPaused',
+  id: 0x0ffcbbadd058c8f7n,
+  retry: { persist: false, idem: false },
+};
+
+export const profiler_isPaused_method: MethodDescriptor = {
+  name: 'isPaused',
+  id: 0xfbcae644722d364en,
+  retry: { persist: false, idem: false },
+};
+
 // Service descriptor for runtime dispatch metadata
 export const profiler_descriptor: ServiceDescriptor = {
   service_name: 'Profiler',
@@ -708,6 +786,8 @@ export const profiler_descriptor: ServiceDescriptor = {
     [profiler_subscribeTimeline_method.id, profiler_subscribeTimeline_method],
     [profiler_subscribeNeighbors_method.id, profiler_subscribeNeighbors_method],
     [profiler_subscribeWakers_method.id, profiler_subscribeWakers_method],
+    [profiler_setPaused_method.id, profiler_setPaused_method],
+    [profiler_isPaused_method.id, profiler_isPaused_method],
   ]),
 };
 
