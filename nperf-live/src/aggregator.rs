@@ -16,6 +16,17 @@ pub struct Aggregator {
     /// Total-count: any time an address appears anywhere in the stack.
     total_counts: HashMap<u64, u64>,
     total_samples: u64,
+    /// Call tree built from full stacks. Walked root-first so children
+    /// represent callees of their parent. The root itself is never
+    /// incremented; total_samples is the sum of root.children.count.
+    pub(crate) flame_root: StackNode,
+}
+
+/// One node in the call tree. Children keyed by callee address.
+#[derive(Default)]
+pub(crate) struct StackNode {
+    pub(crate) count: u64,
+    pub(crate) children: HashMap<u64, StackNode>,
 }
 
 impl Aggregator {
@@ -40,6 +51,14 @@ impl Aggregator {
             if seen.insert(addr) {
                 *self.total_counts.entry(addr).or_insert(0) += 1;
             }
+        }
+
+        // Build the call tree. user_addrs is leaf-first, so iterate
+        // reversed to walk root → leaf.
+        let mut node = &mut self.flame_root;
+        for &addr in user_addrs.iter().rev() {
+            node = node.children.entry(addr).or_default();
+            node.count += 1;
         }
     }
 

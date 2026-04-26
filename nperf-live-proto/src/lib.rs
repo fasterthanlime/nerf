@@ -43,6 +43,25 @@ pub enum TopSort {
     ByTotal = 1,
 }
 
+/// One node in the call-tree flamegraph. Address 0 is reserved for the
+/// synthetic root that aggregates all stacks. Children sum to (or are
+/// less than, after pruning) the parent's `count`.
+#[derive(Clone, Debug, Facet)]
+pub struct FlameNode {
+    pub address: u64,
+    pub count: u64,
+    pub function_name: Option<String>,
+    pub binary: Option<String>,
+    pub is_main: bool,
+    pub children: Vec<FlameNode>,
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct FlamegraphUpdate {
+    pub total_samples: u64,
+    pub root: FlameNode,
+}
+
 /// Source-line header attached to the first instruction generated from
 /// a given (file, line) pair. The frontend renders one of these as a
 /// banner row above the asm row whenever the source location changes
@@ -99,6 +118,11 @@ pub trait Profiler {
     /// Sample counts update live; the disassembly itself only changes if
     /// the binary is unloaded/reloaded.
     async fn subscribe_annotated(&self, address: u64, output: vox::Tx<AnnotatedView>);
+
+    /// Stream periodic flamegraph snapshots. Nodes whose `count` is
+    /// below ~0.5% of `total_samples` are pruned to bound the wire
+    /// size; children are sorted hot-first (largest count leftmost).
+    async fn subscribe_flamegraph(&self, output: vox::Tx<FlamegraphUpdate>);
 }
 
 /// All service descriptors exposed by nperf-live; the codegen iterates over

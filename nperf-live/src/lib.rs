@@ -15,7 +15,8 @@ use nperf_core::live_sink::{
     BinaryLoadedEvent, BinaryUnloadedEvent, LiveSink, SampleEvent, TargetAttached,
 };
 use nperf_live_proto::{
-    AnnotatedLine, AnnotatedView, Profiler, ProfilerDispatcher, TopEntry, TopSort, TopUpdate,
+    AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, Profiler, ProfilerDispatcher,
+    TopEntry, TopSort, TopUpdate,
 };
 
 mod aggregator;
@@ -144,6 +145,21 @@ impl Profiler for LiveServer {
             }
         }
     }
+
+    async fn subscribe_flamegraph(&self, output: vox::Tx<FlamegraphUpdate>) {
+        let aggregator = self.aggregator.clone();
+        let binaries = self.binaries.clone();
+        // Slower cadence than top-N — the tree is much heavier to
+        // build and to push over the wire.
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            let update = build_flame_update(&aggregator, &binaries);
+            if output.send(update).await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 fn build_top_entries(
@@ -236,6 +252,68 @@ fn build_top_entries(
     });
     out.truncate(limit);
     out
+}
+
+fn build_flame_update(
+    aggregator: &Arc<RwLock<Aggregator>>,
+    binaries: &Arc<RwLock<BinaryRegistry>>,
+) -> FlamegraphUpdate {
+    let agg = aggregator.read();
+    let bins = binaries.read();
+    let total = agg.total_samples();
+    // Drop nodes that account for less than 0.5% of total samples.
+    // Keeps the wire size bounded as the tree grows.
+    let threshold = (total / 200).max(1);
+
+    let mut children: Vec<FlameNode> = agg
+        .flame_root
+        .children
+        .iter()
+        .filter(|(_, c)| c.count >= threshold)
+        .map(|(a, c)| flame_node_to_proto(*a, c, threshold, &bins))
+        .collect();
+    children.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let root = FlameNode {
+        address: 0,
+        count: total,
+        function_name: Some("(all)".into()),
+        binary: None,
+        is_main: false,
+        children,
+    };
+    FlamegraphUpdate {
+        total_samples: total,
+        root,
+    }
+}
+
+fn flame_node_to_proto(
+    address: u64,
+    node: &aggregator::StackNode,
+    threshold: u64,
+    binaries: &BinaryRegistry,
+) -> FlameNode {
+    let resolved = binaries.lookup_symbol(address);
+    let (function_name, binary, is_main) = match resolved {
+        Some(r) => (Some(r.function_name), Some(r.binary), r.is_main),
+        None => (None, None, false),
+    };
+    let mut children: Vec<FlameNode> = node
+        .children
+        .iter()
+        .filter(|(_, c)| c.count >= threshold)
+        .map(|(a, c)| flame_node_to_proto(*a, c, threshold, binaries))
+        .collect();
+    children.sort_by(|a, b| b.count.cmp(&a.count));
+    FlameNode {
+        address,
+        count: node.count,
+        function_name,
+        binary,
+        is_main,
+        children,
+    }
 }
 
 fn build_annotated_view(

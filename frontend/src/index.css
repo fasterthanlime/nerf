@@ -111,6 +111,78 @@ body {
 
 /* ---------- split panes ---------- */
 
+.flame-pane {
+  flex: 0 0 auto;
+  border-bottom: 1px solid #232629;
+  background: #0a0b0d;
+  overflow: hidden;
+}
+
+.flame-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.flame {
+  position: relative;
+  width: 100%;
+  background: #0a0b0d;
+  overflow: auto;
+  max-height: 30vh;
+}
+
+.flame.placeholder {
+  padding: 1rem;
+  color: #6c7480;
+  font-size: 12px;
+}
+
+.flame-box {
+  position: absolute;
+  height: 17px;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border: 1px solid #0a0b0d;
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: filter 80ms;
+}
+
+.flame-box:hover {
+  filter: brightness(1.25);
+  z-index: 2;
+}
+
+.flame-status {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #c8d3e0;
+  background: #0e0f12;
+  border-top: 1px solid #1a1c1f;
+  display: flex;
+  gap: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.flame-status-label {
+  color: #d3b75f;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.flame-status-meta {
+  color: #6c7480;
+}
+
 .split {
   flex: 1 1 auto;
   min-height: 0; /* let children shrink so overflow works */

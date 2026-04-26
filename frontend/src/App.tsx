@@ -17,6 +17,7 @@ import {
   type TopSort,
   type TopUpdate,
 } from "./generated/profiler.generated.ts";
+import { Flamegraph } from "./Flamegraph.tsx";
 
 type Status = "pending" | "ok" | "err";
 
@@ -131,6 +132,11 @@ export function App() {
           </span>
         </div>
       </header>
+      {client && (
+        <section className="flame-pane">
+          <Flamegraph client={client} onSelectAddress={setSelected} />
+        </section>
+      )}
       <main className="split">
         <section
           className={`pane top-pane${frozen ? " frozen" : ""}`}
