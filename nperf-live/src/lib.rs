@@ -480,15 +480,25 @@ fn group_top_entries(
             is_main: g.is_main,
         })
         .collect();
-    out.sort_by(|a, b| match sort {
-        TopSort::BySelf => b
-            .self_count
-            .cmp(&a.self_count)
-            .then_with(|| b.total_count.cmp(&a.total_count)),
-        TopSort::ByTotal => b
-            .total_count
-            .cmp(&a.total_count)
-            .then_with(|| b.self_count.cmp(&a.self_count)),
+    // Tie-break on function_name → binary → address so the row order
+    // is stable across snapshots; otherwise rows with equal counts
+    // shuffle every tick as the underlying HashMap iterates them in
+    // a different order.
+    out.sort_by(|a, b| {
+        let primary = match sort {
+            TopSort::BySelf => b
+                .self_count
+                .cmp(&a.self_count)
+                .then_with(|| b.total_count.cmp(&a.total_count)),
+            TopSort::ByTotal => b
+                .total_count
+                .cmp(&a.total_count)
+                .then_with(|| b.self_count.cmp(&a.self_count)),
+        };
+        primary
+            .then_with(|| a.function_name.cmp(&b.function_name))
+            .then_with(|| a.binary.cmp(&b.binary))
+            .then_with(|| a.address.cmp(&b.address))
     });
     out.truncate(limit);
     out
