@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { channel } from "@bearcove/vox-core";
 import {
+  LuStar,
+  LuPackage,
+  LuCircleHelp,
+  LuBinary,
+  LuSettings,
+  LuPause,
+} from "react-icons/lu";
+import { SiRust, SiC, SiCplusplus } from "react-icons/si";
+import {
   connectProfiler,
   type AnnotatedView,
   type ProfilerClient,
@@ -95,7 +104,16 @@ export function App() {
       <header className="topbar">
         <h1>nperf live</h1>
         <div className="connection">
-          <span className={`dot ${status}`} />
+          <span className="status-slot">
+            {frozen ? (
+              <LuPause
+                className="status-paused"
+                title="updates paused (hover the list to release)"
+              />
+            ) : (
+              <span className={`dot ${status}`} />
+            )}
+          </span>
           <input
             value={url}
             onChange={(e) => setUrl(e.target.value)}
@@ -119,9 +137,9 @@ export function App() {
           onMouseEnter={() => setFrozen(true)}
           onMouseLeave={() => setFrozen(false)}
         >
-          {frozen && <div className="frozen-badge">paused (hover)</div>}
           <TopTable
             entries={displayed?.entries ?? []}
+            totalSamples={displayed?.total_samples ?? 0n}
             selected={selected}
             onSelect={setSelected}
             sort={sort}
@@ -140,14 +158,80 @@ export function App() {
   );
 }
 
+type LangKind = "rust" | "c" | "cpp" | "asm" | "unknown";
+type ObjKind = "main" | "system" | "dylib" | "unknown";
+
+function langOf(fn: string | null | undefined): LangKind {
+  if (!fn) return "unknown";
+  if (fn.startsWith("0x")) return "asm";
+  if (fn.includes("::")) return "rust";
+  // C++ template in symbol name (e.g. `std::__1::vector<…>`) is caught
+  // above by `::`. What remains and contains <> is rare but mostly C++.
+  if (fn.includes("<") && fn.includes(">")) return "cpp";
+  return "c";
+}
+
+function objOf(e: TopEntry): ObjKind {
+  if (e.is_main) return "main";
+  const b = e.binary ?? "";
+  if (!b) return "unknown";
+  if (
+    b.startsWith("libsystem_") ||
+    b.startsWith("libobjc") ||
+    b.startsWith("dyld") ||
+    b.startsWith("libdyld") ||
+    b.startsWith("libc++")
+  ) {
+    return "system";
+  }
+  return "dylib";
+}
+
+function langIcon(lang: LangKind) {
+  switch (lang) {
+    case "rust":
+      return <SiRust title="Rust" />;
+    case "c":
+      return <SiC title="C" />;
+    case "cpp":
+      return <SiCplusplus title="C++" />;
+    case "asm":
+      return <LuBinary title="machine code" />;
+    case "unknown":
+      return <LuCircleHelp title="unknown" />;
+  }
+}
+
+function barPct(count: bigint, total: bigint): string {
+  if (total === 0n) return "0%";
+  // 4 decimals of precision via integer math, then format.
+  const ratio = Number((count * 10000n) / total) / 100;
+  return `${Math.min(100, ratio)}%`;
+}
+
+function objIcon(obj: ObjKind) {
+  switch (obj) {
+    case "main":
+      return <LuStar title="main executable" />;
+    case "system":
+      return <LuSettings title="system library" />;
+    case "dylib":
+      return <LuPackage title="dynamic library" />;
+    case "unknown":
+      return <LuCircleHelp title="unmapped (JIT or kernel)" />;
+  }
+}
+
 function TopTable({
   entries,
+  totalSamples,
   selected,
   onSelect,
   sort,
   onSort,
 }: {
   entries: TopEntry[];
+  totalSamples: bigint;
   selected: bigint | null;
   onSelect: (a: bigint) => void;
   sort: SortKey;
@@ -157,42 +241,80 @@ function TopTable({
     <table className="top-table">
       <thead>
         <tr>
-          <th>function</th>
-          <th>binary</th>
-          <th
-            className={`num-h sortable${sort === "self" ? " active" : ""}`}
-            onClick={() => onSort("self")}
-          >
-            self{sort === "self" ? " ↓" : ""}
-          </th>
-          <th
-            className={`num-h sortable${sort === "total" ? " active" : ""}`}
-            onClick={() => onSort("total")}
-          >
-            total{sort === "total" ? " ↓" : ""}
+          <th>function · binary</th>
+          <th className="num-h">
+            <span
+              className={`sortable${sort === "self" ? " active" : ""}`}
+              onClick={() => onSort("self")}
+            >
+              self{sort === "self" ? " ↓" : ""}
+            </span>
+            <span className="sep"> / </span>
+            <span
+              className={`sortable${sort === "total" ? " active" : ""}`}
+              onClick={() => onSort("total")}
+            >
+              total{sort === "total" ? " ↓" : ""}
+            </span>
           </th>
         </tr>
       </thead>
       <tbody>
-        {entries.map((e) => (
-          <tr
-            key={String(e.address)}
-            className={
-              (selected === e.address ? "selected " : "") +
-              (e.is_main ? "main" : "")
-            }
-            onClick={() => onSelect(e.address)}
-          >
-            <td className="fn">
-              {e.function_name ?? (
-                <span className="addr">0x{e.address.toString(16)}</span>
-              )}
-            </td>
-            <td className="bin">{e.binary ?? ""}</td>
-            <td className="num">{e.self_count.toString()}</td>
-            <td className="num">{e.total_count.toString()}</td>
-          </tr>
-        ))}
+        {entries.map((e) => {
+          const lang = langOf(e.function_name);
+          const obj = objOf(e);
+          const fnLabel = e.function_name ?? `0x${e.address.toString(16)}`;
+          const binLabel = e.binary ?? "(no binary)";
+          return (
+            <tr
+              key={String(e.address)}
+              className={
+                (selected === e.address ? "selected " : "") +
+                (e.is_main ? "main" : "")
+              }
+              onClick={() => onSelect(e.address)}
+            >
+              <td className="entry">
+                <div className="entry-line fn-line">
+                  <span className={`glyph lang-${lang}`}>
+                    {langIcon(lang)}
+                  </span>
+                  <span className="fn-name">{fnLabel}</span>
+                </div>
+                <div className="entry-line bin-line">
+                  <span className={`glyph obj-${obj}`}>{objIcon(obj)}</span>
+                  <span className="bin-name">{binLabel}</span>
+                </div>
+              </td>
+              <td className="num">
+                <div className="num-line">
+                  {e.self_count === e.total_count ? (
+                    e.self_count.toString()
+                  ) : (
+                    <>
+                      {e.self_count.toString()}
+                      <span className="num-sep"> / </span>
+                      <span className="num-total">
+                        {e.total_count.toString()}
+                      </span>
+                    </>
+                  )}
+                </div>
+                <div className="num-bar">
+                  <div
+                    className="num-bar-fill"
+                    style={{
+                      width: barPct(
+                        sort === "self" ? e.self_count : e.total_count,
+                        totalSamples,
+                      ),
+                    }}
+                  />
+                </div>
+              </td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   );

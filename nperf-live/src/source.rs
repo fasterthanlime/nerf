@@ -382,12 +382,58 @@ impl SourceResolver {
         if let Some(entry) = self.sources.get(file) {
             return entry.clone();
         }
-        let loaded = std::fs::read_to_string(file)
-            .ok()
+        let loaded = read_source(file)
             .map(|s| Arc::new(s.lines().map(str::to_owned).collect()));
         self.sources.insert(file.to_owned(), loaded.clone());
         loaded
     }
+}
+
+/// Read a source file, with rust-src remapping. The rustc compiler stamps
+/// std/core/alloc paths into DWARF as `/rustc/<commit>/library/...` —
+/// those don't exist on the user's box, but the rust-src component does
+/// (under `<sysroot>/lib/rustlib/src/rust/library/...`), so we try that
+/// translation as a fallback.
+fn read_source(file: &str) -> Option<String> {
+    if let Ok(s) = std::fs::read_to_string(file) {
+        return Some(s);
+    }
+    if let Some(rs_path) = rust_src_translate(file) {
+        if let Ok(s) = std::fs::read_to_string(&rs_path) {
+            tracing::debug!(
+                "source: {} translated to rust-src path {}",
+                file,
+                rs_path.display()
+            );
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn rust_src_translate(file: &str) -> Option<std::path::PathBuf> {
+    let rest = file.strip_prefix("/rustc/")?;
+    // rest = "<commit>/library/std/src/sys/unix.rs"
+    let (_commit, rel) = rest.split_once('/')?;
+    let sysroot = rust_sysroot()?;
+    Some(sysroot.join("lib/rustlib/src/rust").join(rel))
+}
+
+fn rust_sysroot() -> Option<&'static std::path::Path> {
+    use std::sync::OnceLock;
+    static SYSROOT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    SYSROOT
+        .get_or_init(|| {
+            std::process::Command::new("rustc")
+                .arg("--print")
+                .arg("sysroot")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| std::path::PathBuf::from(s.trim()))
+        })
+        .as_deref()
 }
 
 impl Default for SourceResolver {
