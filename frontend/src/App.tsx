@@ -1039,6 +1039,15 @@ function TopTable({
   onContextMenu: (t: ContextMenuTarget) => void;
 }) {
   const visible = entries.filter((e) => !hiddenKinds.has(objKindOf(e)));
+  // Scale every row's progress bar against the busiest visible row,
+  // not the recording's grand total. With 1M+ samples spread across
+  // hundreds of symbols, the grand-total denominator made every bar
+  // a hairline -- now the leader fills the bar and the rest are
+  // proportional to it (the "Activity Monitor" model).
+  const barDenom = visible.reduce((m, e) => {
+    const v = sort === "self" ? e.self_count : e.total_count;
+    return v > m ? v : m;
+  }, 1n);
   return (
     <table className="top-table">
       <thead>
@@ -1120,12 +1129,12 @@ function TopTable({
                     style={{
                       width: barPct(
                         sort === "self" ? e.self_count : e.total_count,
-                        totalSamples,
+                        barDenom,
                       ),
                     }}
                   />
                 </div>
-                {pmuLabel(e, pmuMetric)}
+                <div className="num-ipc-slot">{pmuLabel(e, pmuMetric)}</div>
               </td>
             </tr>
           );

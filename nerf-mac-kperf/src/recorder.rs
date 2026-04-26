@@ -180,7 +180,7 @@ fn scan_thread_names<S: SampleSink>(
         // Truncating to u32: nerf's archive format keeps tids as u32
         // and macOS thread ids practically never overflow that.
         let tid = tid64 as u32;
-        match libproc::thread_name(tid64) {
+        match libproc::thread_name(pid, tid64) {
             Ok(Some(name)) => {
                 named += 1;
                 if cache.note_thread(tid, &name) {

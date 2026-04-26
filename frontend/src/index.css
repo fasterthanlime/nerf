@@ -856,7 +856,12 @@ table.top-table tr.match {
   width: 100%;
   background: var(--bg-pane);
   overflow: auto;
-  max-height: 30vh;
+  /* Fixed height so the flame graph doesn't pop when stacks shrink
+     (e.g. on the on-cpu / off-cpu pivot). Tall enough for ~16
+     frames at 17px each plus the focus row. Use `height` rather
+     than `max-height` so empty rows below the deepest stack
+     stay visible as background instead of collapsing the pane. */
+  height: 30vh;
 }
 
 .flame.placeholder {
@@ -1072,17 +1077,25 @@ table.top-table td.num .num-bar {
 table.top-table td.num .num-bar-fill {
   height: 100%;
   background: var(--accent);
-  border-radius: 2px;
+  border-radius: 1px;
   transition: width 250ms linear;
 }
 
-table.top-table td.num .num-ipc {
+/* The IPC / cache-miss / branch-mispred annotation. Always
+   reserves a slot so rows stay the same height whether the kperf
+   backend reported PMU values for this symbol or not. */
+table.top-table td.num .num-ipc-slot {
   margin-top: 3px;
+  height: 13px;
+  line-height: 13px;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.02em;
   text-transform: uppercase;
-  /* color is set inline (red->green hue ramp by IPC) */
+}
+
+table.top-table td.num .num-ipc {
+  /* color is set inline (red->green hue ramp). */
 }
 
 td.entry {

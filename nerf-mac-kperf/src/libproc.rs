@@ -264,14 +264,16 @@ pub fn list_thread_ids(pid: u32) -> std::io::Result<Vec<u64>> {
     }
 }
 
-/// Look up the name of a single thread via its system-wide tid.
-pub fn thread_name(tid: u64) -> std::io::Result<Option<String>> {
-    // `proc_pidinfo(PROC_PIDTHREADINFO)` takes the tid via `arg` and
-    // ignores `pid` for the lookup; passing 0 works.
+/// Look up the name of one thread inside `pid`. The kernel needs
+/// the owning process to find the thread struct, so passing 0
+/// (which I had as a comment claim) actually returns ESRCH and was
+/// silently failing every lookup -- that's the bug behind the
+/// "thread switcher only shows [tid]" symptom.
+pub fn thread_name(pid: u32, tid: u64) -> std::io::Result<Option<String>> {
     let mut info: ProcThreadInfoC = unsafe { std::mem::zeroed() };
     let n = unsafe {
         proc_pidinfo(
-            0,
+            pid as c_int,
             PROC_PIDTHREADINFO,
             tid,
             &mut info as *mut _ as *mut c_void,
