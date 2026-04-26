@@ -63,6 +63,34 @@
   --border-mid: #2a2e34;
   --text-error: #d35f5f;
   --shadow-popover: 0 4px 12px #00000088;
+  --row-divider: var(--row-divider);
+  --row-divider-faint: var(--row-divider-faint);
+  --row-selected: var(--row-selected);
+  --src-header-bg: var(--src-header-bg);
+  --accent-bg-soft: rgba(211, 183, 95, 0.08);
+  --accent-bg-medium: rgba(211, 183, 95, 0.18);
+  --accent-bg-active: rgba(211, 183, 95, 0.1);
+  --accent-border-medium: rgba(211, 183, 95, 0.7);
+
+  /* Per-kind palette: text/glyph color + flame-box bg/fg. */
+  --kind-main-color: #98c379;
+  --kind-main-bg: #7fa86a;
+  --kind-main-fg: #0e1a07;
+  --kind-dylib-color: #61afef;
+  --kind-dylib-bg: #9b8453;
+  --kind-dylib-fg: #1a1208;
+  --kind-system-color: #8a909a;
+  --kind-system-bg: #5e7a93;
+  --kind-system-fg: #06121f;
+  --kind-unknown-color: #8a909a;
+  --kind-unknown-bg: #5a6066;
+  --kind-unknown-fg: #0e0f12;
+
+  /* Lang-glyph palette (small icons). */
+  --lang-rust: #ce9178;
+  --lang-c: #61afef;
+  --lang-cpp: #c678dd;
+  --lang-asm: #8a909a;
 
   font-family: var(--font-ui);
   color-scheme: dark;
@@ -90,6 +118,32 @@
   --border-mid: #c2c8cf;
   --text-error: #a83030;
   --shadow-popover: 0 4px 12px #1a1d2122;
+  --row-divider: #e8eaee;
+  --row-divider-faint: #eef0f3;
+  --row-selected: #dde2e8;
+  --src-header-bg: #e3eaf2;
+  --accent-bg-soft: rgba(184, 143, 30, 0.1);
+  --accent-bg-medium: rgba(184, 143, 30, 0.22);
+  --accent-bg-active: rgba(184, 143, 30, 0.14);
+  --accent-border-medium: rgba(184, 143, 30, 0.65);
+
+  --kind-main-color: #3a8a3a;
+  --kind-main-bg: #97c87f;
+  --kind-main-fg: #0a1a04;
+  --kind-dylib-color: #2f6fb8;
+  --kind-dylib-bg: #c79a5e;
+  --kind-dylib-fg: #1a1208;
+  --kind-system-color: #5a626c;
+  --kind-system-bg: #7d9bb6;
+  --kind-system-fg: #06121f;
+  --kind-unknown-color: #7a828c;
+  --kind-unknown-bg: #aab0b8;
+  --kind-unknown-fg: #15171b;
+
+  --lang-rust: #b56236;
+  --lang-c: #2f6fb8;
+  --lang-cpp: #8a3aa8;
+  --lang-asm: #5a626c;
 
   color-scheme: light;
 }
@@ -380,12 +434,12 @@ button.regex-toggle {
 }
 
 button.regex-toggle:hover {
-  color: #c8d3e0;
+  color: var(--text-secondary);
 }
 
 button.regex-toggle.active {
   color: var(--accent);
-  background: rgba(211, 183, 95, 0.1);
+  background: var(--accent-bg-active);
 }
 
 .kind-filter {
@@ -416,20 +470,20 @@ button.regex-toggle.active {
 
 /* Active-pill colors mirror the inline icon palette. */
 .kind-pill.kind-main {
-  color: #98c379;
-  border-color: #98c37944;
+  color: var(--kind-main-color);
+  border-color: color-mix(in srgb, var(--kind-main-color) 35%, transparent);
 }
 .kind-pill.kind-dylib {
-  color: #61afef;
-  border-color: #61afef44;
+  color: var(--kind-dylib-color);
+  border-color: color-mix(in srgb, var(--kind-dylib-color) 35%, transparent);
 }
 .kind-pill.kind-system {
-  color: #8a909a;
-  border-color: #8a909a44;
+  color: var(--kind-system-color);
+  border-color: color-mix(in srgb, var(--kind-system-color) 35%, transparent);
 }
 .kind-pill.kind-unknown {
-  color: var(--text-muted);
-  border-color: var(--text-muted)44;
+  color: var(--kind-unknown-color);
+  border-color: color-mix(in srgb, var(--kind-unknown-color) 35%, transparent);
 }
 
 /* Search match highlight. Subtle gold border + bg tint, both in the
@@ -439,7 +493,7 @@ table.top-table tr.match td {
 }
 
 table.top-table tr.match {
-  background: rgba(211, 183, 95, 0.08);
+  background: var(--accent-bg-soft);
 }
 
 .flame-box.match {
@@ -451,7 +505,7 @@ table.top-table tr.match {
 .flame-reset {
   background: var(--bg-button);
   color: var(--accent);
-  border: 1px solid var(--accent)55;
+  border: 1px solid color-mix(in srgb, var(--accent) 33%, transparent);
   border-radius: 3px;
   padding: 2px 8px;
   font: inherit;
@@ -522,7 +576,7 @@ table.top-table tr.match {
   display: inline-block;
 }
 .dot.ok {
-  background: #5fd35f;
+  background: var(--kind-main-color);
 }
 .dot.err {
   background: var(--text-error);
@@ -571,7 +625,7 @@ table.top-table tr.match {
 .timeline-bar {
   flex: 1 1 0;
   min-width: 1px;
-  background: #5e7a93;
+  background: var(--kind-system-bg);
   min-height: 1px;
   border-radius: 1px 1px 0 0;
 }
@@ -584,9 +638,9 @@ table.top-table tr.match {
   position: absolute;
   top: 0;
   bottom: 0;
-  background: rgba(211, 183, 95, 0.18);
-  border-left: 1px solid rgba(211, 183, 95, 0.7);
-  border-right: 1px solid rgba(211, 183, 95, 0.7);
+  background: var(--accent-bg-medium);
+  border-left: 1px solid var(--accent-border-medium);
+  border-right: 1px solid var(--accent-border-medium);
   pointer-events: none;
 }
 
@@ -722,8 +776,25 @@ table.top-table tr.match {
 }
 
 .flame-box:hover {
-  filter: brightness(1.25);
+  filter: brightness(1.15);
   z-index: 2;
+}
+
+.flame-box.kind-main {
+  background: var(--kind-main-bg);
+  color: var(--kind-main-fg);
+}
+.flame-box.kind-dylib {
+  background: var(--kind-dylib-bg);
+  color: var(--kind-dylib-fg);
+}
+.flame-box.kind-system {
+  background: var(--kind-system-bg);
+  color: var(--kind-system-fg);
+}
+.flame-box.kind-unknown {
+  background: var(--kind-unknown-bg);
+  color: var(--kind-unknown-fg);
 }
 
 .flame-status {
@@ -731,9 +802,9 @@ table.top-table tr.match {
   padding: 4px 12px;
   font-size: 11px;
   font-family: var(--font-mono);
-  color: #c8d3e0;
+  color: var(--text-secondary);
   background: var(--bg-base);
-  border-top: 1px solid #1a1c1f;
+  border-top: 1px solid var(--row-divider);
   display: flex;
   gap: 12px;
   white-space: nowrap;
@@ -774,7 +845,7 @@ table.top-table tr.match {
 }
 
 .pane.frozen {
-  outline: 1px solid var(--accent)33;
+  outline: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
   outline-offset: -1px;
 }
 
@@ -845,7 +916,7 @@ table.top-table th .sortable.active {
 
 table.top-table th .sep,
 table.top-table td .num-sep {
-  color: #4a4f55;
+  color: var(--border-strong);
 }
 
 table.top-table td .num-total {
@@ -854,7 +925,7 @@ table.top-table td .num-total {
 
 table.top-table td {
   padding: 4px 10px;
-  border-bottom: 1px solid #1a1c1f;
+  border-bottom: 1px solid var(--row-divider);
 }
 
 table.top-table tr {
@@ -862,7 +933,7 @@ table.top-table tr {
 }
 
 table.top-table tr.selected {
-  background: #1f2329;
+  background: var(--row-selected);
 }
 
 table.top-table tr:hover:not(.selected) {
@@ -885,7 +956,7 @@ table.top-table td.num .num-line {
 
 table.top-table td.num .num-bar {
   height: 3px;
-  background: #1a1c1f;
+  background: var(--row-divider);
   border-radius: 2px;
   margin-top: 4px;
   overflow: hidden;
@@ -947,21 +1018,22 @@ td.entry {
 }
 
 /* Language icon colors (currentColor in the SVGs picks these up). */
-.glyph.lang-rust { color: #ce9178; }
-.glyph.lang-c { color: #61afef; }
-.glyph.lang-cpp { color: #c678dd; }
-.glyph.lang-asm { color: #8a909a; }
+.glyph.lang-rust { color: var(--lang-rust); }
+.glyph.lang-c { color: var(--lang-c); }
+.glyph.lang-cpp { color: var(--lang-cpp); }
+.glyph.lang-asm { color: var(--lang-asm); }
 .glyph.lang-unknown { color: var(--text-muted); }
 
-.glyph.obj-main { color: #98c379; }
-.glyph.obj-system { color: #8a909a; }
-.glyph.obj-dylib { color: #61afef; }
-.glyph.obj-unknown { color: var(--text-muted); }
+.glyph.obj-main { color: var(--kind-main-color); }
+.glyph.obj-system { color: var(--kind-system-color); }
+.glyph.obj-dylib { color: var(--kind-dylib-color); }
+.glyph.obj-unknown { color: var(--kind-unknown-color); }
 
-/* Main-executable rows get a slightly brighter function name, but the
-   binary line keeps its muted color for readability. */
+/* Main-executable rows get a brighter function name; the binary line
+   keeps its muted color for readability. The mix gives a tinted text
+   that works on either theme. */
 table.top-table tr.main .fn-line .fn-name {
-  color: #c8e8b3;
+  color: color-mix(in srgb, var(--kind-main-color) 70%, var(--text-primary));
 }
 
 /* ---------- annotation pane ---------- */
@@ -1150,7 +1222,7 @@ table.asm {
 
 table.asm td {
   padding: 1px 8px;
-  border-bottom: 1px solid #14161a;
+  border-bottom: 1px solid var(--row-divider-faint);
 }
 
 table.asm td.num {
@@ -1173,7 +1245,7 @@ table.asm td.asm-line {
 /* Source-line banner — saturated background block, same font size as
    asm (the visual cue is the bg + accent stripe, not the typography). */
 table.asm tr.src-header {
-  background: #1d2632;
+  background: var(--src-header-bg);
 }
 
 table.asm tr.src-header td {

@@ -23,21 +23,11 @@ type Box = {
   node: FlameNode;
 };
 
-type Color = { bg: string; fg: string };
-
-/// Pick a color for a box based on `is_main` + binary kind.
-function colorFor(node: FlameNode): Color {
-  if (node.is_main) return { bg: "#7fa86a", fg: "#0e1a07" };
-  const b = node.binary ?? "";
-  if (!b) return { bg: "#5a6066", fg: "#0e0f12" };
-  if (
-    b.startsWith("libsystem_") ||
-    b.startsWith("libobjc") ||
-    b.startsWith("dyld")
-  ) {
-    return { bg: "#5e7a93", fg: "#06121f" };
-  }
-  return { bg: "#9b8453", fg: "#1a1208" };
+/// Class name for a flame box, picked from the node's kind. The
+/// matching `.flame-box.kind-*` rules in CSS hold the actual colors,
+/// so the boxes follow the active theme.
+function kindClassFor(node: FlameNode): string {
+  return `kind-${objKindOf(node)}`;
 }
 
 function nodeMatches(
@@ -234,19 +224,16 @@ export function Flamegraph({
         style={{ height: `${height}px` }}
       >
         {boxes.map((b) => {
-          const c = colorFor(b.node);
           const widthPct = (b.x1 - b.x0) * 100;
           const isMatch = nodeMatches(b.node, matchText);
           return (
             <div
               key={b.key}
-              className={`flame-box${isMatch ? " match" : ""}`}
+              className={`flame-box ${kindClassFor(b.node)}${isMatch ? " match" : ""}`}
               style={{
                 left: `${b.x0 * 100}%`,
                 width: `${widthPct}%`,
                 top: b.depth * ROW_H,
-                background: c.bg,
-                color: c.fg,
               }}
               onMouseEnter={() => setHover(b)}
               onClick={() => {
