@@ -19,6 +19,7 @@
 pub mod bindings;
 pub mod error;
 pub mod image_scan;
+pub mod jitdump_tail;
 pub mod kdebug;
 pub mod kernel_symbols;
 pub mod libproc;

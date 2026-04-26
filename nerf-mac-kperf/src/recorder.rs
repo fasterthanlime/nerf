@@ -9,12 +9,16 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use nerf_mac_capture::proc_maps::MachOSymbol;
 use nerf_mac_capture::recorder::ThreadNameCache;
-use nerf_mac_capture::{JitdumpEvent, SampleEvent, SampleSink, ThreadNameEvent, WakeupEvent};
+use nerf_mac_capture::{
+    BinaryLoadedEvent, JitdumpEvent, SampleEvent, SampleSink, ThreadNameEvent, WakeupEvent,
+};
 
 use crate::bindings::{self, sampler, Frameworks};
 use crate::error::Error;
 use crate::image_scan::ImageScanner;
+use crate::jitdump_tail::JitdumpTailer;
 use crate::kdebug::{self, kdbg_class, kdbg_code, kdbg_func, kdbg_subclass, KdBuf, KdRegtype, DBG_PERF};
 use crate::kernel_symbols::{KernelImage, SlideEstimator};
 use crate::libproc;
@@ -385,6 +389,11 @@ fn drain_loop<S: SampleSink>(
     let jitdump_period = Duration::from_millis(500);
     let mut next_jitdump = Instant::now() + jitdump_period;
     let mut jitdump_emitted = false;
+    /// Once the jitdump file appears we tail it incrementally and
+    /// emit a synthetic BinaryLoadedEvent per `CodeLoad` record so
+    /// JIT'd functions show up in the live UI by name. The tailer
+    /// gets re-ticked alongside the existence-check polling.
+    let mut jitdump_tailer: Option<JitdumpTailer> = None;
 
     let mut buf: Vec<KdBuf> = vec![
         KdBuf {
@@ -441,8 +450,53 @@ fn drain_loop<S: SampleSink>(
                     path: &jitdump_path,
                 });
                 jitdump_emitted = true;
+                match JitdumpTailer::open(&jitdump_path) {
+                    Ok(t) => {
+                        log::info!(
+                            "jitdump_tail: opened {} for live tailing",
+                            jitdump_path.display()
+                        );
+                        jitdump_tailer = Some(t);
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "jitdump_tail: failed to open {}: {err}",
+                            jitdump_path.display()
+                        );
+                    }
+                }
             } else {
                 next_jitdump = Instant::now() + jitdump_period;
+            }
+        }
+        if let Some(t) = jitdump_tailer.as_mut() {
+            match t.tick() {
+                Ok(records) => {
+                    for r in records {
+                        // Emit one synthetic image per JIT'd
+                        // function. base_avma == text_svma since
+                        // JIT code has no relocatable layout
+                        // (vma is already the runtime address).
+                        let path = format!("[jit] {}", r.name);
+                        let symbols = vec![MachOSymbol {
+                            start_svma: r.avma,
+                            end_svma: r.avma + r.code_size,
+                            name: r.name.into_bytes(),
+                        }];
+                        sink.on_binary_loaded(BinaryLoadedEvent {
+                            pid: opts.pid,
+                            base_avma: r.avma,
+                            vmsize: r.code_size,
+                            text_svma: r.avma,
+                            path: &path,
+                            uuid: None,
+                            arch: None,
+                            is_executable: false,
+                            symbols: &symbols,
+                        });
+                    }
+                }
+                Err(err) => log::trace!("jitdump_tail tick: {err}"),
             }
         }
 
