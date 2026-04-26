@@ -139,12 +139,7 @@ fn record_child_launch(
     live_sink: Option<Box<dyn LiveSink>>,
 ) -> Result<(), Box<dyn Error>> {
     if args.mac_backend == "kperf" {
-        return Err(
-            "--mac-backend=kperf does not support --process child-launch yet \
-             (use --pid <PID>). The preload-dylib bootstrap is samply-only \
-             today; kperf needs its own integration."
-                .into(),
-        );
+        return record_child_launch_kperf(args, program, program_args, live_sink);
     }
     let mut accepter = TaskAccepter::new()
         .map_err(|err| format!("setting up Mach IPC accepter: {:?}", err))?;
@@ -238,6 +233,63 @@ fn record_child_launch(
     // Best-effort shutdown of the child if it's still running.
     let _ = child.kill();
     let _ = child.wait();
+
+    sink.finish()?;
+    Ok(())
+}
+
+/// Child-launch path for the kperf backend. Plain `Command::spawn` —
+/// no preload dylib, no Mach IPC bootstrap. kperf samples in-kernel
+/// by PID, so we don't need the task port before exec; we acquire
+/// it inside `nerf-mac-kperf::record` via `task_for_pid` after fork.
+///
+/// Limitation: `task_for_pid` against a hardened-runtime / platform
+/// binary returns `KERN_FAILURE` regardless of entitlements, so this
+/// path won't work for those targets. Use the samply backend (which
+/// has the preload-dylib `task_self`-trampoline trick) for those.
+fn record_child_launch_kperf(
+    args: args::RecordArgs,
+    program: String,
+    program_args: Vec<String>,
+    live_sink: Option<Box<dyn LiveSink>>,
+) -> Result<(), Box<dyn Error>> {
+    use std::process::Command;
+
+    info!("Launching {}...", program);
+    let mut child = Command::new(&program)
+        .args(&program_args)
+        .spawn()
+        .map_err(|err| format!("failed to spawn {program}: {err}"))?;
+    let pid = child.id();
+    info!("Child started: PID {}", pid);
+
+    let exe_path = proc_pidpath(pid).unwrap_or_else(|_| program.clone());
+    let output_path = resolve_output_path(&args, pid, &exe_path);
+    info!("Recording PID {} -> {}", pid, output_path.display());
+    let mut sink = open_sink(&output_path, pid, &exe_path, &args)?;
+    sink.live_sink = live_sink;
+
+    let sigint = SigintHandler::new();
+    let time_limit = args.profiler_args.time_limit.map(Duration::from_secs);
+
+    let kopts = KperfRecordOptions {
+        pid,
+        frequency_hz: args.frequency,
+        duration: time_limit,
+        ..Default::default()
+    };
+
+    let should_stop = move || {
+        if sigint.was_triggered() {
+            return true;
+        }
+        matches!(child.try_wait(), Ok(Some(_)))
+    };
+
+    info!("Running... press Ctrl-C to stop.");
+    if let Err(err) = kperf_record(kopts, &mut sink, should_stop) {
+        return Err(format!("nerf-mac-kperf::record failed: {}", err).into());
+    }
 
     sink.finish()?;
     Ok(())
