@@ -32,6 +32,11 @@ pub struct LoadedImage {
     pub arch: Option<&'static str>,
     pub is_executable: bool,
     pub symbols: Vec<MachOSymbol>,
+    /// `true` for entries seeded from the dyld_shared_cache. Those
+    /// don't appear in libproc walks, so the diff-against-libproc
+    /// removal pass needs to skip them or it'd unload everything in
+    /// the cache on the first rescan.
+    pub from_cache: bool,
 }
 
 /// Walks libproc and emits BinaryLoaded/BinaryUnloaded for additions
@@ -53,6 +58,15 @@ impl ImageScanner {
         let regions = libproc::enumerate_regions(pid);
         let exec_count = regions.iter().filter(|r| r.is_executable && !r.path.is_empty()).count();
         let first_scan = self.known.is_empty();
+
+        // Seed the dyld shared cache once. libproc doesn't surface
+        // cache regions (they live in a shared submap, no vnode path
+        // resolution), so without this the entire 0x180000000+ range
+        // shows up as `(no binary)` in the live UI.
+        if first_scan {
+            self.seed_shared_cache(pid, sink);
+        }
+
         if first_scan {
             log::info!(
                 "image_scan: pid={pid} -> {} regions returned, {} vnode-backed executable",
@@ -99,9 +113,9 @@ impl ImageScanner {
 
         let to_remove: Vec<(String, u64)> = self
             .known
-            .keys()
-            .filter(|k| !current.contains(*k))
-            .cloned()
+            .iter()
+            .filter(|(k, img)| !img.from_cache && !current.contains(*k))
+            .map(|(k, _)| k.clone())
             .collect();
         for key in to_remove {
             if let Some(img) = self.known.remove(&key) {
@@ -142,6 +156,47 @@ impl ImageScanner {
             );
         }
     }
+
+    fn seed_shared_cache<S: SampleSink>(&mut self, pid: u32, sink: &mut S) {
+        let Some(cache) = self.shared_cache.as_ref() else {
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        let images = cache.enumerate_runtime_images();
+        let count = images.len();
+        let mut total_symbols = 0usize;
+        for ci in images {
+            total_symbols += ci.symbols.len();
+            let img = LoadedImage {
+                path: ci.install_name,
+                base_avma: ci.runtime_avma,
+                vmsize: ci.vmsize,
+                text_svma: ci.text_svma,
+                uuid: ci.uuid,
+                arch: host_arch(),
+                is_executable: false,
+                symbols: ci.symbols,
+                from_cache: true,
+            };
+            sink.on_binary_loaded(BinaryLoadedEvent {
+                pid,
+                base_avma: img.base_avma,
+                vmsize: img.vmsize,
+                text_svma: img.text_svma,
+                path: &img.path,
+                uuid: img.uuid,
+                arch: img.arch,
+                is_executable: img.is_executable,
+                symbols: &img.symbols,
+            });
+            self.known.insert((img.path.clone(), img.base_avma), img);
+        }
+        log::info!(
+            "shared_cache: seeded {count} images / {total_symbols} symbols in {:?}",
+            t0.elapsed()
+        );
+        let _ = pid; // currently unused; logged for symmetry with libproc path
+    }
 }
 
 /// Try the on-disk Mach-O at `path` first; fall back to the
@@ -165,6 +220,7 @@ fn build_image(
             arch: parsed.arch,
             is_executable: parsed.is_executable,
             symbols: parsed.symbols,
+            from_cache: false,
         };
     }
     if let Some(cache) = shared_cache {
@@ -179,6 +235,7 @@ fn build_image(
                 arch: host_arch(),
                 is_executable: false,
                 symbols: img.symbols,
+                from_cache: false,
             };
         }
     }
@@ -192,6 +249,7 @@ fn build_image(
         arch: None,
         is_executable: false,
         symbols: Vec::new(),
+        from_cache: false,
     }
 }
 
