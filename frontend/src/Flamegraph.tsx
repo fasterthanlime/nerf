@@ -33,12 +33,14 @@ function colorFor(node: FlameNode): Color {
   return { bg: "#9b8453", fg: "#1a1208" };
 }
 
-function nodeMatches(n: FlameNode, search: string): boolean {
-  if (!search) return false;
-  const term = search.toLowerCase();
+function nodeMatches(
+  n: FlameNode,
+  matchText: ((t: string) => boolean) | null,
+): boolean {
+  if (!matchText) return false;
   return (
-    (n.function_name?.toLowerCase().includes(term) ?? false) ||
-    (n.binary?.toLowerCase().includes(term) ?? false)
+    (n.function_name != null && matchText(n.function_name)) ||
+    (n.binary != null && matchText(n.binary))
   );
 }
 
@@ -92,13 +94,13 @@ function layout(root: FlameNode): { boxes: Box[]; depth: number } {
 export function Flamegraph({
   client,
   tid,
-  search,
+  matchText,
   onSelectAddress,
   onFrozenChange,
 }: {
   client: ProfilerClient;
   tid: number | null;
-  search: string;
+  matchText: ((t: string) => boolean) | null;
   onSelectAddress: (a: bigint) => void;
   onFrozenChange?: (frozen: boolean) => void;
 }) {
@@ -186,7 +188,7 @@ export function Flamegraph({
         {boxes.map((b) => {
           const c = colorFor(b.node);
           const widthPct = (b.x1 - b.x0) * 100;
-          const isMatch = nodeMatches(b.node, search);
+          const isMatch = nodeMatches(b.node, matchText);
           return (
             <div
               key={b.key}

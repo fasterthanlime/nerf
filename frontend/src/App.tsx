@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { channel } from "@bearcove/vox-core";
 import {
   LuStar,
@@ -45,6 +45,31 @@ export function App() {
   const [selectedTid, setSelectedTid] = useState<number | null>(null);
   const [threads, setThreads] = useState<ThreadInfo[]>([]);
   const [search, setSearch] = useState("");
+  const [regexMode, setRegexMode] = useState(false);
+
+  // Compile a matcher once per (search, regexMode) change. Returns
+  // `null` when the input is empty or regex compilation failed —
+  // consumers treat null as "nothing matches". `regexError` holds the
+  // compile error message for the UI to flag the input.
+  const { matchText, regexError } = useMemo<{
+    matchText: ((t: string) => boolean) | null;
+    regexError: string | null;
+  }>(() => {
+    if (!search) return { matchText: null, regexError: null };
+    if (regexMode) {
+      try {
+        const re = new RegExp(search, "i");
+        return { matchText: (t: string) => re.test(t), regexError: null };
+      } catch (err) {
+        return { matchText: null, regexError: String(err) };
+      }
+    }
+    const term = search.toLowerCase();
+    return {
+      matchText: (t: string) => t.toLowerCase().includes(term),
+      regexError: null,
+    };
+  }, [search, regexMode]);
   // Latest update kept in a ref so the frozen-gate logic can pull the
   // most recent snapshot when the mouse leaves without re-running the
   // subscribe effect.
@@ -167,13 +192,28 @@ export function App() {
             selectedTid={selectedTid}
             onSelect={setSelectedTid}
           />
-          <input
-            type="search"
-            className="search-input"
-            placeholder="search symbols"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
+          <span className="search-group">
+            <input
+              type="search"
+              className={`search-input${regexError ? " err" : ""}`}
+              placeholder={regexMode ? "regex" : "search symbols"}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              title={regexError ?? undefined}
+            />
+            <button
+              type="button"
+              className={`regex-toggle${regexMode ? " active" : ""}`}
+              onClick={() => setRegexMode((m) => !m)}
+              title={
+                regexMode
+                  ? "regex mode (case-insensitive); click to switch to substring"
+                  : "substring mode; click to switch to regex"
+              }
+            >
+              .*
+            </button>
+          </span>
           <span className="spacer" />
           <span className="meta">
             {displayed
@@ -187,7 +227,7 @@ export function App() {
           <Flamegraph
             client={client}
             tid={selectedTid}
-            search={search}
+            matchText={matchText}
             onSelectAddress={setSelected}
             onFrozenChange={setFlameFrozen}
           />
@@ -206,7 +246,7 @@ export function App() {
             onSelect={setSelected}
             sort={sort}
             onSort={setSort}
-            search={search}
+            matchText={matchText}
           />
         </section>
         <section className="pane ann-pane">
@@ -290,12 +330,14 @@ function objIcon(obj: ObjKind) {
   }
 }
 
-function entryMatches(e: TopEntry, search: string): boolean {
-  if (!search) return false;
-  const term = search.toLowerCase();
+function entryMatches(
+  e: TopEntry,
+  matchText: ((t: string) => boolean) | null,
+): boolean {
+  if (!matchText) return false;
   return (
-    (e.function_name?.toLowerCase().includes(term) ?? false) ||
-    (e.binary?.toLowerCase().includes(term) ?? false)
+    (e.function_name != null && matchText(e.function_name)) ||
+    (e.binary != null && matchText(e.binary))
   );
 }
 
@@ -306,7 +348,7 @@ function TopTable({
   onSelect,
   sort,
   onSort,
-  search,
+  matchText,
 }: {
   entries: TopEntry[];
   totalSamples: bigint;
@@ -314,7 +356,7 @@ function TopTable({
   onSelect: (a: bigint) => void;
   sort: SortKey;
   onSort: (s: SortKey) => void;
-  search: string;
+  matchText: ((t: string) => boolean) | null;
 }) {
   return (
     <table className="top-table">
@@ -350,7 +392,7 @@ function TopTable({
               className={
                 (selected === e.address ? "selected " : "") +
                 (e.is_main ? "main " : "") +
-                (entryMatches(e, search) ? "match" : "")
+                (entryMatches(e, matchText) ? "match" : "")
               }
               onClick={() => onSelect(e.address)}
             >

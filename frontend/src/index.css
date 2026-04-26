@@ -105,20 +105,53 @@ select.thread-switcher:hover {
   border-color: #2a2e34;
 }
 
-input.search-input {
-  background: #16181c;
-  color: #e6e8eb;
+.search-group {
+  display: inline-flex;
+  align-items: stretch;
   border: 1px solid #232629;
   border-radius: 4px;
+  background: #16181c;
+  overflow: hidden;
+}
+
+.search-group:focus-within {
+  border-color: #d3b75f;
+}
+
+input.search-input {
+  background: transparent;
+  color: #e6e8eb;
+  border: 0;
   padding: 4px 8px;
   font: inherit;
   font-size: 12px;
   width: 14em;
+  outline: none;
 }
 
-input.search-input:focus {
-  outline: none;
-  border-color: #d3b75f;
+input.search-input.err {
+  color: #d35f5f;
+}
+
+button.regex-toggle {
+  background: transparent;
+  border: 0;
+  border-left: 1px solid #232629;
+  color: #6c7480;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+}
+
+button.regex-toggle:hover {
+  color: #c8d3e0;
+}
+
+button.regex-toggle.active {
+  color: #d3b75f;
+  background: rgba(211, 183, 95, 0.1);
 }
 
 /* Search match highlight. Subtle gold border + bg tint, both in the
