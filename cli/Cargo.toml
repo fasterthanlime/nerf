@@ -6,9 +6,12 @@ edition = "2021"
 [dependencies]
 log = "0.4"
 env_logger = "0.11"
+libc = "0.2"
+eyre = "0.6"
 facet = { version = "0.46" }
 figue = { version = "2.0" }
 stax-core = { path = "..", default-features = false }
+stax-live-proto = { path = "../stax-live-proto" }
 
 [dependencies.stax-live]
 path = "../stax-live"

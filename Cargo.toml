@@ -8,6 +8,9 @@ libc = "0.2"
 log = "0.4"
 facet = { version = "0.46" }
 figue = { version = "2.0" }
+eyre = "0.6"
+stax-live-proto = { path = "stax-live-proto" }
+vox = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d", features = ["transport-local"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 stax-mac-capture = { version = "0.1", path = "stax-mac-capture" }

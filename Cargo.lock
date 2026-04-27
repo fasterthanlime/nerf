@@ -2009,11 +2009,14 @@ name = "stax"
 version = "0.1.1"
 dependencies = [
  "env_logger",
+ "eyre",
  "facet",
  "figue",
+ "libc",
  "log",
  "stax-core",
  "stax-live",
+ "stax-live-proto",
  "tokio",
 ]
 
@@ -2021,15 +2024,18 @@ dependencies = [
 name = "stax-core"
 version = "0.1.1"
 dependencies = [
+ "eyre",
  "facet",
  "figue",
  "libc",
  "log",
  "mach2",
  "nwind",
+ "stax-live-proto",
  "stax-mac-capture",
  "staxd-client",
  "tokio",
+ "vox",
 ]
 
 [[package]]
