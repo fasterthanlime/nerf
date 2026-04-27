@@ -1925,6 +1925,7 @@ dependencies = [
  "addr2line",
  "arborium",
  "eyre",
+ "log",
  "mach2 0.4.3",
  "memmap2",
  "nerf-mac-capture",

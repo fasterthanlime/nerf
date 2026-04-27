@@ -138,10 +138,9 @@ impl LiveSink for LiveSinkImpl {
         // exercised (the parser stats on the recorder side are
         // already logged independently by nperfd-client).
         if n == 1 || n.is_multiple_of(10_000) {
-            tracing::info!(
-                count = n,
-                send_ok = send_result.is_ok(),
-                "live_sink: handed off PetSample to aggregator channel",
+            log::info!(
+                "live_sink: handed off PetSample #{n} to aggregator channel (send_ok={})",
+                send_result.is_ok(),
             );
         }
     }
@@ -1676,9 +1675,8 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
                         if pet_samples_drained == 1
                             || pet_samples_drained.is_multiple_of(10_000)
                         {
-                            tracing::info!(
-                                count = pet_samples_drained,
-                                "aggregator: drained PetSample"
+                            log::info!(
+                                "aggregator: drained PetSample #{pet_samples_drained}"
                             );
                         }
                     }

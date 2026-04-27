@@ -11,6 +11,7 @@ nperf-live-proto = { path = "../nperf-live-proto" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 eyre = "0.6"
 tracing = "0.1"
+log = "0.4"
 parking_lot = "0.12"
 arborium = { version = "2.16", features = ["lang-asm", "lang-rust", "lang-c", "lang-cpp"] }
 addr2line = { version = "0.21", default-features = false, features = ["std"] }
