@@ -100,10 +100,27 @@ pub async fn drive_session<S: SampleSink>(
     };
 
     info!("nperfd-client: connecting to {url}");
-    let client: NperfdClient = vox::connect(&url).await.map_err(|e| Error::Connect {
-        url: url.clone(),
-        source: Box::new(e),
-    })?;
+    let client: NperfdClient = match vox::connect(&url).await {
+        Ok(c) => c,
+        Err(e) => {
+            // The "no such file" case dominates — the user forgot to
+            // start the daemon. Render an actionable hint instead of
+            // bare io::ErrorKind::NotFound so they know what to do.
+            let socket_missing = !std::path::Path::new(&opts.daemon_socket).exists()
+                && !opts.daemon_socket.starts_with("local://");
+            let hint = if socket_missing {
+                " (daemon socket doesn't exist — is nperfd running? \
+                 try `sudo nperf setup` to install it as a LaunchDaemon, \
+                 or `sudo nperfd --socket <path>` for a one-off)"
+            } else {
+                ""
+            };
+            return Err(Error::Connect {
+                url: format!("{url}{hint}"),
+                source: Box::new(e),
+            });
+        }
+    };
 
     let status = client
         .status()
