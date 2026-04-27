@@ -18,12 +18,16 @@ use nperf_core::live_sink::{
 #[cfg(target_os = "macos")]
 use nperf_core::live_sink::MachOByteSource;
 use nperf_live_proto::{
-    AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, LiveFilter, NeighborsUpdate,
-    Profiler, ProfilerDispatcher, ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate,
-    TopEntry, TopSort, TopUpdate, ViewParams,
+    AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, IntervalEntry, IntervalListUpdate,
+    LiveFilter, NeighborsUpdate, OffCpuReason, PetSampleEntry, PetSampleListUpdate, Profiler,
+    ProfilerDispatcher, ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate, TopEntry,
+    TopSort, TopUpdate, ViewParams,
 };
 
-use crate::aggregator::{PmcAccum, PmuSample, RawSample, RawTopEntry};
+use crate::aggregator::{
+    Aggregation, AddressStats, EventCtx, IntervalKind, OffCpuBreakdown, PmcAccum, PmuSample,
+    RawInterval, StackNode,
+};
 
 mod aggregator;
 mod binaries;
@@ -37,18 +41,27 @@ pub use binaries::{BinaryRegistry, LoadedBinary};
 
 /// What the sampler thread pushes into tokio. Owned data so we can move
 /// across the thread boundary cheaply.
+///
+/// PET stack walks come in as `PetSample` (stack identity); SCHED
+/// transitions come in as `CpuInterval` (real-time bookkeeping). The
+/// aggregator stores both raw event streams and stitches them at
+/// query time -- duration is *never* fabricated from "samples × period."
 pub(crate) enum LiveEvent {
-    Sample {
+    PetSample {
         tid: u32,
         timestamp_ns: u64,
-        /// Wall-clock time this sample accounts for.
-        duration_ns: u64,
         user_addrs: Vec<u64>,
-        is_offcpu: bool,
         cycles: u64,
         instructions: u64,
         l1d_misses: u64,
         branch_mispreds: u64,
+    },
+    CpuInterval {
+        tid: u32,
+        start_ns: u64,
+        /// 0 means "still open" (not yet closed by a SCHED transition).
+        end_ns: u64,
+        kind: CpuIntervalKind,
     },
     BinaryLoaded(binaries::LoadedBinary),
     BinaryUnloaded {
@@ -73,6 +86,18 @@ pub(crate) enum LiveEvent {
     MachOByteSource(Arc<dyn MachOByteSource>),
 }
 
+pub(crate) enum CpuIntervalKind {
+    OnCpu,
+    OffCpu {
+        /// Stack at the moment the thread blocked, leaf-first. Empty
+        /// when no PET stack had been captured for the thread before
+        /// it parked.
+        stack: Vec<u64>,
+        waker_tid: Option<u32>,
+        waker_user_stack: Option<Vec<u64>>,
+    },
+}
+
 #[derive(Clone)]
 pub struct LiveSinkImpl {
     tx: mpsc::UnboundedSender<LiveEvent>,
@@ -89,16 +114,44 @@ impl LiveSink for LiveSinkImpl {
             return;
         }
         let user_addrs: Vec<u64> = event.user_backtrace.iter().map(|f| f.address).collect();
-        let _ = self.tx.send(LiveEvent::Sample {
+        if event.is_offcpu {
+            // Transitional path: the recorder still sends synthesised
+            // off-CPU "samples" with a duration. Translate them into a
+            // proper interval so the aggregator can attribute the
+            // blocked time correctly. Once the recorder grows native
+            // SCHED-driven interval emission these will be dropped.
+            let end_ns = event.timestamp.saturating_add(event.duration_ns);
+            let _ = self.tx.send(LiveEvent::CpuInterval {
+                tid: event.tid,
+                start_ns: event.timestamp,
+                end_ns,
+                kind: CpuIntervalKind::OffCpu {
+                    stack: user_addrs,
+                    waker_tid: None,
+                    waker_user_stack: None,
+                },
+            });
+            return;
+        }
+        // PET stack-walk hit: real on-CPU sample. Forward as-is, plus
+        // a same-period synthetic on-CPU interval so the aggregator's
+        // interval-driven attribution has something to credit until
+        // we wire up real SCHED-derived on-CPU intervals.
+        let _ = self.tx.send(LiveEvent::PetSample {
             tid: event.tid,
             timestamp_ns: event.timestamp,
-            duration_ns: event.duration_ns,
-            user_addrs,
-            is_offcpu: event.is_offcpu,
+            user_addrs: user_addrs.clone(),
             cycles: event.cycles,
             instructions: event.instructions,
             l1d_misses: event.l1d_misses,
             branch_mispreds: event.branch_mispreds,
+        });
+        let end_ns = event.timestamp.saturating_add(event.duration_ns);
+        let _ = self.tx.send(LiveEvent::CpuInterval {
+            tid: event.tid,
+            start_ns: event.timestamp,
+            end_ns,
+            kind: CpuIntervalKind::OnCpu,
         });
     }
 
@@ -182,8 +235,8 @@ impl Profiler for LiveServer {
     async fn top(&self, limit: u32, sort: TopSort, params: ViewParams) -> Vec<TopEntry> {
         let agg = self.aggregator.read();
         let bins = self.binaries.read();
-        let raw = collect_top_raw(&agg, &bins, params.tid, &params.filter);
-        group_top_entries(raw, &bins, sort, limit as usize)
+        let aggregation = aggregate_with_filter(&agg, &bins, params.tid, &params.filter);
+        group_top_entries(&aggregation, &bins, sort, limit as usize)
     }
 
     async fn subscribe_top(
@@ -204,26 +257,12 @@ impl Profiler for LiveServer {
                 let snapshot = {
                     let agg = aggregator.read();
                     let bins = binaries.read();
-                    if is_filter_empty(&filter) {
-                        let raw = agg.top_raw(usize::MAX, tid);
-                        let entries = group_top_entries(raw, &bins, sort, limit as usize);
-                        TopUpdate {
-                            total_duration_ns: agg.total_duration_ns(tid),
-                            entries,
-                        }
-                    } else {
-                        let pred = make_predicate(
-                            &filter,
-                            agg.session_start_ns().unwrap_or(0),
-                            &bins,
-                        );
-                        let f = agg.aggregate_filtered(tid, pred);
-                        let entries =
-                            group_top_entries(f.top_raw(usize::MAX), &bins, sort, limit as usize);
-                        TopUpdate {
-                            total_duration_ns: f.total_duration_ns,
-                            entries,
-                        }
+                    let aggregation = aggregate_with_filter(&agg, &bins, tid, &filter);
+                    let entries = group_top_entries(&aggregation, &bins, sort, limit as usize);
+                    TopUpdate {
+                        total_on_cpu_ns: aggregation.total_on_cpu_ns,
+                        total_off_cpu: aggregation.total_off_cpu.to_proto(),
+                        entries,
                     }
                 };
                 if let Err(e) = output.send(snapshot).await {
@@ -234,8 +273,10 @@ impl Profiler for LiveServer {
         });
     }
 
-    async fn total_duration_ns(&self) -> u64 {
-        self.aggregator.read().total_duration_ns(None)
+    async fn total_on_cpu_ns(&self) -> u64 {
+        let agg = self.aggregator.read();
+        let bins = self.binaries.read();
+        agg.aggregate_all(&bins).total_on_cpu_ns
     }
 
     async fn subscribe_annotated(
@@ -257,29 +298,18 @@ impl Profiler for LiveServer {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
             loop {
                 interval.tick().await;
-                let view = {
-                    if is_filter_empty(&filter) {
-                        let agg = aggregator.read();
-                        compute_annotated_view(&binaries, &source, address, |a| {
-                            agg.self_duration_ns(a, tid)
-                        })
-                    } else {
-                        // Snapshot self_durations under the lock, drop, then build.
-                        let self_durations = {
-                            let agg = aggregator.read();
-                            let bins = binaries.read();
-                            let pred = make_predicate(
-                                &filter,
-                                agg.session_start_ns().unwrap_or(0),
-                                &bins,
-                            );
-                            agg.aggregate_filtered(tid, pred).self_durations
-                        };
-                        compute_annotated_view(&binaries, &source, address, |a| {
-                            self_durations.get(&a).copied().unwrap_or(0)
-                        })
-                    }
+                // Snapshot per-address stats under the lock, drop, then build.
+                let by_address = {
+                    let agg = aggregator.read();
+                    let bins = binaries.read();
+                    aggregate_with_filter(&agg, &bins, tid, &filter).by_address
                 };
+                let view = compute_annotated_view(&binaries, &source, address, |a| {
+                    by_address
+                        .get(&a)
+                        .map(|s| (s.self_on_cpu_ns, s.self_pet_samples))
+                        .unwrap_or((0, 0))
+                });
                 if let Err(e) = output.send(view).await {
                     tracing::info!(
                         address = format!("{:#x}", address),
@@ -304,21 +334,8 @@ impl Profiler for LiveServer {
                 let update = {
                     let agg = aggregator.read();
                     let bins = binaries.read();
-                    if is_filter_empty(&filter) {
-                        compute_flame_update(
-                            agg.total_duration_ns(tid),
-                            &agg.flame_root(tid),
-                            &bins,
-                        )
-                    } else {
-                        let pred = make_predicate(
-                            &filter,
-                            agg.session_start_ns().unwrap_or(0),
-                            &bins,
-                        );
-                        let f = agg.aggregate_filtered(tid, pred);
-                        compute_flame_update(f.total_duration_ns, &f.flame_root, &bins)
-                    }
+                    let aggregation = aggregate_with_filter(&agg, &bins, tid, &filter);
+                    compute_flame_update(&aggregation, &bins)
                 };
                 if let Err(e) = output.send(update).await {
                     tracing::info!(?tid, "subscribe_flamegraph: stream ended: {e:?}");
@@ -349,17 +366,8 @@ impl Profiler for LiveServer {
                 let update = {
                     let agg = aggregator.read();
                     let bins = binaries.read();
-                    if is_filter_empty(&filter) {
-                        compute_neighbors_update(&agg.flame_root(tid), &bins, address)
-                    } else {
-                        let pred = make_predicate(
-                            &filter,
-                            agg.session_start_ns().unwrap_or(0),
-                            &bins,
-                        );
-                        let f = agg.aggregate_filtered(tid, pred);
-                        compute_neighbors_update(&f.flame_root, &bins, address)
-                    }
+                    let aggregation = aggregate_with_filter(&agg, &bins, tid, &filter);
+                    compute_neighbors_update(&aggregation.flame_root, &bins, address)
                 };
                 if let Err(e) = output.send(update).await {
                     tracing::info!(
@@ -414,6 +422,60 @@ impl Profiler for LiveServer {
         });
     }
 
+    async fn subscribe_intervals(
+        &self,
+        flame_key: String,
+        params: ViewParams,
+        output: vox::Tx<IntervalListUpdate>,
+    ) {
+        // TODO: drill-down RPC. Not yet implemented; emits empty
+        // updates so the frontend can subscribe without errors.
+        let ViewParams { tid, filter: _ } = params;
+        tracing::info!(?tid, %flame_key, "subscribe_intervals: stub stream");
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let update = IntervalListUpdate {
+                    strings: Vec::new(),
+                    total_intervals: 0,
+                    total_duration_ns: 0,
+                    by_reason: nperf_live_proto::OffCpuBreakdown::default(),
+                    entries: Vec::new(),
+                };
+                if let Err(e) = output.send(update).await {
+                    tracing::info!("subscribe_intervals: stream ended: {e:?}");
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn subscribe_pet_samples(
+        &self,
+        flame_key: String,
+        params: ViewParams,
+        output: vox::Tx<PetSampleListUpdate>,
+    ) {
+        // TODO: drill-down RPC. Stub.
+        let ViewParams { tid, filter: _ } = params;
+        tracing::info!(?tid, %flame_key, "subscribe_pet_samples: stub stream");
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let update = PetSampleListUpdate {
+                    total_samples: 0,
+                    entries: Vec::new(),
+                };
+                if let Err(e) = output.send(update).await {
+                    tracing::info!("subscribe_pet_samples: stream ended: {e:?}");
+                    break;
+                }
+            }
+        });
+    }
+
     async fn set_paused(&self, paused: bool) {
         self.paused
             .store(paused, std::sync::atomic::Ordering::Relaxed);
@@ -427,21 +489,38 @@ impl Profiler for LiveServer {
     async fn subscribe_threads(&self, output: vox::Tx<ThreadsUpdate>) {
         tracing::info!("subscribe_threads: starting stream");
         let aggregator = self.aggregator.clone();
+        let binaries = self.binaries.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 interval.tick().await;
                 let update = {
                     let agg = aggregator.read();
+                    let bins = binaries.read();
                     let mut threads: Vec<ThreadInfo> = agg
                         .iter_threads()
-                        .map(|(tid, duration_ns)| ThreadInfo {
-                            tid,
-                            name: agg.thread_name(tid).map(|s| s.to_owned()),
-                            duration_ns,
+                        .map(|tid| {
+                            let aggregation = agg.aggregate(Some(tid), &bins, |_| true);
+                            let pet_samples: u64 = agg
+                                .thread_stats(tid)
+                                .map(|s| s.pet_samples.len() as u64)
+                                .unwrap_or(0);
+                            ThreadInfo {
+                                tid,
+                                name: agg.thread_name(tid).map(|s| s.to_owned()),
+                                on_cpu_ns: aggregation.total_on_cpu_ns,
+                                off_cpu: aggregation.total_off_cpu.to_proto(),
+                                pet_samples,
+                            }
                         })
                         .collect();
-                    threads.sort_by(|a, b| b.duration_ns.cmp(&a.duration_ns));
+                    // Rank by on_cpu_ns + total off-cpu so active +
+                    // heavily-blocked threads both float to the top.
+                    threads.sort_by(|a, b| {
+                        let a_total = a.on_cpu_ns.saturating_add(off_cpu_total_proto(&a.off_cpu));
+                        let b_total = b.on_cpu_ns.saturating_add(off_cpu_total_proto(&b.off_cpu));
+                        b_total.cmp(&a_total)
+                    });
                     ThreadsUpdate { threads }
                 };
                 if let Err(e) = output.send(update).await {
@@ -450,6 +529,37 @@ impl Profiler for LiveServer {
                 }
             }
         });
+    }
+}
+
+fn off_cpu_total_proto(b: &nperf_live_proto::OffCpuBreakdown) -> u64 {
+    b.idle_ns
+        .saturating_add(b.lock_ns)
+        .saturating_add(b.semaphore_ns)
+        .saturating_add(b.ipc_ns)
+        .saturating_add(b.io_read_ns)
+        .saturating_add(b.io_write_ns)
+        .saturating_add(b.readiness_ns)
+        .saturating_add(b.sleep_ns)
+        .saturating_add(b.connect_ns)
+        .saturating_add(b.other_ns)
+}
+
+/// One-stop helper: run `Aggregator::aggregate` with the
+/// `LiveFilter`-derived predicate. Pulled out because every RPC
+/// handler kicks off the same dance.
+fn aggregate_with_filter(
+    agg: &Aggregator,
+    binaries: &BinaryRegistry,
+    tid: Option<u32>,
+    filter: &LiveFilter,
+) -> Aggregation {
+    if is_filter_empty(filter) {
+        agg.aggregate(tid, binaries, |_| true)
+    } else {
+        let session_start = agg.session_start_ns().unwrap_or(0);
+        let pred = make_predicate(filter, session_start);
+        agg.aggregate(tid, binaries, pred)
     }
 }
 
@@ -495,32 +605,52 @@ fn is_filter_empty(filter: &LiveFilter) -> bool {
     filter.time_range.is_none() && filter.exclude_symbols.is_empty()
 }
 
-/// Build the predicate that `aggregate_filtered` calls for each raw
-/// sample. Captures `filter` + `binaries` + the recording origin so
-/// time-range and exclude-symbol filters can be applied in one pass.
-/// On/off-CPU split is no longer a filter -- every aggregated node
-/// carries both kinds in separate fields and the UI picks which one
-/// to render.
+/// Build the predicate `Aggregator::aggregate` runs against every PET
+/// sample / interval. Captures the filter + recording origin so
+/// time-range and exclude-symbol filters can both be applied in one
+/// pass. On/off-CPU split is *not* a filter -- every node carries
+/// both kinds in separate fields and the UI picks which one to show.
 fn make_predicate<'a>(
     filter: &'a LiveFilter,
     session_start_ns: u64,
-    binaries: &'a BinaryRegistry,
-) -> impl FnMut(&RawSample) -> bool + 'a {
+) -> impl FnMut(EventCtx<'_>) -> bool + 'a {
     use std::collections::HashSet;
     let exclude: HashSet<(Option<String>, Option<String>)> = filter
         .exclude_symbols
         .iter()
         .map(|s| (s.function_name.clone(), s.binary.clone()))
         .collect();
-    move |sample: &RawSample| {
+    move |ctx: EventCtx<'_>| {
+        let (timestamp, stack_iter, binaries): (u64, Box<dyn Iterator<Item = u64>>, _) = match ctx {
+            EventCtx::PetSample {
+                tid: _,
+                sample,
+                binaries,
+            } => (
+                sample.timestamp_ns,
+                Box::new(sample.stack.iter().copied().collect::<Vec<_>>().into_iter()),
+                binaries,
+            ),
+            EventCtx::Interval {
+                tid: _,
+                interval,
+                binaries,
+            } => {
+                let stack: Vec<u64> = match &interval.kind {
+                    IntervalKind::OnCpu => Vec::new(),
+                    IntervalKind::OffCpu { stack, .. } => stack.iter().copied().collect(),
+                };
+                (interval.start_ns, Box::new(stack.into_iter()), binaries)
+            }
+        };
         if let Some(ref tr) = filter.time_range {
-            let rel = sample.timestamp_ns.saturating_sub(session_start_ns);
+            let rel = timestamp.saturating_sub(session_start_ns);
             if rel < tr.start_ns || rel >= tr.end_ns {
                 return false;
             }
         }
         if !exclude.is_empty() {
-            for &addr in sample.stack.iter() {
+            for addr in stack_iter {
                 let key = match binaries.lookup_symbol(addr) {
                     Some(r) => (Some(r.function_name), Some(r.binary)),
                     None => (None, None),
@@ -534,103 +664,85 @@ fn make_predicate<'a>(
     }
 }
 
-/// Helper for the one-shot `top` RPC: chooses fast/slow path based on
-/// the filter and returns raw counts (pre-grouping).
-fn collect_top_raw(
-    agg: &Aggregator,
-    binaries: &BinaryRegistry,
-    tid: Option<u32>,
-    filter: &LiveFilter,
-) -> Vec<RawTopEntry> {
-    if is_filter_empty(filter) {
-        agg.top_raw(usize::MAX, tid)
-    } else {
-        let pred = make_predicate(filter, agg.session_start_ns().unwrap_or(0), binaries);
-        agg.aggregate_filtered(tid, pred).top_raw(usize::MAX)
-    }
-}
-
 fn group_top_entries(
-    raw: Vec<RawTopEntry>,
+    aggregation: &Aggregation,
     binaries: &BinaryRegistry,
     sort: TopSort,
     limit: usize,
 ) -> Vec<TopEntry> {
     use std::collections::HashMap;
 
-    // Group key: (function_name, binary_basename). When unresolved (no
-    // containing image), each address is its own group (keyed by its
-    // hex form so it stays unique).
+    // Group key: (function_name, binary_basename). When unresolved
+    // (no containing image), each address is its own group (keyed by
+    // its hex form so it stays unique).
     struct Agg {
         address: u64,
-        representative_self_duration_ns: u64,
-        self_duration_ns: u64,
-        total_duration_ns: u64,
-        self_cycles: u64,
-        self_instructions: u64,
-        self_l1d_misses: u64,
-        self_branch_mispreds: u64,
-        total_cycles: u64,
-        total_instructions: u64,
-        total_l1d_misses: u64,
-        total_branch_mispreds: u64,
+        representative_self_ns: u64,
+        self_on_cpu_ns: u64,
+        total_on_cpu_ns: u64,
+        self_off_cpu: OffCpuBreakdown,
+        total_off_cpu: OffCpuBreakdown,
+        self_pet_samples: u64,
+        total_pet_samples: u64,
+        self_off_cpu_intervals: u64,
+        total_off_cpu_intervals: u64,
+        self_pmc: PmcAccum,
+        total_pmc: PmcAccum,
         function_name: Option<String>,
         binary: Option<String>,
         is_main: bool,
         language: nperf_demangle::Language,
     }
     let mut groups: HashMap<(String, String), Agg> = HashMap::new();
-    for e in raw {
-        let resolved = binaries.lookup_symbol(e.address);
+    for (&address, stats) in &aggregation.by_address {
+        let resolved = binaries.lookup_symbol(address);
         let (fn_name, bin, is_main, language) = match resolved {
             Some(r) => (Some(r.function_name), Some(r.binary), r.is_main, r.language),
             None => (None, None, false, nperf_demangle::Language::Unknown),
         };
         let key: (String, String) = match (&fn_name, &bin) {
             (Some(n), Some(b)) => (n.clone(), b.clone()),
-            _ => (format!("{:#x}", e.address), String::new()),
+            _ => (format!("{:#x}", address), String::new()),
         };
         groups
             .entry(key)
             .and_modify(|g| {
-                g.self_duration_ns += e.self_duration_ns;
-                g.total_duration_ns += e.total_duration_ns;
-                g.self_cycles = g.self_cycles.saturating_add(e.self_pmc.cycles);
-                g.self_instructions = g
-                    .self_instructions
-                    .saturating_add(e.self_pmc.instructions);
-                g.self_l1d_misses = g.self_l1d_misses.saturating_add(e.self_pmc.l1d_misses);
-                g.self_branch_mispreds = g
-                    .self_branch_mispreds
-                    .saturating_add(e.self_pmc.branch_mispreds);
-                g.total_cycles = g.total_cycles.saturating_add(e.total_pmc.cycles);
-                g.total_instructions = g
-                    .total_instructions
-                    .saturating_add(e.total_pmc.instructions);
-                g.total_l1d_misses = g
-                    .total_l1d_misses
-                    .saturating_add(e.total_pmc.l1d_misses);
-                g.total_branch_mispreds = g
-                    .total_branch_mispreds
-                    .saturating_add(e.total_pmc.branch_mispreds);
-                if e.self_duration_ns > g.representative_self_duration_ns {
-                    g.address = e.address;
-                    g.representative_self_duration_ns = e.self_duration_ns;
+                g.self_on_cpu_ns = g.self_on_cpu_ns.saturating_add(stats.self_on_cpu_ns);
+                g.total_on_cpu_ns =
+                    g.total_on_cpu_ns.saturating_add(stats.total_on_cpu_ns);
+                g.self_off_cpu.add_other(&stats.self_off_cpu);
+                g.total_off_cpu.add_other(&stats.total_off_cpu);
+                g.self_pet_samples =
+                    g.self_pet_samples.saturating_add(stats.self_pet_samples);
+                g.total_pet_samples =
+                    g.total_pet_samples.saturating_add(stats.total_pet_samples);
+                g.self_off_cpu_intervals = g
+                    .self_off_cpu_intervals
+                    .saturating_add(stats.self_off_cpu_intervals);
+                g.total_off_cpu_intervals = g
+                    .total_off_cpu_intervals
+                    .saturating_add(stats.total_off_cpu_intervals);
+                g.self_pmc.add_other(&stats.self_pmc);
+                g.total_pmc.add_other(&stats.total_pmc);
+                let candidate_self = stats.self_on_cpu_ns;
+                if candidate_self > g.representative_self_ns {
+                    g.address = address;
+                    g.representative_self_ns = candidate_self;
                 }
             })
             .or_insert(Agg {
-                address: e.address,
-                representative_self_duration_ns: e.self_duration_ns,
-                self_duration_ns: e.self_duration_ns,
-                total_duration_ns: e.total_duration_ns,
-                self_cycles: e.self_pmc.cycles,
-                self_instructions: e.self_pmc.instructions,
-                self_l1d_misses: e.self_pmc.l1d_misses,
-                self_branch_mispreds: e.self_pmc.branch_mispreds,
-                total_cycles: e.total_pmc.cycles,
-                total_instructions: e.total_pmc.instructions,
-                total_l1d_misses: e.total_pmc.l1d_misses,
-                total_branch_mispreds: e.total_pmc.branch_mispreds,
+                address,
+                representative_self_ns: stats.self_on_cpu_ns,
+                self_on_cpu_ns: stats.self_on_cpu_ns,
+                total_on_cpu_ns: stats.total_on_cpu_ns,
+                self_off_cpu: stats.self_off_cpu,
+                total_off_cpu: stats.total_off_cpu,
+                self_pet_samples: stats.self_pet_samples,
+                total_pet_samples: stats.total_pet_samples,
+                self_off_cpu_intervals: stats.self_off_cpu_intervals,
+                total_off_cpu_intervals: stats.total_off_cpu_intervals,
+                self_pmc: stats.self_pmc,
+                total_pmc: stats.total_pmc,
                 function_name: fn_name,
                 binary: bin,
                 is_main,
@@ -642,20 +754,26 @@ fn group_top_entries(
         .into_values()
         .map(|g| TopEntry {
             address: g.address,
-            self_duration_ns: g.self_duration_ns,
-            total_duration_ns: g.total_duration_ns,
             function_name: g.function_name,
             binary: g.binary,
             is_main: g.is_main,
             language: g.language.as_str().to_owned(),
-            self_cycles: g.self_cycles,
-            self_instructions: g.self_instructions,
-            self_l1d_misses: g.self_l1d_misses,
-            self_branch_mispreds: g.self_branch_mispreds,
-            total_cycles: g.total_cycles,
-            total_instructions: g.total_instructions,
-            total_l1d_misses: g.total_l1d_misses,
-            total_branch_mispreds: g.total_branch_mispreds,
+            self_on_cpu_ns: g.self_on_cpu_ns,
+            total_on_cpu_ns: g.total_on_cpu_ns,
+            self_off_cpu: g.self_off_cpu.to_proto(),
+            total_off_cpu: g.total_off_cpu.to_proto(),
+            self_pet_samples: g.self_pet_samples,
+            total_pet_samples: g.total_pet_samples,
+            self_off_cpu_intervals: g.self_off_cpu_intervals,
+            total_off_cpu_intervals: g.total_off_cpu_intervals,
+            self_cycles: g.self_pmc.cycles,
+            self_instructions: g.self_pmc.instructions,
+            self_l1d_misses: g.self_pmc.l1d_misses,
+            self_branch_mispreds: g.self_pmc.branch_mispreds,
+            total_cycles: g.total_pmc.cycles,
+            total_instructions: g.total_pmc.instructions,
+            total_l1d_misses: g.total_pmc.l1d_misses,
+            total_branch_mispreds: g.total_pmc.branch_mispreds,
         })
         .collect();
     // Tie-break on function_name → binary → address so the row order
@@ -663,15 +781,17 @@ fn group_top_entries(
     // shuffle every tick as the underlying HashMap iterates them in
     // a different order.
     out.sort_by(|a, b| {
+        let a_self_off = off_cpu_total_proto(&a.self_off_cpu);
+        let b_self_off = off_cpu_total_proto(&b.self_off_cpu);
+        let a_total_off = off_cpu_total_proto(&a.total_off_cpu);
+        let b_total_off = off_cpu_total_proto(&b.total_off_cpu);
+        let a_self = a.self_on_cpu_ns.saturating_add(a_self_off);
+        let b_self = b.self_on_cpu_ns.saturating_add(b_self_off);
+        let a_total = a.total_on_cpu_ns.saturating_add(a_total_off);
+        let b_total = b.total_on_cpu_ns.saturating_add(b_total_off);
         let primary = match sort {
-            TopSort::BySelf => b
-                .self_duration_ns
-                .cmp(&a.self_duration_ns)
-                .then_with(|| b.total_duration_ns.cmp(&a.total_duration_ns)),
-            TopSort::ByTotal => b
-                .total_duration_ns
-                .cmp(&a.total_duration_ns)
-                .then_with(|| b.self_duration_ns.cmp(&a.self_duration_ns)),
+            TopSort::BySelf => b_self.cmp(&a_self).then_with(|| b_total.cmp(&a_total)),
+            TopSort::ByTotal => b_total.cmp(&a_total).then_with(|| b_self.cmp(&a_self)),
         };
         primary
             .then_with(|| a.function_name.cmp(&b.function_name))
@@ -682,12 +802,15 @@ fn group_top_entries(
     out
 }
 
-/// Build a wall-clock-time timeline from the per-thread raw sample
-/// log. Each bucket accumulates the `duration_ns` of samples whose
-/// `timestamp_ns` falls inside it, so bar height represents activity
-/// per bucket. Bucket size is chosen so we stay around
-/// `TARGET_BUCKETS` regardless of recording duration, with a sensible
-/// minimum so we don't over-quantize a 1-second recording.
+/// Build the timeline by walking SCHED-derived intervals (the
+/// authoritative source of "when was a thread doing what"). Each
+/// interval's duration gets distributed across the buckets it
+/// overlaps, split into on-CPU vs off-CPU stacks. PET samples
+/// don't directly drive the timeline -- they're stack-only.
+///
+/// Bucket size is chosen so we stay around `TARGET_BUCKETS`
+/// regardless of recording duration, with a sensible minimum so we
+/// don't over-quantize a 1-second recording.
 fn build_timeline_update(
     aggregator: &Arc<RwLock<Aggregator>>,
     tid: Option<u32>,
@@ -697,7 +820,7 @@ fn build_timeline_update(
 
     let agg = aggregator.read();
     let start = agg.session_start_ns().unwrap_or(0);
-    let last = agg.last_sample_ns().unwrap_or(start);
+    let last = agg.last_event_ns().unwrap_or(start);
     let recording_duration_ns = last.saturating_sub(start);
 
     let bucket_size_ns = if recording_duration_ns == 0 {
@@ -706,31 +829,59 @@ fn build_timeline_update(
         (recording_duration_ns / TARGET_BUCKETS).max(MIN_BUCKET_NS)
     };
     let n_buckets = ((recording_duration_ns / bucket_size_ns) + 1) as usize;
-    let mut bucket_durations: Vec<u64> = vec![0; n_buckets.max(1)];
+    let mut on_cpu_per_bucket: Vec<u64> = vec![0; n_buckets.max(1)];
+    let mut off_cpu_per_bucket: Vec<u64> = vec![0; n_buckets.max(1)];
 
-    let mut total_duration_ns: u64 = 0;
-    for (_tid, sample) in agg.iter_samples(tid) {
-        let rel = sample.timestamp_ns.saturating_sub(start);
-        let idx = (rel / bucket_size_ns) as usize;
-        if idx < bucket_durations.len() {
-            bucket_durations[idx] = bucket_durations[idx].saturating_add(sample.duration_ns);
-            total_duration_ns = total_duration_ns.saturating_add(sample.duration_ns);
+    let mut total_on_cpu_ns: u64 = 0;
+    let mut total_off_cpu_ns: u64 = 0;
+
+    for (_tid, interval) in agg.iter_intervals(tid) {
+        let int_start = interval.start_ns;
+        let int_end = if interval.end_ns == 0 { last } else { interval.end_ns };
+        if int_end <= int_start {
+            continue;
+        }
+        let on_cpu = matches!(interval.kind, IntervalKind::OnCpu);
+        // Distribute the interval's duration across the buckets it
+        // overlaps. For each overlapping bucket [b_start, b_end), the
+        // share is min(int_end, b_end) - max(int_start, b_start).
+        let rel_start = int_start.saturating_sub(start);
+        let rel_end = int_end.saturating_sub(start);
+        let first_bucket = (rel_start / bucket_size_ns) as usize;
+        let last_bucket = ((rel_end.saturating_sub(1)) / bucket_size_ns) as usize;
+        for b in first_bucket..=last_bucket.min(n_buckets.saturating_sub(1)) {
+            let b_start = (b as u64) * bucket_size_ns;
+            let b_end = b_start.saturating_add(bucket_size_ns);
+            let share = b_end.min(rel_end).saturating_sub(b_start.max(rel_start));
+            if share == 0 {
+                continue;
+            }
+            if on_cpu {
+                on_cpu_per_bucket[b] = on_cpu_per_bucket[b].saturating_add(share);
+                total_on_cpu_ns = total_on_cpu_ns.saturating_add(share);
+            } else {
+                off_cpu_per_bucket[b] = off_cpu_per_bucket[b].saturating_add(share);
+                total_off_cpu_ns = total_off_cpu_ns.saturating_add(share);
+            }
         }
     }
 
-    let buckets: Vec<TimelineBucket> = bucket_durations
+    let buckets: Vec<TimelineBucket> = on_cpu_per_bucket
         .into_iter()
+        .zip(off_cpu_per_bucket.into_iter())
         .enumerate()
-        .map(|(i, duration_ns)| TimelineBucket {
+        .map(|(i, (on_cpu_ns, off_cpu_ns))| TimelineBucket {
             start_ns: i as u64 * bucket_size_ns,
-            duration_ns,
+            on_cpu_ns,
+            off_cpu_ns,
         })
         .collect();
 
     TimelineUpdate {
         bucket_size_ns,
         recording_duration_ns,
-        total_duration_ns,
+        total_on_cpu_ns,
+        total_off_cpu_ns,
         buckets,
     }
 }
@@ -739,12 +890,15 @@ fn build_timeline_update(
 ///
 /// We walk the call tree once and, for every node whose resolved
 /// symbol matches the target, do two things:
-///   1. Merge the entire ancestor chain (parent → grandparent → …)
-///      into `callers_tree`, growing outward toward `main`.
+///   1. Merge the entire ancestor chain into `callers_tree`,
+///      growing outward toward `main`.
 ///   2. Merge the entire descendant subtree into `callees_tree`,
 ///      keyed by symbol (so recursion + multiple call sites collapse).
+///
+/// SymbolNode tracks both on-CPU time and the off-CPU breakdown so
+/// the family-tree view shows the same dimensions as the main flame.
 fn compute_neighbors_update(
-    flame_root: &aggregator::StackNode,
+    flame_root: &StackNode,
     binaries: &BinaryRegistry,
     target_address: u64,
 ) -> NeighborsUpdate {
@@ -754,10 +908,12 @@ fn compute_neighbors_update(
 
     #[derive(Default)]
     struct SymbolNode {
-        /// Wall-clock time attributed to this symbol, in nanoseconds.
-        duration_ns: u64,
+        on_cpu_ns: u64,
+        off_cpu: OffCpuBreakdown,
+        pet_samples: u64,
+        off_cpu_intervals: u64,
         rep_address: u64,
-        rep_self_duration_ns: u64,
+        rep_self_ns: u64,
         is_main: bool,
         language: nperf_demangle::Language,
         children: HashMap<SymbolKey, SymbolNode>,
@@ -777,22 +933,25 @@ fn compute_neighbors_update(
         }
     }
 
-    /// Insert one (addr, duration_ns) sample into `node`, merging by
-    /// SymbolKey-keyed children. `delta` is added to this node's
-    /// `duration_ns`; `rep_self_duration_ns` tracks the largest single
-    /// contribution so we can pick the hottest address as the
-    /// click-through representative.
+    /// Add the data from one source `StackNode` into a `SymbolNode`,
+    /// updating its rep-address heuristic.
     fn accumulate(
         node: &mut SymbolNode,
         addr: u64,
-        delta: u64,
+        src: &StackNode,
         is_main: bool,
         language: nperf_demangle::Language,
     ) {
-        node.duration_ns = node.duration_ns.saturating_add(delta);
-        if delta > node.rep_self_duration_ns {
+        node.on_cpu_ns = node.on_cpu_ns.saturating_add(src.on_cpu_ns);
+        node.off_cpu.add_other(&src.off_cpu);
+        node.pet_samples = node.pet_samples.saturating_add(src.pet_samples);
+        node.off_cpu_intervals = node
+            .off_cpu_intervals
+            .saturating_add(src.off_cpu_intervals);
+        let candidate = src.on_cpu_ns;
+        if candidate > node.rep_self_ns {
             node.rep_address = addr;
-            node.rep_self_duration_ns = delta;
+            node.rep_self_ns = candidate;
             node.is_main = is_main;
             node.language = language;
         }
@@ -800,40 +959,39 @@ fn compute_neighbors_update(
 
     fn merge_descendants(
         dst: &mut SymbolNode,
-        src: &aggregator::StackNode,
+        src: &StackNode,
         bins: &BinaryRegistry,
     ) {
         for (caddr, child) in &src.children {
             let (key, is_main, language) = classify(*caddr, bins);
             let entry = dst.children.entry(key).or_default();
-            accumulate(entry, *caddr, child.duration_ns, is_main, language);
+            accumulate(entry, *caddr, child, is_main, language);
             merge_descendants(entry, child, bins);
         }
     }
 
     fn walk(
-        node: &aggregator::StackNode,
+        node: &StackNode,
         node_addr: u64,
         ancestors: &mut Vec<u64>,
         target_key: &SymbolKey,
         bins: &BinaryRegistry,
         callers: &mut SymbolNode,
         callees: &mut SymbolNode,
-        own_duration_ns: &mut u64,
+        own: &mut SymbolNode,
     ) {
         if node_addr != 0 {
             let (key, _is_main, _language) = classify(node_addr, bins);
             if &key == target_key {
-                *own_duration_ns = own_duration_ns.saturating_add(node.duration_ns);
+                accumulate(own, node_addr, node, _is_main, _language);
                 // Insert ancestor chain into callers_tree, innermost-first.
                 let mut cur = &mut *callers;
                 for &caller_addr in ancestors.iter().rev() {
                     let (ckey, cmain, clang) = classify(caller_addr, bins);
                     let entry = cur.children.entry(ckey).or_default();
-                    accumulate(entry, caller_addr, node.duration_ns, cmain, clang);
+                    accumulate(entry, caller_addr, node, cmain, clang);
                     cur = entry;
                 }
-                // Merge descendants into callees_tree.
                 merge_descendants(callees, node, bins);
             }
         }
@@ -843,16 +1001,7 @@ fn compute_neighbors_update(
             ancestors.push(node_addr);
         }
         for (caddr, child) in &node.children {
-            walk(
-                child,
-                *caddr,
-                ancestors,
-                target_key,
-                bins,
-                callers,
-                callees,
-                own_duration_ns,
-            );
+            walk(child, *caddr, ancestors, target_key, bins, callers, callees, own);
         }
         if pushed {
             ancestors.pop();
@@ -866,23 +1015,27 @@ fn compute_neighbors_update(
         interner: &mut StringInterner,
     ) -> FlameNode {
         let SymbolNode {
-            duration_ns,
+            on_cpu_ns,
+            off_cpu,
+            pet_samples,
+            off_cpu_intervals,
             rep_address,
             is_main,
             language,
             children,
             ..
         } = sn;
-        // Sort by (duration desc, fname asc, bin asc) on the
-        // SymbolKey strings, before interning, so the order is stable
-        // across snapshots. See compute_flame_update for the rationale.
+        // Sort by (on_cpu_ns desc, fname asc, bin asc) so order is
+        // stable across snapshots.
         let mut entries: Vec<(SymbolKey, SymbolNode)> = children
             .into_iter()
-            .filter(|(_, c)| c.duration_ns >= threshold)
+            .filter(|(_, c)| c.on_cpu_ns.saturating_add(c.off_cpu.total_ns()) >= threshold)
             .collect();
         entries.sort_by(|a, b| {
-            b.1.duration_ns
-                .cmp(&a.1.duration_ns)
+            let a_total = a.1.on_cpu_ns.saturating_add(a.1.off_cpu.total_ns());
+            let b_total = b.1.on_cpu_ns.saturating_add(b.1.off_cpu.total_ns());
+            b_total
+                .cmp(&a_total)
                 .then_with(|| a.0.0.cmp(&b.0.0))
                 .then_with(|| a.0.1.cmp(&b.0.1))
         });
@@ -892,14 +1045,14 @@ fn compute_neighbors_update(
             .collect();
         FlameNode {
             address: rep_address,
-            duration_ns,
+            on_cpu_ns,
+            off_cpu: off_cpu.to_proto(),
+            pet_samples,
+            off_cpu_intervals,
             function_name: interner.intern_opt(key.0),
             binary: interner.intern_opt(key.1),
             is_main,
             language: interner.intern_str(language.as_str()),
-            // PMC values aren't currently propagated through the
-            // SymbolNode-based callers/callees trees -- the neighbors
-            // view shows time only.
             cycles: 0,
             instructions: 0,
             l1d_misses: 0,
@@ -920,7 +1073,7 @@ fn compute_neighbors_update(
 
     let mut callers = SymbolNode::default();
     let mut callees = SymbolNode::default();
-    let mut own_duration_ns: u64 = 0;
+    let mut own = SymbolNode::default();
 
     let mut ancestors: Vec<u64> = Vec::new();
     walk(
@@ -931,23 +1084,30 @@ fn compute_neighbors_update(
         binaries,
         &mut callers,
         &mut callees,
-        &mut own_duration_ns,
+        &mut own,
     );
 
-    // Stamp the target's own duration + representative onto each
-    // tree's root so the renderer has a useful "self" frame.
-    callers.duration_ns = own_duration_ns;
+    // Stamp the target's own data + representative onto each tree's
+    // root so the renderer has a useful "self" frame.
+    callers.on_cpu_ns = own.on_cpu_ns;
+    callers.off_cpu = own.off_cpu;
+    callers.pet_samples = own.pet_samples;
+    callers.off_cpu_intervals = own.off_cpu_intervals;
     callers.rep_address = target_address;
     callers.is_main = target_resolved.as_ref().map(|r| r.is_main).unwrap_or(false);
     callers.language = target_language;
-    callees.duration_ns = own_duration_ns;
+    callees.on_cpu_ns = own.on_cpu_ns;
+    callees.off_cpu = own.off_cpu;
+    callees.pet_samples = own.pet_samples;
+    callees.off_cpu_intervals = own.off_cpu_intervals;
     callees.rep_address = target_address;
     callees.is_main = target_resolved.as_ref().map(|r| r.is_main).unwrap_or(false);
     callees.language = target_language;
 
+    let own_total_ns = own.on_cpu_ns.saturating_add(own.off_cpu.total_ns());
     // Same lenient 0.05% threshold as the main flamegraph so the
     // family tree shows small but non-trivial neighbours.
-    let threshold = (own_duration_ns / 2000).max(1);
+    let threshold = (own_total_ns / 2000).max(1);
     let mut interner = StringInterner::new();
     let target_fname = interner.intern_opt(target_key.0.clone());
     let target_bin = interner.intern_opt(target_key.1.clone());
@@ -961,7 +1121,10 @@ fn compute_neighbors_update(
         binary: target_bin,
         is_main: target_resolved.as_ref().map(|r| r.is_main).unwrap_or(false),
         language: target_lang,
-        own_duration_ns,
+        own_on_cpu_ns: own.on_cpu_ns,
+        own_off_cpu: own.off_cpu.to_proto(),
+        own_pet_samples: own.pet_samples,
+        own_off_cpu_intervals: own.off_cpu_intervals,
         callers_tree,
         callees_tree,
     }
@@ -1016,23 +1179,24 @@ impl StringInterner {
 }
 
 fn compute_flame_update(
-    total_duration_ns: u64,
-    flame_root: &aggregator::StackNode,
+    aggregation: &Aggregation,
     binaries: &BinaryRegistry,
 ) -> FlamegraphUpdate {
+    let total_on_cpu_ns = aggregation.total_on_cpu_ns;
+    let total_off_cpu = aggregation.total_off_cpu;
+    let total_combined = total_on_cpu_ns.saturating_add(total_off_cpu.total_ns());
     // 0.05% of total. Lower than the previous 0.5% so that when the
     // user focuses into a smaller subtree there's still meaningful
     // per-callsite detail instead of one big "(N small frames)" cell.
     // Bumps the wire payload roughly 5-10x but the live UI handles
     // it; the residue cell still catches the truly-tiny tail.
-    let threshold = (total_duration_ns / 2000).max(1);
+    let threshold = (total_combined / 2000).max(1);
     let mut interner = StringInterner::new();
     let (mut children, residue) =
-        build_children_with_residue(&[flame_root], threshold, binaries, &mut interner);
-    // build_children_with_residue already returns children sorted by
-    // (duration desc, fname asc, bin asc); fold_recursion only rewrites
-    // a node's children Vec, never the node's own duration, so the
-    // top-level order stays correct.
+        build_children_with_residue(&[&aggregation.flame_root], threshold, binaries, &mut interner);
+    // build_children_with_residue already returns children sorted;
+    // fold_recursion only rewrites a node's children Vec, never the
+    // node's own data, so the top-level order stays correct.
     for c in &mut children {
         fold_recursion(c);
     }
@@ -1042,45 +1206,22 @@ fn compute_flame_update(
 
     let unknown_lang = interner.intern_str(nperf_demangle::Language::Unknown.as_str());
 
-    // Samples whose user-stack walk returned zero frames (kernel-only
-    // samples, walk failures, etc.) contribute to `total_duration_ns`
-    // but never touch `flame_root.children`. Without this synthetic
-    // leaf the (all) row says "100%" but the visible cells fill <100%
-    // of the width, leaving black space that looks like a bug. Spell
-    // it out instead.
-    let visible_sum: u64 = children.iter().map(|c| c.duration_ns).sum();
-    if total_duration_ns > visible_sum {
-        let missing_ns = total_duration_ns - visible_sum;
-        let label = interner.intern(format!(
-            "(in-kernel / no user stack: {:.1}ms)",
-            missing_ns as f64 / 1_000_000.0
-        ));
-        children.push(FlameNode {
-            address: u64::MAX - 1,
-            duration_ns: missing_ns,
-            function_name: Some(label),
-            binary: None,
-            is_main: false,
-            language: unknown_lang,
-            cycles: 0,
-            instructions: 0,
-            l1d_misses: 0,
-            branch_mispreds: 0,
-            children: Vec::new(),
-        });
-    }
-
     // Root sums counters across all children so the "(all)" row
     // shows the recording's grand totals.
     let total_cycles: u64 = children.iter().map(|c| c.cycles).sum();
     let total_instructions: u64 = children.iter().map(|c| c.instructions).sum();
     let total_l1d_misses: u64 = children.iter().map(|c| c.l1d_misses).sum();
     let total_branch_mispreds: u64 = children.iter().map(|c| c.branch_mispreds).sum();
+    let total_pet_samples: u64 = children.iter().map(|c| c.pet_samples).sum();
+    let total_off_cpu_intervals: u64 = children.iter().map(|c| c.off_cpu_intervals).sum();
 
     let all_label = interner.intern_str("(all)");
     let root = FlameNode {
         address: 0,
-        duration_ns: total_duration_ns,
+        on_cpu_ns: total_on_cpu_ns,
+        off_cpu: total_off_cpu.to_proto(),
+        pet_samples: total_pet_samples,
+        off_cpu_intervals: total_off_cpu_intervals,
         function_name: Some(all_label),
         binary: None,
         is_main: false,
@@ -1092,7 +1233,8 @@ fn compute_flame_update(
         children,
     };
     FlamegraphUpdate {
-        total_duration_ns,
+        total_on_cpu_ns,
+        total_off_cpu: total_off_cpu.to_proto(),
         strings: interner.into_strings(),
         root,
     }
@@ -1134,7 +1276,7 @@ fn symbol_eq(a: &FlameNode, b: &FlameNode) -> bool {
 /// sibling so the renderer doesn't leave black space where the long
 /// tail used to live.
 fn build_children_with_residue(
-    sources: &[&aggregator::StackNode],
+    sources: &[&StackNode],
     threshold: u64,
     binaries: &BinaryRegistry,
     interner: &mut StringInterner,
@@ -1144,13 +1286,16 @@ fn build_children_with_residue(
     type SymbolKey = (Option<String>, Option<String>);
 
     struct Acc<'a> {
-        duration_ns: u64,
+        on_cpu_ns: u64,
+        off_cpu: OffCpuBreakdown,
+        pet_samples: u64,
+        off_cpu_intervals: u64,
         pmc: PmcAccum,
         rep_addr: u64,
-        rep_duration_ns: u64,
+        rep_self_ns: u64,
         is_main: bool,
         language: nperf_demangle::Language,
-        sub_sources: Vec<&'a aggregator::StackNode>,
+        sub_sources: Vec<&'a StackNode>,
     }
 
     let mut groups: HashMap<SymbolKey, Acc> = HashMap::new();
@@ -1168,27 +1313,31 @@ fn build_children_with_residue(
             };
             let key = (fname, bin);
             let acc = groups.entry(key).or_insert_with(|| Acc {
-                duration_ns: 0,
+                on_cpu_ns: 0,
+                off_cpu: OffCpuBreakdown::default(),
+                pet_samples: 0,
+                off_cpu_intervals: 0,
                 pmc: PmcAccum::default(),
                 rep_addr: addr,
-                rep_duration_ns: 0,
+                rep_self_ns: 0,
                 is_main,
                 language: lang,
                 sub_sources: Vec::new(),
             });
-            acc.duration_ns = acc.duration_ns.saturating_add(child.duration_ns);
-            acc.pmc.cycles = acc.pmc.cycles.saturating_add(child.pmc.cycles);
-            acc.pmc.instructions = acc.pmc.instructions.saturating_add(child.pmc.instructions);
-            acc.pmc.l1d_misses = acc.pmc.l1d_misses.saturating_add(child.pmc.l1d_misses);
-            acc.pmc.branch_mispreds = acc
-                .pmc
-                .branch_mispreds
-                .saturating_add(child.pmc.branch_mispreds);
+            acc.on_cpu_ns = acc.on_cpu_ns.saturating_add(child.on_cpu_ns);
+            acc.off_cpu.add_other(&child.off_cpu);
+            acc.pet_samples = acc.pet_samples.saturating_add(child.pet_samples);
+            acc.off_cpu_intervals = acc
+                .off_cpu_intervals
+                .saturating_add(child.off_cpu_intervals);
+            acc.pmc.add_other(&child.pmc);
             // Largest single contributor's address is the click-through
-            // representative (matches what compute_neighbors_update does).
-            if child.duration_ns > acc.rep_duration_ns {
+            // representative; we rank by on_cpu_ns since that's the
+            // most common attribution path.
+            let candidate = child.on_cpu_ns;
+            if candidate > acc.rep_self_ns {
                 acc.rep_addr = addr;
-                acc.rep_duration_ns = child.duration_ns;
+                acc.rep_self_ns = candidate;
                 acc.is_main = is_main;
                 acc.language = lang;
             }
@@ -1196,25 +1345,27 @@ fn build_children_with_residue(
         }
     }
 
-    // Sort by (duration desc, function_name asc, binary asc) before
-    // interning so the visible order is stable across snapshots.
-    // Without the symbol-key tie-break, runs of equal-duration
-    // siblings (common when many cells hold ~1 sample worth) shuffle
-    // on every tick because HashMap iteration order is
-    // non-deterministic.
+    // Sort by (on+off duration desc, function_name asc, binary asc)
+    // before interning so the visible order is stable across snapshots.
     let mut entries: Vec<((Option<String>, Option<String>), Acc)> = groups.into_iter().collect();
     entries.sort_by(|a, b| {
-        b.1.duration_ns
-            .cmp(&a.1.duration_ns)
+        let a_total = a.1.on_cpu_ns.saturating_add(a.1.off_cpu.total_ns());
+        let b_total = b.1.on_cpu_ns.saturating_add(b.1.off_cpu.total_ns());
+        b_total
+            .cmp(&a_total)
             .then_with(|| a.0.0.cmp(&b.0.0))
             .then_with(|| a.0.1.cmp(&b.0.1))
     });
 
     let mut visible: Vec<FlameNode> = Vec::new();
-    let mut residue_duration_ns: u64 = 0;
+    let mut residue_on_cpu_ns: u64 = 0;
+    let mut residue_off_cpu = OffCpuBreakdown::default();
+    let mut residue_pet_samples: u64 = 0;
+    let mut residue_off_cpu_intervals: u64 = 0;
     let mut residue_dropped: u64 = 0;
     for ((fname, bin), acc) in entries {
-        if acc.duration_ns >= threshold {
+        let acc_total = acc.on_cpu_ns.saturating_add(acc.off_cpu.total_ns());
+        if acc_total >= threshold {
             let (mut grandchildren, gres) =
                 build_children_with_residue(&acc.sub_sources, threshold, binaries, interner);
             if let Some(extra) = gres {
@@ -1222,7 +1373,10 @@ fn build_children_with_residue(
             }
             visible.push(FlameNode {
                 address: acc.rep_addr,
-                duration_ns: acc.duration_ns,
+                on_cpu_ns: acc.on_cpu_ns,
+                off_cpu: acc.off_cpu.to_proto(),
+                pet_samples: acc.pet_samples,
+                off_cpu_intervals: acc.off_cpu_intervals,
                 function_name: interner.intern_opt(fname),
                 binary: interner.intern_opt(bin),
                 is_main: acc.is_main,
@@ -1234,12 +1388,16 @@ fn build_children_with_residue(
                 children: grandchildren,
             });
         } else {
-            residue_duration_ns =
-                residue_duration_ns.saturating_add(acc.duration_ns);
+            residue_on_cpu_ns = residue_on_cpu_ns.saturating_add(acc.on_cpu_ns);
+            residue_off_cpu.add_other(&acc.off_cpu);
+            residue_pet_samples = residue_pet_samples.saturating_add(acc.pet_samples);
+            residue_off_cpu_intervals = residue_off_cpu_intervals
+                .saturating_add(acc.off_cpu_intervals);
             residue_dropped += 1;
         }
     }
-    let residue = if residue_duration_ns > 0 && residue_dropped > 0 {
+    let residue_total = residue_on_cpu_ns.saturating_add(residue_off_cpu.total_ns());
+    let residue = if residue_total > 0 && residue_dropped > 0 {
         let label = interner.intern(format!("({} small frames)", residue_dropped));
         let unknown_lang = interner.intern_str(nperf_demangle::Language::Unknown.as_str());
         Some(FlameNode {
@@ -1249,7 +1407,10 @@ fn build_children_with_residue(
             // path first, but we also pick u64::MAX here as a defence
             // in case future renderers fall back to address.
             address: u64::MAX,
-            duration_ns: residue_duration_ns,
+            on_cpu_ns: residue_on_cpu_ns,
+            off_cpu: residue_off_cpu.to_proto(),
+            pet_samples: residue_pet_samples,
+            off_cpu_intervals: residue_off_cpu_intervals,
             function_name: Some(label),
             binary: None,
             is_main: false,
@@ -1266,17 +1427,19 @@ fn build_children_with_residue(
     (visible, residue)
 }
 
+/// `self_lookup` returns `(self_on_cpu_ns, self_pet_samples)` for an
+/// address, used to populate the annotated disassembly heatmap.
 fn compute_annotated_view(
     binaries: &Arc<RwLock<BinaryRegistry>>,
     source: &Arc<parking_lot::Mutex<source::SourceResolver>>,
     address: u64,
-    self_duration_ns: impl Fn(u64) -> u64,
+    self_lookup: impl Fn(u64) -> (u64, u64),
 ) -> AnnotatedView {
     let resolved = binaries.write().resolve(address);
 
     let mut hl = highlight::AsmHighlighter::new();
     let mut lines: Vec<AnnotatedLine> = match &resolved {
-        Some(r) => disassemble::disassemble(r, &mut hl, |addr| self_duration_ns(addr)),
+        Some(r) => disassemble::disassemble(r, &mut hl, |addr| self_lookup(addr)),
         None => Vec::new(),
     };
 
@@ -1332,23 +1495,19 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
-                    LiveEvent::Sample {
+                    LiveEvent::PetSample {
                         tid,
                         timestamp_ns,
-                        duration_ns,
                         user_addrs,
-                        is_offcpu,
                         cycles,
                         instructions,
                         l1d_misses,
                         branch_mispreds,
                     } => {
-                        aggregator.write().record(
+                        aggregator.write().record_pet_sample(
                             tid,
                             timestamp_ns,
-                            duration_ns,
                             &user_addrs,
-                            is_offcpu,
                             PmuSample {
                                 cycles,
                                 instructions,
@@ -1356,6 +1515,29 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
                                 branch_mispreds,
                             },
                         );
+                    }
+                    LiveEvent::CpuInterval {
+                        tid,
+                        start_ns,
+                        end_ns,
+                        kind,
+                    } => {
+                        let kind = match kind {
+                            CpuIntervalKind::OnCpu => IntervalKind::OnCpu,
+                            CpuIntervalKind::OffCpu {
+                                stack,
+                                waker_tid,
+                                waker_user_stack,
+                            } => IntervalKind::OffCpu {
+                                stack: stack.into_boxed_slice(),
+                                waker_tid,
+                                waker_user_stack: waker_user_stack
+                                    .map(|s| s.into_boxed_slice()),
+                            },
+                        };
+                        aggregator
+                            .write()
+                            .record_interval(tid, start_ns, end_ns, kind);
                     }
                     LiveEvent::Wakeup {
                         timestamp_ns,

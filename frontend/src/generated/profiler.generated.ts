@@ -21,15 +21,9 @@ export interface SymbolRef {
   binary: string | null;
 }
 
-export type SampleMode =
-  | { tag: 'Both' }
-  | { tag: 'OnCpu' }
-  | { tag: 'OffCpu' };
-
 export interface LiveFilter {
   time_range: TimeRange | null;
   exclude_symbols: SymbolRef[];
-  sample_mode: SampleMode;
 }
 
 export interface ViewParams {
@@ -37,14 +31,33 @@ export interface ViewParams {
   filter: LiveFilter;
 }
 
+export interface OffCpuBreakdown {
+  idle_ns: bigint;
+  lock_ns: bigint;
+  semaphore_ns: bigint;
+  ipc_ns: bigint;
+  io_read_ns: bigint;
+  io_write_ns: bigint;
+  readiness_ns: bigint;
+  sleep_ns: bigint;
+  connect_ns: bigint;
+  other_ns: bigint;
+}
+
 export interface TopEntry {
   address: bigint;
-  self_duration_ns: bigint;
-  total_duration_ns: bigint;
   function_name: string | null;
   binary: string | null;
   is_main: boolean;
   language: string;
+  self_on_cpu_ns: bigint;
+  total_on_cpu_ns: bigint;
+  self_off_cpu: OffCpuBreakdown;
+  total_off_cpu: OffCpuBreakdown;
+  self_pet_samples: bigint;
+  total_pet_samples: bigint;
+  self_off_cpu_intervals: bigint;
+  total_off_cpu_intervals: bigint;
   self_cycles: bigint;
   self_instructions: bigint;
   self_l1d_misses: bigint;
@@ -56,7 +69,8 @@ export interface TopEntry {
 }
 
 export interface TopUpdate {
-  total_duration_ns: bigint;
+  total_on_cpu_ns: bigint;
+  total_off_cpu: OffCpuBreakdown;
   entries: TopEntry[];
 }
 
@@ -69,7 +83,8 @@ export interface SourceHeader {
 export interface AnnotatedLine {
   address: bigint;
   html: string;
-  self_duration_ns: bigint;
+  self_on_cpu_ns: bigint;
+  self_pet_samples: bigint;
   source_header: SourceHeader | null;
 }
 
@@ -83,11 +98,14 @@ export interface AnnotatedView {
 
 export interface FlameNode {
   address: bigint;
-  duration_ns: bigint;
   function_name: number | null;
   binary: number | null;
   is_main: boolean;
   language: number;
+  on_cpu_ns: bigint;
+  off_cpu: OffCpuBreakdown;
+  pet_samples: bigint;
+  off_cpu_intervals: bigint;
   cycles: bigint;
   instructions: bigint;
   l1d_misses: bigint;
@@ -96,7 +114,8 @@ export interface FlameNode {
 }
 
 export interface FlamegraphUpdate {
-  total_duration_ns: bigint;
+  total_on_cpu_ns: bigint;
+  total_off_cpu: OffCpuBreakdown;
   strings: string[];
   root: FlameNode;
 }
@@ -104,7 +123,9 @@ export interface FlamegraphUpdate {
 export interface ThreadInfo {
   tid: number;
   name: string | null;
-  duration_ns: bigint;
+  on_cpu_ns: bigint;
+  off_cpu: OffCpuBreakdown;
+  pet_samples: bigint;
 }
 
 export interface ThreadsUpdate {
@@ -113,13 +134,15 @@ export interface ThreadsUpdate {
 
 export interface TimelineBucket {
   start_ns: bigint;
-  duration_ns: bigint;
+  on_cpu_ns: bigint;
+  off_cpu_ns: bigint;
 }
 
 export interface TimelineUpdate {
   bucket_size_ns: bigint;
   recording_duration_ns: bigint;
-  total_duration_ns: bigint;
+  total_on_cpu_ns: bigint;
+  total_off_cpu_ns: bigint;
   buckets: TimelineBucket[];
 }
 
@@ -129,7 +152,10 @@ export interface NeighborsUpdate {
   binary: number | null;
   is_main: boolean;
   language: number;
-  own_duration_ns: bigint;
+  own_on_cpu_ns: bigint;
+  own_off_cpu: OffCpuBreakdown;
+  own_pet_samples: bigint;
+  own_off_cpu_intervals: bigint;
   callers_tree: FlameNode;
   callees_tree: FlameNode;
 }
@@ -149,6 +175,51 @@ export interface WakersUpdate {
   entries: WakerEntry[];
 }
 
+export type OffCpuReason =
+  | { tag: 'Idle' }
+  | { tag: 'LockWait' }
+  | { tag: 'SemaphoreWait' }
+  | { tag: 'IpcWait' }
+  | { tag: 'IoRead' }
+  | { tag: 'IoWrite' }
+  | { tag: 'Readiness' }
+  | { tag: 'Sleep' }
+  | { tag: 'ConnectionSetup' }
+  | { tag: 'Other' };
+
+export interface IntervalEntry {
+  tid: number;
+  start_ns: bigint;
+  duration_ns: bigint;
+  reason: OffCpuReason;
+  waker_tid: number | null;
+  waker_address: bigint | null;
+  waker_function_name: number | null;
+  waker_binary: number | null;
+}
+
+export interface IntervalListUpdate {
+  strings: string[];
+  total_intervals: bigint;
+  total_duration_ns: bigint;
+  by_reason: OffCpuBreakdown;
+  entries: IntervalEntry[];
+}
+
+export interface PetSampleEntry {
+  tid: number;
+  timestamp_ns: bigint;
+  cycles: bigint;
+  instructions: bigint;
+  l1d_misses: bigint;
+  branch_mispreds: bigint;
+}
+
+export interface PetSampleListUpdate {
+  total_samples: bigint;
+  entries: PetSampleEntry[];
+}
+
 // Request/Response type aliases
 export type TopRequest = [
   number, // limit
@@ -165,8 +236,8 @@ export type SubscribeTopRequest = [
 ];
 export type SubscribeTopResponse = void;
 
-export type TotalDurationNsRequest = [];
-export type TotalDurationNsResponse = bigint;
+export type TotalOnCpuNsRequest = [];
+export type TotalOnCpuNsResponse = bigint;
 
 export type SubscribeAnnotatedRequest = [
   bigint, // address
@@ -203,6 +274,20 @@ export type SubscribeWakersRequest = [
 ];
 export type SubscribeWakersResponse = void;
 
+export type SubscribeIntervalsRequest = [
+  string, // flame_key
+  ViewParams, // params
+  Tx<IntervalListUpdate>, // output
+];
+export type SubscribeIntervalsResponse = void;
+
+export type SubscribePetSamplesRequest = [
+  string, // flame_key
+  ViewParams, // params
+  Tx<PetSampleListUpdate>, // output
+];
+export type SubscribePetSamplesResponse = void;
+
 export type SetPausedRequest = [boolean];
 export type SetPausedResponse = void;
 
@@ -218,11 +303,12 @@ export interface ProfilerCaller {
   top(limit: number, sort: TopSort, params: ViewParams): Promise<TopEntry[]>;
   subscribeTop(limit: number, sort: TopSort, params: ViewParams, output: Tx<TopUpdate>): Promise<void>;
   /**
-   * Total wall-clock time covered by samples, across every
-   * thread, in nanoseconds. The recorder's `T s elapsed` reading
-   * is `total_duration_ns / 1e9`.
+   * Total on-CPU time across every thread, in nanoseconds.
+   * Bounded by `cores × wall_time` (you can't be on more than one
+   * CPU at a time, and there are only so many CPUs). Useful for
+   * "X CPU-seconds across the recording" displays.
    */
-  totalDurationNs(): Promise<bigint>;
+  totalOnCpuNs(): Promise<bigint>;
   subscribeAnnotated(address: bigint, params: ViewParams, output: Tx<AnnotatedView>): Promise<void>;
   subscribeFlamegraph(params: ViewParams, output: Tx<FlamegraphUpdate>): Promise<void>;
   subscribeThreads(output: Tx<ThreadsUpdate>): Promise<void>;
@@ -240,6 +326,21 @@ export interface ProfilerCaller {
    * threads).
    */
   subscribeWakers(wakeeTid: number, output: Tx<WakersUpdate>): Promise<void>;
+  /**
+   * Stream the off-CPU intervals attributed to a single stack
+   * node, in chronological order. Lets the UI drill into a flame
+   * box and see "this stack was blocked here for 12ms, here for
+   * 30ms..." with each interval colored by reason and clickable
+   * to surface the waker. `flame_key` matches the `r/2/1/0`
+   * addressing the frontend already uses for focus.
+   */
+  subscribeIntervals(flameKey: string, params: ViewParams, output: Tx<IntervalListUpdate>): Promise<void>;
+  /**
+   * Stream the PET stack-walk hits attributed to a single stack
+   * node, in chronological order. Symmetric counterpart to
+   * `subscribe_intervals` for the on-CPU side.
+   */
+  subscribePetSamples(flameKey: string, params: ViewParams, output: Tx<PetSampleListUpdate>): Promise<void>;
   /**
    * Pause / resume live ingestion. While paused, new samples and
    * wakeup edges from the recorder get dropped before reaching
@@ -305,15 +406,16 @@ export class ProfilerClient implements ProfilerCaller {
   }
 
   /**
-   * Total wall-clock time covered by samples, across every
-   * thread, in nanoseconds. The recorder's `T s elapsed` reading
-   * is `total_duration_ns / 1e9`.
+   * Total on-CPU time across every thread, in nanoseconds.
+   * Bounded by `cores × wall_time` (you can't be on more than one
+   * CPU at a time, and there are only so many CPUs). Useful for
+   * "X CPU-seconds across the recording" displays.
    */
-  async totalDurationNs(): Promise<bigint> {
-    const descriptor = profiler_totalDurationNs_method;
+  async totalOnCpuNs(): Promise<bigint> {
+    const descriptor = profiler_totalOnCpuNs_method;
     const sendSchemas = profiler_descriptor.send_schemas;
       const value = await this.caller.call({
-        method: "Profiler.totalDurationNs",
+        method: "Profiler.totalOnCpuNs",
         args: {},
         descriptor,
         sendSchemas,
@@ -501,6 +603,75 @@ export class ProfilerClient implements ProfilerCaller {
   }
 
   /**
+   * Stream the off-CPU intervals attributed to a single stack
+   * node, in chronological order. Lets the UI drill into a flame
+   * box and see "this stack was blocked here for 12ms, here for
+   * 30ms..." with each interval colored by reason and clickable
+   * to surface the waker. `flame_key` matches the `r/2/1/0`
+   * addressing the frontend already uses for focus.
+   */
+  async subscribeIntervals(flameKey: string, params: ViewParams, output: Tx<IntervalListUpdate>): Promise<void> {
+    const descriptor = profiler_subscribeIntervals_method;
+    const sendSchemas = profiler_descriptor.send_schemas;
+    const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
+    const prepareRetry = () => {
+      const channels = bindChannelsForTypeRefs(
+        argTypeRefs,
+        [flameKey, params, output],
+        this.caller.getChannelAllocator(),
+        this.caller.getChannelRegistry(),
+        sendSchemas.schemas,
+      );
+      const payload = new Uint8Array(0);
+      return { payload, channels };
+    };
+    const { channels } = prepareRetry();
+      const value = await this.caller.call({
+        method: "Profiler.subscribeIntervals",
+        args: { flameKey, params, output },
+        descriptor,
+        sendSchemas,
+        channels,
+        prepareRetry,
+        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [flameKey, params, output], sendSchemas.schemas),
+      });
+      return value as void;
+  }
+
+  /**
+   * Stream the PET stack-walk hits attributed to a single stack
+   * node, in chronological order. Symmetric counterpart to
+   * `subscribe_intervals` for the on-CPU side.
+   */
+  async subscribePetSamples(flameKey: string, params: ViewParams, output: Tx<PetSampleListUpdate>): Promise<void> {
+    const descriptor = profiler_subscribePetSamples_method;
+    const sendSchemas = profiler_descriptor.send_schemas;
+    const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
+    const prepareRetry = () => {
+      const channels = bindChannelsForTypeRefs(
+        argTypeRefs,
+        [flameKey, params, output],
+        this.caller.getChannelAllocator(),
+        this.caller.getChannelRegistry(),
+        sendSchemas.schemas,
+      );
+      const payload = new Uint8Array(0);
+      return { payload, channels };
+    };
+    const { channels } = prepareRetry();
+      const value = await this.caller.call({
+        method: "Profiler.subscribePetSamples",
+        args: { flameKey, params, output },
+        descriptor,
+        sendSchemas,
+        channels,
+        prepareRetry,
+        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [flameKey, params, output], sendSchemas.schemas),
+      });
+      return value as void;
+  }
+
+  /**
    * Pause / resume live ingestion. While paused, new samples and
    * wakeup edges from the recorder get dropped before reaching
    * the aggregator -- frozen views, no client churn -- but the
@@ -551,13 +722,15 @@ export async function connectProfiler(
 export interface ProfilerHandler {
   top(limit: number, sort: TopSort, params: ViewParams): Promise<TopEntry[]> | TopEntry[];
   subscribeTop(limit: number, sort: TopSort, params: ViewParams, output: Tx<TopUpdate>): Promise<void> | void;
-  totalDurationNs(): Promise<bigint> | bigint;
+  totalOnCpuNs(): Promise<bigint> | bigint;
   subscribeAnnotated(address: bigint, params: ViewParams, output: Tx<AnnotatedView>): Promise<void> | void;
   subscribeFlamegraph(params: ViewParams, output: Tx<FlamegraphUpdate>): Promise<void> | void;
   subscribeThreads(output: Tx<ThreadsUpdate>): Promise<void> | void;
   subscribeTimeline(tid: number | null, output: Tx<TimelineUpdate>): Promise<void> | void;
   subscribeNeighbors(address: bigint, params: ViewParams, output: Tx<NeighborsUpdate>): Promise<void> | void;
   subscribeWakers(wakeeTid: number, output: Tx<WakersUpdate>): Promise<void> | void;
+  subscribeIntervals(flameKey: string, params: ViewParams, output: Tx<IntervalListUpdate>): Promise<void> | void;
+  subscribePetSamples(flameKey: string, params: ViewParams, output: Tx<PetSampleListUpdate>): Promise<void> | void;
   setPaused(paused: boolean): Promise<void> | void;
   isPaused(): Promise<boolean> | boolean;
 }
@@ -590,9 +763,9 @@ export class ProfilerDispatcher implements Dispatcher {
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
       }
-    } else if (method.id === 0xb844a1afad0be4d7n) {
+    } else if (method.id === 0xe2829a21383119b4n) {
       try {
-        const result = await this.handler.totalDurationNs();
+        const result = await this.handler.totalOnCpuNs();
         call.reply(result);
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
@@ -645,6 +818,22 @@ export class ProfilerDispatcher implements Dispatcher {
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
       }
+    } else if (method.id === 0xc689c5fb8e7ec474n) {
+      try {
+        const result = await this.handler.subscribeIntervals(args[0] as string, args[1] as ViewParams, args[2] as Tx<IntervalListUpdate>);
+        (args[2] as { close(): void }).close(); // close output before reply
+        call.reply(result);
+      } catch (error) {
+        call.replyInternalError(error instanceof Error ? error.message : String(error));
+      }
+    } else if (method.id === 0xca1b65cabd8a8f38n) {
+      try {
+        const result = await this.handler.subscribePetSamples(args[0] as string, args[1] as ViewParams, args[2] as Tx<PetSampleListUpdate>);
+        (args[2] as { close(): void }).close(); // close output before reply
+        call.reply(result);
+      } catch (error) {
+        call.replyInternalError(error instanceof Error ? error.message : String(error));
+      }
     } else if (method.id === 0x0ffcbbadd058c8f7n) {
       try {
         const result = await this.handler.setPaused(args[0] as boolean);
@@ -679,40 +868,47 @@ export const profiler_send_schemas: import("@bearcove/vox-core").ServiceSendSche
     [0x68892f74829bd154n, { id: 0x68892f74829bd154n, type_params: [], kind: { tag: 'struct', name: 'TimeRange', fields: [{ name: 'start_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'end_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
     [0xbc88382e830f9c36n, { id: 0xbc88382e830f9c36n, type_params: [], kind: { tag: 'struct', name: 'SymbolRef', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }] } }],
     [0x0a96b404b4d79d67n, { id: 0x0a96b404b4d79d67n, type_params: ['T'], kind: { tag: 'list', element: { tag: 'var', name: 'T' } } }],
-    [0xa56c5aa60605e243n, { id: 0xa56c5aa60605e243n, type_params: [], kind: { tag: 'enum', name: 'SampleMode', variants: [{ name: 'Both', index: 0, payload: { tag: 'unit' } }, { name: 'OnCpu', index: 1, payload: { tag: 'unit' } }, { name: 'OffCpu', index: 2, payload: { tag: 'unit' } }] } }],
-    [0xb98e7d1f98d5e9abn, { id: 0xb98e7d1f98d5e9abn, type_params: [], kind: { tag: 'struct', name: 'LiveFilter', fields: [{ name: 'time_range', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x68892f74829bd154n, args: [] }] }, required: true }, { name: 'exclude_symbols', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xbc88382e830f9c36n, args: [] }] }, required: true }, { name: 'sample_mode', type_ref: { tag: 'concrete', type_id: 0xa56c5aa60605e243n, args: [] }, required: true }] } }],
-    [0x6353fa11ad0f6f57n, { id: 0x6353fa11ad0f6f57n, type_params: [], kind: { tag: 'struct', name: 'ViewParams', fields: [{ name: 'tid', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'filter', type_ref: { tag: 'concrete', type_id: 0xb98e7d1f98d5e9abn, args: [] }, required: true }] } }],
+    [0xce2c9daef1e9c914n, { id: 0xce2c9daef1e9c914n, type_params: [], kind: { tag: 'struct', name: 'LiveFilter', fields: [{ name: 'time_range', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x68892f74829bd154n, args: [] }] }, required: true }, { name: 'exclude_symbols', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xbc88382e830f9c36n, args: [] }] }, required: true }] } }],
+    [0x6f5fed68b5ace623n, { id: 0x6f5fed68b5ace623n, type_params: [], kind: { tag: 'struct', name: 'ViewParams', fields: [{ name: 'tid', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'filter', type_ref: { tag: 'concrete', type_id: 0xce2c9daef1e9c914n, args: [] }, required: true }] } }],
     [0xaa510ab07d34f141n, { id: 0xaa510ab07d34f141n, type_params: ['T0', 'T1', 'T2'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }, { tag: 'var', name: 'T2' }] } }],
-    [0xaab0f10ba893000dn, { id: 0xaab0f10ba893000dn, type_params: [], kind: { tag: 'struct', name: 'TopEntry', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'self_cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
-    [0x9371661290335ce2n, { id: 0x9371661290335ce2n, type_params: [], kind: { tag: 'struct', name: 'TopUpdate', fields: [{ name: 'total_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'entries', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xaab0f10ba893000dn, args: [] }] }, required: true }] } }],
+    [0xa6544bf68ad6b55cn, { id: 0xa6544bf68ad6b55cn, type_params: [], kind: { tag: 'struct', name: 'OffCpuBreakdown', fields: [{ name: 'idle_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'lock_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'semaphore_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'ipc_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'io_read_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'io_write_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'readiness_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'sleep_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'connect_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'other_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0x5973fe57ec11dd2fn, { id: 0x5973fe57ec11dd2fn, type_params: [], kind: { tag: 'struct', name: 'TopEntry', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'self_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'total_off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'self_pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_off_cpu_intervals', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_off_cpu_intervals', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0xf37cef8f274712ban, { id: 0xf37cef8f274712ban, type_params: [], kind: { tag: 'struct', name: 'TopUpdate', fields: [{ name: 'total_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'entries', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x5973fe57ec11dd2fn, args: [] }] }, required: true }] } }],
     [0xc886545a493d06ebn, { id: 0xc886545a493d06ebn, type_params: ['T'], kind: { tag: 'channel', direction: 'tx', element: { tag: 'var', name: 'T' } } }],
     [0x915c6fb5b64f270bn, { id: 0x915c6fb5b64f270bn, type_params: ['T0', 'T1', 'T2', 'T3'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }, { tag: 'var', name: 'T2' }, { tag: 'var', name: 'T3' }] } }],
     [0xbc5c33249a2dc720n, { id: 0xbc5c33249a2dc720n, type_params: [], kind: { tag: 'primitive', primitive_type: 'unit' } }],
     [0xa8c9da7259d0084cn, { id: 0xa8c9da7259d0084cn, type_params: [], kind: { tag: 'struct', name: 'SourceHeader', fields: [{ name: 'file', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'line', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'html', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }],
-    [0x03a53adeaa3cf060n, { id: 0x03a53adeaa3cf060n, type_params: [], kind: { tag: 'struct', name: 'AnnotatedLine', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'html', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'self_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'source_header', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xa8c9da7259d0084cn, args: [] }] }, required: true }] } }],
-    [0x33a736e90dfbb1a9n, { id: 0x33a736e90dfbb1a9n, type_params: [], kind: { tag: 'struct', name: 'AnnotatedView', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'base_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'queried_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'lines', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x03a53adeaa3cf060n, args: [] }] }, required: true }] } }],
-    [0xbbda0aaf275c85dbn, { id: 0xbbda0aaf275c85dbn, type_params: [], kind: { tag: 'struct', name: 'FlameNode', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'children', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xbbda0aaf275c85dbn, args: [] }] }, required: true }] } }],
-    [0x0daa079fbb937e3en, { id: 0x0daa079fbb937e3en, type_params: [], kind: { tag: 'struct', name: 'FlamegraphUpdate', fields: [{ name: 'total_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'strings', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'root', type_ref: { tag: 'concrete', type_id: 0xbbda0aaf275c85dbn, args: [] }, required: true }] } }],
+    [0x221c376d3d0775c7n, { id: 0x221c376d3d0775c7n, type_params: [], kind: { tag: 'struct', name: 'AnnotatedLine', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'html', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'self_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'source_header', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xa8c9da7259d0084cn, args: [] }] }, required: true }] } }],
+    [0xcac80352e0417711n, { id: 0xcac80352e0417711n, type_params: [], kind: { tag: 'struct', name: 'AnnotatedView', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'base_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'queried_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'lines', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x221c376d3d0775c7n, args: [] }] }, required: true }] } }],
+    [0xacd4834091495bcen, { id: 0xacd4834091495bcen, type_params: [], kind: { tag: 'struct', name: 'FlameNode', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu_intervals', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'children', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xacd4834091495bcen, args: [] }] }, required: true }] } }],
+    [0x240883a6784a0dden, { id: 0x240883a6784a0dden, type_params: [], kind: { tag: 'struct', name: 'FlamegraphUpdate', fields: [{ name: 'total_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'strings', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'root', type_ref: { tag: 'concrete', type_id: 0xacd4834091495bcen, args: [] }, required: true }] } }],
     [0xba0496aa8cee7a4cn, { id: 0xba0496aa8cee7a4cn, type_params: ['T0', 'T1'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }] } }],
-    [0x2c238a01d8fa6eb1n, { id: 0x2c238a01d8fa6eb1n, type_params: [], kind: { tag: 'struct', name: 'ThreadInfo', fields: [{ name: 'tid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
-    [0x86b13e50ad209b9an, { id: 0x86b13e50ad209b9an, type_params: [], kind: { tag: 'struct', name: 'ThreadsUpdate', fields: [{ name: 'threads', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x2c238a01d8fa6eb1n, args: [] }] }, required: true }] } }],
+    [0x280e4b7bd3c1857fn, { id: 0x280e4b7bd3c1857fn, type_params: [], kind: { tag: 'struct', name: 'ThreadInfo', fields: [{ name: 'tid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0x2c384616cb5c3aden, { id: 0x2c384616cb5c3aden, type_params: [], kind: { tag: 'struct', name: 'ThreadsUpdate', fields: [{ name: 'threads', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x280e4b7bd3c1857fn, args: [] }] }, required: true }] } }],
     [0x6847ab90feda71c1n, { id: 0x6847ab90feda71c1n, type_params: ['T0'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }] } }],
-    [0xbd16a002cf7011aen, { id: 0xbd16a002cf7011aen, type_params: [], kind: { tag: 'struct', name: 'TimelineBucket', fields: [{ name: 'start_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
-    [0x2aa7f26e8c384e2cn, { id: 0x2aa7f26e8c384e2cn, type_params: [], kind: { tag: 'struct', name: 'TimelineUpdate', fields: [{ name: 'bucket_size_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'recording_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'buckets', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xbd16a002cf7011aen, args: [] }] }, required: true }] } }],
-    [0x3334b6f519c81359n, { id: 0x3334b6f519c81359n, type_params: [], kind: { tag: 'struct', name: 'NeighborsUpdate', fields: [{ name: 'strings', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'own_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'callers_tree', type_ref: { tag: 'concrete', type_id: 0xbbda0aaf275c85dbn, args: [] }, required: true }, { name: 'callees_tree', type_ref: { tag: 'concrete', type_id: 0xbbda0aaf275c85dbn, args: [] }, required: true }] } }],
+    [0x32ec7bb903ef97ddn, { id: 0x32ec7bb903ef97ddn, type_params: [], kind: { tag: 'struct', name: 'TimelineBucket', fields: [{ name: 'start_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0x850d6eed797249ffn, { id: 0x850d6eed797249ffn, type_params: [], kind: { tag: 'struct', name: 'TimelineUpdate', fields: [{ name: 'bucket_size_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'recording_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_off_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'buckets', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x32ec7bb903ef97ddn, args: [] }] }, required: true }] } }],
+    [0x3b0d82ca26ca8011n, { id: 0x3b0d82ca26ca8011n, type_params: [], kind: { tag: 'struct', name: 'NeighborsUpdate', fields: [{ name: 'strings', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'own_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'own_off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'own_pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'own_off_cpu_intervals', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'callers_tree', type_ref: { tag: 'concrete', type_id: 0xacd4834091495bcen, args: [] }, required: true }, { name: 'callees_tree', type_ref: { tag: 'concrete', type_id: 0xacd4834091495bcen, args: [] }, required: true }] } }],
     [0xdd37b6551b52fb4fn, { id: 0xdd37b6551b52fb4fn, type_params: [], kind: { tag: 'struct', name: 'WakerEntry', fields: [{ name: 'waker_tid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'waker_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'waker_function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'waker_binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'count', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
     [0x5ce6ea672e206d3en, { id: 0x5ce6ea672e206d3en, type_params: [], kind: { tag: 'struct', name: 'WakersUpdate', fields: [{ name: 'wakee_tid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'total_wakeups', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'entries', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xdd37b6551b52fb4fn, args: [] }] }, required: true }] } }],
+    [0xd4aa7ad5e9292896n, { id: 0xd4aa7ad5e9292896n, type_params: [], kind: { tag: 'enum', name: 'OffCpuReason', variants: [{ name: 'Idle', index: 0, payload: { tag: 'unit' } }, { name: 'LockWait', index: 1, payload: { tag: 'unit' } }, { name: 'SemaphoreWait', index: 2, payload: { tag: 'unit' } }, { name: 'IpcWait', index: 3, payload: { tag: 'unit' } }, { name: 'IoRead', index: 4, payload: { tag: 'unit' } }, { name: 'IoWrite', index: 5, payload: { tag: 'unit' } }, { name: 'Readiness', index: 6, payload: { tag: 'unit' } }, { name: 'Sleep', index: 7, payload: { tag: 'unit' } }, { name: 'ConnectionSetup', index: 8, payload: { tag: 'unit' } }, { name: 'Other', index: 9, payload: { tag: 'unit' } }] } }],
+    [0x697260434424b795n, { id: 0x697260434424b795n, type_params: [], kind: { tag: 'struct', name: 'IntervalEntry', fields: [{ name: 'tid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'start_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'reason', type_ref: { tag: 'concrete', type_id: 0xd4aa7ad5e9292896n, args: [] }, required: true }, { name: 'waker_tid', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'waker_address', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }] }, required: true }, { name: 'waker_function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'waker_binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }] } }],
+    [0xe0dc192175c3c123n, { id: 0xe0dc192175c3c123n, type_params: [], kind: { tag: 'struct', name: 'IntervalListUpdate', fields: [{ name: 'strings', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'total_intervals', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_duration_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'by_reason', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'entries', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x697260434424b795n, args: [] }] }, required: true }] } }],
+    [0x8ff4ce59f1e94d72n, { id: 0x8ff4ce59f1e94d72n, type_params: [], kind: { tag: 'struct', name: 'PetSampleEntry', fields: [{ name: 'tid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'timestamp_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0xd6af01229bc47f82n, { id: 0xd6af01229bc47f82n, type_params: [], kind: { tag: 'struct', name: 'PetSampleListUpdate', fields: [{ name: 'total_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'entries', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x8ff4ce59f1e94d72n, args: [] }] }, required: true }] } }],
   ]),
   methods: new Map<bigint, import("@bearcove/vox-core").MethodSendSchemas>([
-    [0x4eb5e594c5e49e21n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0x6353fa11ad0f6f57n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xaab0f10ba893000dn, args: [] }] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0x5e5b065bf333971bn, { argsRootRef: { tag: 'concrete', type_id: 0x915c6fb5b64f270bn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0x6353fa11ad0f6f57n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x9371661290335ce2n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0xb844a1afad0be4d7n, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0xbd08d48f35f68c69n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6353fa11ad0f6f57n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x33a736e90dfbb1a9n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0x6889c2c730466af0n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x6353fa11ad0f6f57n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x0daa079fbb937e3en, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0xbf5f73ea223d9f7dn, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x86b13e50ad209b9an, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0xc3381210c17fc3c4n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x2aa7f26e8c384e2cn, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0x42acdf6aa85cc2d3n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6353fa11ad0f6f57n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x3334b6f519c81359n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x4eb5e594c5e49e21n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x5973fe57ec11dd2fn, args: [] }] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x5e5b065bf333971bn, { argsRootRef: { tag: 'concrete', type_id: 0x915c6fb5b64f270bn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xf37cef8f274712ban, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xe2829a21383119b4n, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xbd08d48f35f68c69n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xcac80352e0417711n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x6889c2c730466af0n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x240883a6784a0dden, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xbf5f73ea223d9f7dn, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x2c384616cb5c3aden, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xc3381210c17fc3c4n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x850d6eed797249ffn, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x42acdf6aa85cc2d3n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x3b0d82ca26ca8011n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xc6ab2f2a4444e87cn, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x5ce6ea672e206d3en, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xc689c5fb8e7ec474n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xe0dc192175c3c123n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xca1b65cabd8a8f38n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xd6af01229bc47f82n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x0ffcbbadd058c8f7n, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xfbcae644722d364en, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
   ]),
@@ -730,9 +926,9 @@ export const profiler_subscribeTop_method: MethodDescriptor = {
   retry: { persist: false, idem: false },
 };
 
-export const profiler_totalDurationNs_method: MethodDescriptor = {
-  name: 'totalDurationNs',
-  id: 0xb844a1afad0be4d7n,
+export const profiler_totalOnCpuNs_method: MethodDescriptor = {
+  name: 'totalOnCpuNs',
+  id: 0xe2829a21383119b4n,
   retry: { persist: false, idem: false },
 };
 
@@ -772,6 +968,18 @@ export const profiler_subscribeWakers_method: MethodDescriptor = {
   retry: { persist: false, idem: false },
 };
 
+export const profiler_subscribeIntervals_method: MethodDescriptor = {
+  name: 'subscribeIntervals',
+  id: 0xc689c5fb8e7ec474n,
+  retry: { persist: false, idem: false },
+};
+
+export const profiler_subscribePetSamples_method: MethodDescriptor = {
+  name: 'subscribePetSamples',
+  id: 0xca1b65cabd8a8f38n,
+  retry: { persist: false, idem: false },
+};
+
 export const profiler_setPaused_method: MethodDescriptor = {
   name: 'setPaused',
   id: 0x0ffcbbadd058c8f7n,
@@ -791,13 +999,15 @@ export const profiler_descriptor: ServiceDescriptor = {
   methods: new Map<bigint, MethodDescriptor>([
     [profiler_top_method.id, profiler_top_method],
     [profiler_subscribeTop_method.id, profiler_subscribeTop_method],
-    [profiler_totalDurationNs_method.id, profiler_totalDurationNs_method],
+    [profiler_totalOnCpuNs_method.id, profiler_totalOnCpuNs_method],
     [profiler_subscribeAnnotated_method.id, profiler_subscribeAnnotated_method],
     [profiler_subscribeFlamegraph_method.id, profiler_subscribeFlamegraph_method],
     [profiler_subscribeThreads_method.id, profiler_subscribeThreads_method],
     [profiler_subscribeTimeline_method.id, profiler_subscribeTimeline_method],
     [profiler_subscribeNeighbors_method.id, profiler_subscribeNeighbors_method],
     [profiler_subscribeWakers_method.id, profiler_subscribeWakers_method],
+    [profiler_subscribeIntervals_method.id, profiler_subscribeIntervals_method],
+    [profiler_subscribePetSamples_method.id, profiler_subscribePetSamples_method],
     [profiler_setPaused_method.id, profiler_setPaused_method],
     [profiler_isPaused_method.id, profiler_isPaused_method],
   ]),

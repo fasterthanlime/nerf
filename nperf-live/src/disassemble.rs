@@ -13,10 +13,13 @@ use yaxpeax_x86::amd64::InstDecoder as Amd64Decoder;
 use crate::binaries::ResolvedAddress;
 use crate::highlight::AsmHighlighter;
 
+/// Disassemble `resolved`'s bytes and look up per-instruction stats
+/// via `self_lookup`, which returns `(self_on_cpu_ns, self_pet_samples)`
+/// for the address at each line.
 pub fn disassemble(
     resolved: &ResolvedAddress,
     hl: &mut AsmHighlighter,
-    mut self_duration_ns: impl FnMut(u64) -> u64,
+    mut self_lookup: impl FnMut(u64) -> (u64, u64),
 ) -> Vec<AnnotatedLine> {
     let arch = resolved
         .arch
@@ -24,9 +27,9 @@ pub fn disassemble(
         .unwrap_or(host_arch());
     match arch {
         "aarch64" | "arm64" | "arm64e" => {
-            disassemble_aarch64(resolved, hl, &mut self_duration_ns)
+            disassemble_aarch64(resolved, hl, &mut self_lookup)
         }
-        "amd64" | "x86_64" | "x86_64h" => disassemble_amd64(resolved, hl, &mut self_duration_ns),
+        "amd64" | "x86_64" | "x86_64h" => disassemble_amd64(resolved, hl, &mut self_lookup),
         _ => Vec::new(),
     }
 }
@@ -44,7 +47,7 @@ fn host_arch() -> &'static str {
 fn disassemble_aarch64(
     resolved: &ResolvedAddress,
     hl: &mut AsmHighlighter,
-    self_duration_ns: &mut dyn FnMut(u64) -> u64,
+    self_lookup: &mut dyn FnMut(u64) -> (u64, u64),
 ) -> Vec<AnnotatedLine> {
     let decoder = Aarch64Decoder::default();
     let bytes = &resolved.bytes;
@@ -59,10 +62,12 @@ fn disassemble_aarch64(
             Err(err) => format!("<decode error: {}>", err),
         };
         let address = base + offset as u64;
+        let (on_cpu_ns, pet_samples) = self_lookup(address);
         out.push(AnnotatedLine {
             address,
             html: hl.highlight_line(&asm),
-            self_duration_ns: self_duration_ns(address),
+            self_on_cpu_ns: on_cpu_ns,
+            self_pet_samples: pet_samples,
             source_header: None,
         });
         offset += 4;
@@ -73,7 +78,7 @@ fn disassemble_aarch64(
 fn disassemble_amd64(
     resolved: &ResolvedAddress,
     hl: &mut AsmHighlighter,
-    self_duration_ns: &mut dyn FnMut(u64) -> u64,
+    self_lookup: &mut dyn FnMut(u64) -> (u64, u64),
 ) -> Vec<AnnotatedLine> {
     let decoder = Amd64Decoder::default();
     let bytes = &resolved.bytes;
@@ -82,6 +87,7 @@ fn disassemble_amd64(
     let mut offset = 0;
     while offset < bytes.len() {
         let address = base + offset as u64;
+        let (on_cpu_ns, pet_samples) = self_lookup(address);
         match decoder.decode_slice(&bytes[offset..]) {
             Ok(instr) => {
                 let len = instr.len().to_const() as usize;
@@ -89,7 +95,8 @@ fn disassemble_amd64(
                 out.push(AnnotatedLine {
                     address,
                     html: hl.highlight_line(&asm),
-                    self_duration_ns: self_duration_ns(address),
+                    self_on_cpu_ns: on_cpu_ns,
+                    self_pet_samples: pet_samples,
                     source_header: None,
                 });
                 offset += len.max(1);
@@ -98,7 +105,8 @@ fn disassemble_amd64(
                 out.push(AnnotatedLine {
                     address,
                     html: hl.highlight_line(&format!("<decode error: {}>", err)),
-                    self_duration_ns: self_duration_ns(address),
+                    self_on_cpu_ns: on_cpu_ns,
+                    self_pet_samples: pet_samples,
                     source_header: None,
                 });
                 offset += 1;
