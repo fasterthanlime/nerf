@@ -413,7 +413,16 @@ fn open_sink(
     exe_path: &str,
     args: &args::RecordArgs,
 ) -> Result<MacSink, Box<dyn Error>> {
-    let writer = BufWriter::new(File::create(output_path)?);
+    // Bare File::create errors print as "Permission denied (os
+    // error 13)" with no path, which is unactionable. The most common
+    // case is leftover root-owned files from an earlier sudo'd run;
+    // include both the path and the underlying io::Error so the user
+    // can `ls -la` it without guessing.
+    let writer = BufWriter::new(
+        File::create(output_path).map_err(|err| {
+            format!("opening output file {}: {err}", output_path.display())
+        })?,
+    );
     let mut sink = MacSink::new(writer, pid)?;
 
     sink.write_packet(Packet::Header {
