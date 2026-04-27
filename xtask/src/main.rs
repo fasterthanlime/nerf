@@ -137,15 +137,39 @@ fn install_server_launch_agent(cargo_bin: &Path) -> Result<(), Box<dyn Error>> {
         .args(["bootstrap", &domain])
         .arg(&plist_dst)
         .status()?;
-    if !status.success() {
-        return Err(format!(
-            "launchctl bootstrap exited with {status} (try `launchctl load {}` manually)",
-            plist_dst.display()
-        )
-        .into());
+    if status.success() {
+        println!(":: stax-server LaunchAgent loaded.");
+        return Ok(());
     }
-    println!(":: stax-server LaunchAgent loaded.");
-    Ok(())
+
+    // Bootstrap exit 5 ("Input/output error") usually means "still
+    // loaded" — bootout returns before launchd has actually torn
+    // the service down. If that's what happened, just kickstart
+    // it: re-exec the current label with the binary we just wrote.
+    let print_status = Command::new("launchctl")
+        .args(["print", &label_target])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok();
+    if matches!(print_status, Some(s) if s.success()) {
+        println!(":: bootstrap reported {status} but {label_target} is loaded;");
+        println!("::   running launchctl kickstart -k {label_target} instead");
+        let kick = Command::new("launchctl")
+            .args(["kickstart", "-k", &label_target])
+            .status()?;
+        if kick.success() {
+            println!(":: stax-server kickstarted with the new binary.");
+            return Ok(());
+        }
+        return Err(format!("launchctl kickstart exited with {kick}").into());
+    }
+
+    Err(format!(
+        "launchctl bootstrap exited with {status} (try `launchctl load {}` manually)",
+        plist_dst.display()
+    )
+    .into())
 }
 
 #[cfg(target_os = "macos")]
