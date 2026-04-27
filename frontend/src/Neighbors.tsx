@@ -67,10 +67,10 @@ function layout(
       if (depth > maxDepth) maxDepth = depth;
     }
     const span = x1 - x0;
-    const denom = node.duration_ns > 0n ? Number(node.duration_ns) : 1;
+    const denom = node.on_cpu_ns > 0n ? Number(node.on_cpu_ns) : 1;
     let cursor = x0;
     node.children.forEach((c, i) => {
-      const cw = (Number(c.duration_ns) / denom) * span;
+      const cw = (Number(c.on_cpu_ns) / denom) * span;
       if (c.address !== 0n && hiddenKinds.has(objKindOf(c))) {
         cursor += cw;
         return;
@@ -132,7 +132,7 @@ function FamilyChart({
   const { boxes, depth } = layout(root, hiddenKinds, true);
   const rows = depth + 1;
   const height = rows * ROW_H;
-  const total = root.duration_ns;
+  const total = root.on_cpu_ns;
 
   if (boxes.length === 0) {
     return <div className="family-empty">{empty}</div>;
@@ -167,7 +167,7 @@ function FamilyChart({
                 kind: objKindOf(b.node),
               });
             }}
-            title={`${labelFor(b.node)} · ${formatDuration(b.node.duration_ns)} / ${formatDuration(total)} · ${pct(b.node.duration_ns, total)}`}
+            title={`${labelFor(b.node)} · ${formatDuration(b.node.on_cpu_ns)} / ${formatDuration(total)} · ${pct(b.node.on_cpu_ns, total)}`}
           >
             {widthPct > 2 ? <FamilyBoxLabel node={b.node} /> : null}
           </div>
@@ -254,7 +254,7 @@ export function Neighbors({
           {update.function_name ?? `0x${address.toString(16)}`}
         </span>
         <span className="family-target-meta">
-          {formatDuration(update.own_duration_ns)}
+          {formatDuration(update.own_on_cpu_ns)}
           {update.binary ? ` · ${update.binary}` : ""}
         </span>
       </div>

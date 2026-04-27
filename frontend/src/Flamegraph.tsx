@@ -102,10 +102,10 @@ function layout(
     });
     if (depth > maxDepth) maxDepth = depth;
     const span = x1 - x0;
-    const denom = node.duration_ns > 0n ? Number(node.duration_ns) : 1;
+    const denom = node.on_cpu_ns > 0n ? Number(node.on_cpu_ns) : 1;
     let cursor = x0;
     node.children.forEach((c, i) => {
-      const cw = (Number(c.duration_ns) / denom) * span;
+      const cw = (Number(c.on_cpu_ns) / denom) * span;
       // Address 0 = synthetic root marker; never filter that out.
       if (c.address !== 0n && hiddenKinds.has(objKindOf(c))) {
         cursor += cw;
@@ -283,7 +283,7 @@ export function Flamegraph({
     ? layout(renderRoot, hiddenKinds)
     : { boxes: [], depth: 0 };
   const innerHeight = (depth + 1) * ROW_H;
-  const total = update?.total_duration_ns ?? 0n;
+  const total = update?.total_on_cpu_ns ?? 0n;
 
   return (
     <div
@@ -339,8 +339,8 @@ export function Flamegraph({
           <>
             <span className="flame-status-label">{labelFor(hover.node)}</span>
             <span className="flame-status-meta">
-              {formatDuration(hover.node.duration_ns)} / {formatDuration(total)} ·{" "}
-              {pct(hover.node.duration_ns, total)}
+              {formatDuration(hover.node.on_cpu_ns)} / {formatDuration(total)} ·{" "}
+              {pct(hover.node.on_cpu_ns, total)}
               {ipcFor(hover.node) ? ` · ${ipcFor(hover.node)} ipc` : ""}
               {hover.node.binary ? ` · ${hover.node.binary}` : ""}
             </span>
@@ -397,7 +397,7 @@ function ipcFor(node: FlameView): string | null {
 }
 
 function tooltipFor(node: FlameView, total: bigint): string {
-  const base = `${labelFor(node)} · ${formatDuration(node.duration_ns)} / ${formatDuration(total)} (${pct(node.duration_ns, total)})`;
+  const base = `${labelFor(node)} · ${formatDuration(node.on_cpu_ns)} / ${formatDuration(total)} (${pct(node.on_cpu_ns, total)})`;
   const ipc = ipcFor(node);
   return ipc
     ? `${base} · ${ipc} ipc (${node.instructions.toString()} insns / ${node.cycles.toString()} cycles)`

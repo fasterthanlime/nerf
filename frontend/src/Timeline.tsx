@@ -47,10 +47,14 @@ export function Timeline({
     return <div className="timeline placeholder">timeline (waiting for samples…)</div>;
   }
 
-  const max = update.buckets.reduce(
-    (m, b) => (b.duration_ns > m ? b.duration_ns : m),
-    0n,
-  );
+  // Use total wall time per bucket (on + off) as the bar height: it's
+  // the most useful "what was the system doing here?" signal. The
+  // per-axis split is in the bucket fields; future iterations can
+  // stack on-CPU and off-CPU as separate layers in the chart.
+  const max = update.buckets.reduce((m, b) => {
+    const total = b.on_cpu_ns + b.off_cpu_ns;
+    return total > m ? total : m;
+  }, 0n);
   const maxF = max === 0n ? 1 : Number(max);
   const durSec = Number(update.recording_duration_ns) / 1e9;
   const durNs = update.recording_duration_ns;
@@ -114,7 +118,9 @@ export function Timeline({
   const points: string[] = [];
   for (let i = 0; i < n; i++) {
     const x = ((i + 0.5) / n) * 100;
-    const y = max === 0n ? 100 : 100 - (Number(update.buckets[i].duration_ns) / maxF) * 100;
+    const b = update.buckets[i];
+    const total = Number(b.on_cpu_ns + b.off_cpu_ns);
+    const y = max === 0n ? 100 : 100 - (total / maxF) * 100;
     points.push(`${x.toFixed(3)},${y.toFixed(3)}`);
   }
   const areaD =
@@ -148,7 +154,8 @@ export function Timeline({
         )}
       </svg>
       <div className="timeline-footer">
-        {(Number(update.total_duration_ns) / 1e9).toFixed(2)}s of activity ·{" "}
+        {(Number(update.total_on_cpu_ns) / 1e9).toFixed(2)}s on-CPU ·{" "}
+        {(Number(update.total_off_cpu_ns) / 1e9).toFixed(2)}s off-CPU ·{" "}
         {durSec.toFixed(1)}s elapsed
         {range && (
           <>

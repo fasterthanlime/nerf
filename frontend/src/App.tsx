@@ -19,7 +19,6 @@ import {
   type AnnotatedView,
   type LiveFilter,
   type ProfilerClient,
-  type SampleMode,
   type SymbolRef,
   type ThreadInfo,
   type ThreadsUpdate,
@@ -32,7 +31,7 @@ import {
 import { Flamegraph } from "./Flamegraph.tsx";
 import { Neighbors } from "./Neighbors.tsx";
 import { Timeline } from "./Timeline.tsx";
-import { formatDuration } from "./wire.ts";
+import { formatDuration, offCpuTotal } from "./wire.ts";
 
 type Status = "pending" | "ok" | "err";
 type Theme = "dark" | "light";
@@ -57,7 +56,6 @@ function initialTheme(): Theme {
 export const EMPTY_FILTER: LiveFilter = {
   time_range: null,
   exclude_symbols: [],
-  sample_mode: { tag: "Both" },
 };
 
 /// One step in the drill-down stack. Renders as a breadcrumb chip
@@ -268,8 +266,8 @@ export function App() {
             "App: top update",
             next.entries.length,
             "entries,",
-            next.total_duration_ns.toString(),
-            "ns wall",
+            next.total_on_cpu_ns.toString(),
+            "ns on-cpu",
           );
           latest.current = next;
           // While frozen we accumulate into `latest` but don't render.
@@ -408,12 +406,10 @@ export function App() {
               .*
             </button>
           </span>
-          <SampleModeFilter
-            mode={filter.sample_mode}
-            onChange={(m) =>
-              setFilter((prev) => ({ ...prev, sample_mode: m }))
-            }
-          />
+          {/* On/off-CPU toggle removed for now: every flame node
+              now carries both kinds (and per-reason off-CPU) on the
+              wire, so this becomes a pure display preference. Re-add
+              when the new schema's per-reason rendering lands. */}
           <PmuMetricFilter metric={pmuMetric} onChange={setPmuMetric} />
           <KindFilter hidden={hiddenKinds} onChange={setHiddenKinds} />
           <button
@@ -428,7 +424,7 @@ export function App() {
           <span className="spacer" />
           <span className="meta">
             {displayed
-              ? `${formatDuration(displayed.total_duration_ns)} · ${displayed.entries.length} symbols`
+              ? `${formatDuration(displayed.total_on_cpu_ns)} on-CPU · ${formatDuration(offCpuTotal(displayed.total_off_cpu))} off-CPU · ${displayed.entries.length} symbols`
               : "waiting for samples..."}
           </span>
         </div>
@@ -516,7 +512,7 @@ export function App() {
         >
           <TopTable
             entries={displayed?.entries ?? []}
-            totalDurationNs={displayed?.total_duration_ns ?? 0n}
+            totalOnCpuNs={displayed?.total_on_cpu_ns ?? 0n}
             selected={selected}
             onSelect={setSelected}
             sort={sort}
@@ -848,50 +844,6 @@ function PmuMetricFilter({
   );
 }
 
-function SampleModeFilter({
-  mode,
-  onChange,
-}: {
-  mode: SampleMode;
-  onChange: (m: SampleMode) => void;
-}) {
-  const options: { tag: "Both" | "OnCpu" | "OffCpu"; label: string; title: string }[] = [
-    {
-      tag: "Both",
-      label: "wall",
-      title: "wall-clock: on-CPU + off-CPU samples (default)",
-    },
-    {
-      tag: "OnCpu",
-      label: "on-cpu",
-      title: "on-CPU only — what samply / Time Profiler show",
-    },
-    {
-      tag: "OffCpu",
-      label: "off-cpu",
-      title: "off-CPU only — where threads are blocked",
-    },
-  ];
-  return (
-    <span className="kind-filter">
-      {options.map((opt) => {
-        const active = mode.tag === opt.tag;
-        return (
-          <button
-            key={opt.tag}
-            type="button"
-            className={`kind-pill mode-${opt.tag.toLowerCase()}${active ? "" : " off"}`}
-            onClick={() => onChange({ tag: opt.tag } as SampleMode)}
-            title={opt.title}
-          >
-            {opt.label}
-          </button>
-        );
-      })}
-    </span>
-  );
-}
-
 function KindFilter({
   hidden,
   onChange,
@@ -1067,7 +1019,7 @@ function entryMatches(
 
 function TopTable({
   entries,
-  totalDurationNs,
+  totalOnCpuNs,
   selected,
   onSelect,
   sort,
@@ -1078,7 +1030,7 @@ function TopTable({
   onContextMenu,
 }: {
   entries: TopEntry[];
-  totalDurationNs: bigint;
+  totalOnCpuNs: bigint;
   selected: bigint | null;
   onSelect: (a: bigint) => void;
   sort: SortKey;
@@ -1088,15 +1040,16 @@ function TopTable({
   pmuMetric: PmuMetric;
   onContextMenu: (t: ContextMenuTarget) => void;
 }) {
-  void totalDurationNs;
+  void totalOnCpuNs;
   const visible = entries.filter((e) => !hiddenKinds.has(objKindOf(e)));
   // Scale every row's progress bar against the busiest visible row,
-  // not the recording's grand total. With 1M+ samples spread across
-  // hundreds of symbols, the grand-total denominator made every bar
-  // a hairline -- now the leader fills the bar and the rest are
-  // proportional to it (the "Activity Monitor" model).
+  // not the recording's grand total. With many symbols, the
+  // grand-total denominator made every bar a hairline -- now the
+  // leader fills the bar and the rest are proportional to it (the
+  // "Activity Monitor" model). Rank by on-CPU time; off-CPU time
+  // shows up as a secondary annotation.
   const barDenom = visible.reduce((m, e) => {
-    const v = sort === "self" ? e.self_duration_ns : e.total_duration_ns;
+    const v = sort === "self" ? e.self_on_cpu_ns : e.total_on_cpu_ns;
     return v > m ? v : m;
   }, 1n);
   return (
@@ -1162,14 +1115,14 @@ function TopTable({
               </td>
               <td className="num">
                 <div className="num-line">
-                  {e.self_duration_ns === e.total_duration_ns ? (
-                    formatDuration(e.self_duration_ns)
+                  {e.self_on_cpu_ns === e.total_on_cpu_ns ? (
+                    formatDuration(e.self_on_cpu_ns)
                   ) : (
                     <>
-                      {formatDuration(e.self_duration_ns)}
+                      {formatDuration(e.self_on_cpu_ns)}
                       <span className="num-sep"> / </span>
                       <span className="num-total">
-                        {formatDuration(e.total_duration_ns)}
+                        {formatDuration(e.total_on_cpu_ns)}
                       </span>
                     </>
                   )}
@@ -1179,7 +1132,7 @@ function TopTable({
                     className="num-bar-fill"
                     style={{
                       width: barPct(
-                        sort === "self" ? e.self_duration_ns : e.total_duration_ns,
+                        sort === "self" ? e.self_on_cpu_ns : e.total_on_cpu_ns,
                         barDenom,
                       ),
                     }}
@@ -1260,10 +1213,13 @@ function ThreadSwitcher({
     }
   }, [open]);
 
-  const total = threads.reduce((s, t) => s + t.duration_ns, 0n);
+  // Rank by on-CPU time so threads doing real CPU work float up;
+  // mostly-parked workers stay near the bottom even though they may
+  // have a lot of blocked wall time.
+  const total = threads.reduce((s, t) => s + t.on_cpu_ns, 0n);
   const totalF = total === 0n ? 1 : Number(total);
   const max = threads.reduce(
-    (m, t) => (t.duration_ns > m ? t.duration_ns : m),
+    (m, t) => (t.on_cpu_ns > m ? t.on_cpu_ns : m),
     0n,
   );
   const maxF = max === 0n ? 1 : Number(max);
@@ -1328,7 +1284,7 @@ function ThreadSwitcher({
               </span>
               <span className="thread-name">all threads</span>
               <span className="thread-count">
-                {total.toLocaleString()}
+                {formatDuration(total)}
               </span>
             </button>
             {filtered.length === 0 ? (
@@ -1337,19 +1293,20 @@ function ThreadSwitcher({
               filtered.map((t) => {
                 const sel = selectedTid === t.tid;
                 const wPct =
-                  max === 0n ? 0 : (Number(t.duration_ns) / maxF) * 100;
+                  max === 0n ? 0 : (Number(t.on_cpu_ns) / maxF) * 100;
                 const rPct =
                   total === 0n
                     ? 0
-                    : Math.round((Number(t.duration_ns) / totalF) * 1000) /
+                    : Math.round((Number(t.on_cpu_ns) / totalF) * 1000) /
                       10;
+                const offTotal = offCpuTotal(t.off_cpu);
                 return (
                   <button
                     type="button"
                     key={t.tid}
                     className={`thread-row${sel ? " selected" : ""}`}
                     onClick={() => pick(t.tid)}
-                    title={`${formatDuration(t.duration_ns)} (${rPct}%)`}
+                    title={`${formatDuration(t.on_cpu_ns)} on-CPU + ${formatDuration(offTotal)} off-CPU (${rPct}% of CPU time)`}
                   >
                     <span className="thread-check">{sel && <LuCheck />}</span>
                     <span className="thread-name">
@@ -1365,7 +1322,7 @@ function ThreadSwitcher({
                       />
                     </span>
                     <span className="thread-count">
-                      {formatDuration(t.duration_ns)}
+                      {formatDuration(t.on_cpu_ns)}
                     </span>
                   </button>
                 );
@@ -1373,7 +1330,7 @@ function ThreadSwitcher({
             )}
           </div>
           <div className="thread-popover-footer">
-            {threads.length} threads · sorted by wall time
+            {threads.length} threads · sorted by on-CPU time
           </div>
         </div>
       )}
@@ -1420,7 +1377,7 @@ function Annotation({
 
   const lines = view?.lines ?? [];
   const maxSelf = lines.reduce(
-    (m, l) => (l.self_duration_ns > m ? l.self_duration_ns : m),
+    (m, l) => (l.self_on_cpu_ns > m ? l.self_on_cpu_ns : m),
     0n,
   );
 
@@ -1473,11 +1430,11 @@ function Annotation({
                   <tr
                     key={String(line.address)}
                     data-addr={String(line.address)}
-                    style={{ background: heatBg(line.self_duration_ns, maxSelf) }}
+                    style={{ background: heatBg(line.self_on_cpu_ns, maxSelf) }}
                   >
                     <td className="num">
-                      {line.self_duration_ns > 0n
-                        ? formatDuration(line.self_duration_ns)
+                      {line.self_on_cpu_ns > 0n
+                        ? formatDuration(line.self_on_cpu_ns)
                         : ""}
                     </td>
                     <td className="addr">+0x{off.toString(16)}</td>
@@ -1498,8 +1455,8 @@ function Annotation({
               <div
                 key={String(line.address)}
                 className="mm-row"
-                title={`+0x${(line.address - view!.base_address).toString(16)} · ${formatDuration(line.self_duration_ns)}`}
-                style={{ background: heatBg(line.self_duration_ns, maxSelf) }}
+                title={`+0x${(line.address - view!.base_address).toString(16)} · ${formatDuration(line.self_on_cpu_ns)}`}
+                style={{ background: heatBg(line.self_on_cpu_ns, maxSelf) }}
                 onClick={() => jumpTo(line.address)}
               />
             ))}

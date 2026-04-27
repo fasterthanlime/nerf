@@ -3,22 +3,32 @@
 // FlamegraphUpdate.strings) and what the rest of the frontend wants
 // to see (those fields as inline strings).
 //
-// The tree is rebuilt once per snapshot. Identical indices share
-// references so V8 only holds one copy of each interned string; the
-// FlameView tree's footprint is roughly the same as the equivalent
-// string-inline tree, with the wire savings showing up purely on the
-// network.
+// Each node carries on-CPU time + off-CPU breakdown (10 reasons) +
+// PET sample count + off-CPU interval count separately. The UI picks
+// which dimension drives flame box width and can color-segment a
+// single box across the off-CPU reasons.
 
 import type {
   FlameNode as WireFlameNode,
   FlamegraphUpdate as WireFlamegraphUpdate,
   NeighborsUpdate as WireNeighborsUpdate,
+  OffCpuBreakdown as WireOffCpuBreakdown,
 } from "./generated/profiler.generated.ts";
+
+/// Re-export so non-wire code paths can describe their own breakdowns.
+export type OffCpuBreakdown = WireOffCpuBreakdown;
 
 export interface FlameView {
   address: bigint;
-  /// Wall-clock time spent at (or under) this node, in nanoseconds.
-  duration_ns: bigint;
+  /// Real CPU time at (or under) this stack, in ns.
+  on_cpu_ns: bigint;
+  /// Off-CPU time at this stack, by reason. Sum across fields = total
+  /// off-CPU time. UI can color-segment a flame box by reason.
+  off_cpu: OffCpuBreakdown;
+  /// PET stack-walk hits at (or under) this node.
+  pet_samples: bigint;
+  /// Off-CPU intervals attributed to this stack.
+  off_cpu_intervals: bigint;
   function_name: string | null;
   binary: string | null;
   is_main: boolean;
@@ -31,7 +41,8 @@ export interface FlameView {
 }
 
 export interface FlamegraphView {
-  total_duration_ns: bigint;
+  total_on_cpu_ns: bigint;
+  total_off_cpu: OffCpuBreakdown;
   root: FlameView;
 }
 
@@ -40,7 +51,10 @@ export interface NeighborsView {
   binary: string | null;
   is_main: boolean;
   language: string;
-  own_duration_ns: bigint;
+  own_on_cpu_ns: bigint;
+  own_off_cpu: OffCpuBreakdown;
+  own_pet_samples: bigint;
+  own_off_cpu_intervals: bigint;
   callers_tree: FlameView;
   callees_tree: FlameView;
 }
@@ -52,7 +66,10 @@ function lookup(strings: string[], idx: number | null): string | null {
 function hydrateNode(node: WireFlameNode, strings: string[]): FlameView {
   return {
     address: node.address,
-    duration_ns: node.duration_ns,
+    on_cpu_ns: node.on_cpu_ns,
+    off_cpu: node.off_cpu,
+    pet_samples: node.pet_samples,
+    off_cpu_intervals: node.off_cpu_intervals,
     function_name: lookup(strings, node.function_name),
     binary: lookup(strings, node.binary),
     is_main: node.is_main,
@@ -67,7 +84,8 @@ function hydrateNode(node: WireFlameNode, strings: string[]): FlameView {
 
 export function hydrateFlamegraph(u: WireFlamegraphUpdate): FlamegraphView {
   return {
-    total_duration_ns: u.total_duration_ns,
+    total_on_cpu_ns: u.total_on_cpu_ns,
+    total_off_cpu: u.total_off_cpu,
     root: hydrateNode(u.root, u.strings),
   };
 }
@@ -78,14 +96,32 @@ export function hydrateNeighbors(u: WireNeighborsUpdate): NeighborsView {
     binary: lookup(u.strings, u.binary),
     is_main: u.is_main,
     language: u.strings[u.language],
-    own_duration_ns: u.own_duration_ns,
+    own_on_cpu_ns: u.own_on_cpu_ns,
+    own_off_cpu: u.own_off_cpu,
+    own_pet_samples: u.own_pet_samples,
+    own_off_cpu_intervals: u.own_off_cpu_intervals,
     callers_tree: hydrateNode(u.callers_tree, u.strings),
     callees_tree: hydrateNode(u.callees_tree, u.strings),
   };
 }
 
-/// Format a nanosecond duration as a human-readable string. Used
-/// across the UI now that the aggregator's unit is wall-clock time.
+/// Sum of every off-CPU reason in a breakdown.
+export function offCpuTotal(b: OffCpuBreakdown): bigint {
+  return (
+    b.idle_ns +
+    b.lock_ns +
+    b.semaphore_ns +
+    b.ipc_ns +
+    b.io_read_ns +
+    b.io_write_ns +
+    b.readiness_ns +
+    b.sleep_ns +
+    b.connect_ns +
+    b.other_ns
+  );
+}
+
+/// Format a nanosecond duration as a human-readable string.
 export function formatDuration(ns: bigint): string {
   if (ns === 0n) return "0";
   const n = Number(ns);
