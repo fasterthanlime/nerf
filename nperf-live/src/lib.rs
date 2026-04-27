@@ -20,14 +20,13 @@ use nperf_core::live_sink::{
 use nperf_core::live_sink::MachOByteSource;
 use nperf_live_proto::{
     AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, IntervalEntry, IntervalListUpdate,
-    LiveFilter, NeighborsUpdate, OffCpuReason, PetSampleEntry, PetSampleListUpdate, Profiler,
+    LiveFilter, NeighborsUpdate, PetSampleEntry, PetSampleListUpdate, Profiler,
     ProfilerDispatcher, ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate, TopEntry,
     TopSort, TopUpdate, ViewParams,
 };
 
 use crate::aggregator::{
-    Aggregation, AddressStats, EventCtx, IntervalKind, OffCpuBreakdown, PmcAccum, PmuSample,
-    RawInterval, StackNode,
+    Aggregation, EventCtx, IntervalKind, OffCpuBreakdown, PmcAccum, PmuSample, StackNode,
 };
 
 mod aggregator;

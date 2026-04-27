@@ -179,7 +179,10 @@ pub enum IntervalKind {
 }
 
 /// One observed wakeup edge for the wakers panel. Independent of
-/// interval tracking.
+/// interval tracking. `timestamp_ns` is currently unread (the panel
+/// aggregates by waker symbol, not by time), but kept on-record so a
+/// future timeline view can plot wakeups directly.
+#[allow(dead_code)]
 pub struct RawWakeup {
     pub timestamp_ns: u64,
     pub waker_tid: u32,
