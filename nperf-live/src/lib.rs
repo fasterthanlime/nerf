@@ -423,20 +423,23 @@ impl Profiler for LiveServer {
         params: ViewParams,
         output: vox::Tx<IntervalListUpdate>,
     ) {
-        // TODO: drill-down RPC. Not yet implemented; emits empty
-        // updates so the frontend can subscribe without errors.
-        let ViewParams { tid, filter: _ } = params;
-        tracing::info!(?tid, %flame_key, "subscribe_intervals: stub stream");
+        // `flame_key` is currently ignored (TODO: filter to the
+        // intervals whose stack matches the prefix encoded by the
+        // key). For now we return every off-CPU interval matching
+        // the tid + time/exclude filter, capped at INTERVAL_CAP per
+        // snapshot so the wire payload stays bounded.
+        let ViewParams { tid, filter } = params;
+        tracing::info!(?tid, %flame_key, "subscribe_intervals: starting stream");
+        let aggregator = self.aggregator.clone();
+        let binaries = self.binaries.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 interval.tick().await;
-                let update = IntervalListUpdate {
-                    strings: Vec::new(),
-                    total_intervals: 0,
-                    total_duration_ns: 0,
-                    by_reason: nperf_live_proto::OffCpuBreakdown::default(),
-                    entries: Vec::new(),
+                let update = {
+                    let agg = aggregator.read();
+                    let bins = binaries.read();
+                    build_intervals_update(&agg, &bins, tid, &filter)
                 };
                 if let Err(e) = output.send(update).await {
                     tracing::info!("subscribe_intervals: stream ended: {e:?}");
@@ -452,16 +455,17 @@ impl Profiler for LiveServer {
         params: ViewParams,
         output: vox::Tx<PetSampleListUpdate>,
     ) {
-        // TODO: drill-down RPC. Stub.
-        let ViewParams { tid, filter: _ } = params;
-        tracing::info!(?tid, %flame_key, "subscribe_pet_samples: stub stream");
+        // Same flame_key-filter caveat as subscribe_intervals.
+        let ViewParams { tid, filter } = params;
+        tracing::info!(?tid, %flame_key, "subscribe_pet_samples: starting stream");
+        let aggregator = self.aggregator.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 interval.tick().await;
-                let update = PetSampleListUpdate {
-                    total_samples: 0,
-                    entries: Vec::new(),
+                let update = {
+                    let agg = aggregator.read();
+                    build_pet_samples_update(&agg, tid, &filter)
                 };
                 if let Err(e) = output.send(update).await {
                     tracing::info!("subscribe_pet_samples: stream ended: {e:?}");
@@ -592,6 +596,138 @@ fn build_wakers_update(
     nperf_live_proto::WakersUpdate {
         wakee_tid,
         total_wakeups: total,
+        entries,
+    }
+}
+
+/// Cap on entries returned per drill-down RPC tick. Bounded wire size
+/// matters more than completeness here -- the user is looking for
+/// representative samples / intervals to inspect, not an exhaustive
+/// dump. The total count fields tell the UI when there's more.
+const DRILLDOWN_ENTRY_CAP: usize = 10_000;
+
+fn build_intervals_update(
+    agg: &Aggregator,
+    binaries: &BinaryRegistry,
+    tid: Option<u32>,
+    filter: &LiveFilter,
+) -> IntervalListUpdate {
+    let session_start = agg.session_start_ns().unwrap_or(0);
+    let mut interner = StringInterner::new();
+    let mut total_intervals: u64 = 0;
+    let mut total_duration_ns: u64 = 0;
+    let mut by_reason = aggregator::OffCpuBreakdown::default();
+    let mut entries: Vec<IntervalEntry> = Vec::new();
+
+    for (event_tid, raw) in agg.iter_intervals(tid) {
+        // We only surface off-CPU intervals here; on-CPU intervals
+        // are visible via `subscribe_pet_samples` (where each
+        // entry is one PET hit inside the interval). The two
+        // streams together cover both axes.
+        let (stack, waker_tid, waker_user_stack) = match &raw.kind {
+            IntervalKind::OnCpu => continue,
+            IntervalKind::OffCpu {
+                stack,
+                waker_tid,
+                waker_user_stack,
+            } => (stack, waker_tid, waker_user_stack),
+        };
+        // Apply the time-range / exclude-symbol filter.
+        if let Some(ref tr) = filter.time_range {
+            let rel = raw.start_ns.saturating_sub(session_start);
+            if rel < tr.start_ns || rel >= tr.end_ns {
+                continue;
+            }
+        }
+        let interval_ns = raw.end_ns.saturating_sub(raw.start_ns);
+        if interval_ns == 0 {
+            continue;
+        }
+        let leaf_name = stack
+            .first()
+            .and_then(|&addr| binaries.lookup_symbol(addr))
+            .map(|r| r.function_name);
+        let reason = classify::classify_offcpu(leaf_name.as_deref());
+        total_intervals = total_intervals.saturating_add(1);
+        total_duration_ns = total_duration_ns.saturating_add(interval_ns);
+        by_reason.add_reason(reason, interval_ns);
+
+        if entries.len() < DRILLDOWN_ENTRY_CAP {
+            // Resolve the waker symbol into the shared string table.
+            let (waker_address, waker_function_name, waker_binary) = match (
+                waker_tid,
+                waker_user_stack.as_deref(),
+            ) {
+                (Some(_), Some(stack)) => match stack.first().copied() {
+                    Some(addr) => match binaries.lookup_symbol(addr) {
+                        Some(r) => (
+                            Some(addr),
+                            Some(interner.intern(r.function_name)),
+                            Some(interner.intern(r.binary)),
+                        ),
+                        None => (Some(addr), None, None),
+                    },
+                    None => (None, None, None),
+                },
+                _ => (None, None, None),
+            };
+            entries.push(IntervalEntry {
+                tid: event_tid,
+                start_ns: raw.start_ns.saturating_sub(session_start),
+                duration_ns: interval_ns,
+                reason,
+                waker_tid: *waker_tid,
+                waker_address,
+                waker_function_name,
+                waker_binary,
+            });
+        }
+    }
+
+    // Most-recent first so the drill-down panel surfaces what's
+    // happening *now* without the user scrolling past hours of
+    // history.
+    entries.sort_by(|a, b| b.start_ns.cmp(&a.start_ns));
+
+    IntervalListUpdate {
+        strings: interner.into_strings(),
+        total_intervals,
+        total_duration_ns,
+        by_reason: by_reason.to_proto(),
+        entries,
+    }
+}
+
+fn build_pet_samples_update(
+    agg: &Aggregator,
+    tid: Option<u32>,
+    filter: &LiveFilter,
+) -> PetSampleListUpdate {
+    let session_start = agg.session_start_ns().unwrap_or(0);
+    let mut total_samples: u64 = 0;
+    let mut entries: Vec<PetSampleEntry> = Vec::new();
+    for (event_tid, sample) in agg.iter_pet_samples(tid) {
+        if let Some(ref tr) = filter.time_range {
+            let rel = sample.timestamp_ns.saturating_sub(session_start);
+            if rel < tr.start_ns || rel >= tr.end_ns {
+                continue;
+            }
+        }
+        total_samples = total_samples.saturating_add(1);
+        if entries.len() < DRILLDOWN_ENTRY_CAP {
+            entries.push(PetSampleEntry {
+                tid: event_tid,
+                timestamp_ns: sample.timestamp_ns.saturating_sub(session_start),
+                cycles: sample.pmc.cycles,
+                instructions: sample.pmc.instructions,
+                l1d_misses: sample.pmc.l1d_misses,
+                branch_mispreds: sample.pmc.branch_mispreds,
+            });
+        }
+    }
+    entries.sort_by(|a, b| b.timestamp_ns.cmp(&a.timestamp_ns));
+    PetSampleListUpdate {
+        total_samples,
         entries,
     }
 }

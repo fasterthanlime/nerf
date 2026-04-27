@@ -675,6 +675,8 @@ fn drain_loop<S: SampleSink>(
                 crate::offcpu::PendingKind::OffCpu {
                     user_stack,
                     kernel_stack: _,
+                    waker_tid,
+                    waker_user_stack,
                 } => {
                     sink.on_cpu_interval(nerf_mac_capture::sample_sink::CpuIntervalEvent {
                         pid: opts.pid,
@@ -683,8 +685,8 @@ fn drain_loop<S: SampleSink>(
                         end_ns: interval.end_ns,
                         kind: nerf_mac_capture::sample_sink::CpuIntervalKind::OffCpu {
                             stack: &user_stack,
-                            waker_tid: None,
-                            waker_user_stack: None,
+                            waker_tid,
+                            waker_user_stack: waker_user_stack.as_deref(),
                         },
                     });
                 }

@@ -59,6 +59,18 @@ struct ThreadState {
     /// any subsequent off-CPU interval. Updated on every PET tick.
     last_user_stack: Vec<u64>,
     last_kernel_stack: Vec<u64>,
+    /// Wakeup that brought this thread out of its current off-CPU
+    /// state. Populated when MAKERUNNABLE fires with this thread as
+    /// the wakee; consumed (and cleared) when the thread comes back
+    /// on-CPU and we close its off-CPU interval. Lets us answer
+    /// "who unblocked this thread?" per interval, not just per-tid.
+    pending_wakeup: Option<PendingWakerAttribution>,
+}
+
+#[derive(Clone)]
+struct PendingWakerAttribution {
+    waker_tid: u32,
+    waker_user_stack: Vec<u64>,
 }
 
 /// One closed CPU interval, fed to the recorder's sink.
@@ -77,6 +89,14 @@ pub enum PendingKind {
         /// Cached kernel stack (currently unused by the live sink
         /// but kept for symmetry with the suspend-and-walk path).
         kernel_stack: Vec<u64>,
+        /// Who woke this thread out of the off-CPU interval. `None`
+        /// when no MAKERUNNABLE record landed in the interval window
+        /// (e.g. timer/IO interrupt completing the wait without an
+        /// explicit wake call, or the wake event was dropped from
+        /// the kdebug ring before we drained it).
+        waker_tid: Option<u32>,
+        /// Cached waker stack at the moment of MAKERUNNABLE, leaf-first.
+        waker_user_stack: Option<Vec<u64>>,
     },
 }
 
@@ -173,6 +193,11 @@ impl CpuIntervalTracker {
                             // total_off_ns for diagnostics but skip
                             // the sink.
                             if !st.last_user_stack.is_empty() {
+                                let waker = st.pending_wakeup.take();
+                                let (waker_tid, waker_user_stack) = match waker {
+                                    Some(w) => (Some(w.waker_tid), Some(w.waker_user_stack)),
+                                    None => (None, None),
+                                };
                                 self.pending.push(PendingInterval {
                                     tid: new_tid as u32,
                                     start_ns: off_ns,
@@ -180,8 +205,15 @@ impl CpuIntervalTracker {
                                     kind: PendingKind::OffCpu {
                                         user_stack: st.last_user_stack.clone(),
                                         kernel_stack: st.last_kernel_stack.clone(),
+                                        waker_tid,
+                                        waker_user_stack,
                                     },
                                 });
+                            } else {
+                                // Discard stale wakeup record so we
+                                // don't carry it into the next
+                                // off-CPU interval.
+                                st.pending_wakeup = None;
                             }
                         }
                     }
@@ -201,20 +233,37 @@ impl CpuIntervalTracker {
                 if waker_tid == 0 || wakee_tid == 0 || waker_tid == wakee_tid {
                     return;
                 }
-                let Some(waker_state) = self.threads.get(&waker_tid) else {
-                    return;
+                let waker_user_stack = match self.threads.get(&waker_tid) {
+                    Some(s) if !s.last_user_stack.is_empty()
+                        || !s.last_kernel_stack.is_empty() =>
+                    {
+                        s.last_user_stack.clone()
+                    }
+                    _ => return,
                 };
-                if waker_state.last_user_stack.is_empty()
-                    && waker_state.last_kernel_stack.is_empty()
-                {
-                    return;
-                }
+                let waker_kernel_stack = self
+                    .threads
+                    .get(&waker_tid)
+                    .map(|s| s.last_kernel_stack.clone())
+                    .unwrap_or_default();
+                // Two consumers of this wakeup:
+                // 1) The "who woke me?" panel aggregates these per
+                //    wakee tid, top-N grouped by (waker_tid, waker_leaf).
+                // 2) Per off-CPU *interval* attribution: stash the
+                //    waker on the wakee's ThreadState so the next
+                //    SCHED-on for that thread can stamp the closing
+                //    interval with `waker_tid + waker_user_stack`.
                 self.pending_wakeups.push(PendingWakeup {
                     timestamp_ns: ts,
                     waker_tid: waker_tid as u32,
                     wakee_tid: wakee_tid as u32,
-                    waker_user_stack: waker_state.last_user_stack.clone(),
-                    waker_kernel_stack: waker_state.last_kernel_stack.clone(),
+                    waker_user_stack: waker_user_stack.clone(),
+                    waker_kernel_stack,
+                });
+                let wakee = self.threads.entry(wakee_tid).or_default();
+                wakee.pending_wakeup = Some(PendingWakerAttribution {
+                    waker_tid: waker_tid as u32,
+                    waker_user_stack,
                 });
             }
             _ => {}
