@@ -23,5 +23,6 @@ nperf-demangle = { path = "../nperf-demangle" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.4"
+nerf-mac-capture = { version = "0.1", path = "../nerf-mac-capture" }
 
 vox = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d", features = ["transport-websocket"] }

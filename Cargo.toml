@@ -31,6 +31,7 @@ memmap2 = "0.9"
 [target.'cfg(target_os = "macos")'.dependencies]
 nerf-mac-capture = { version = "0.1", path = "nerf-mac-capture" }
 nerf-mac-kperf = { version = "0.1", path = "nerf-mac-kperf" }
+nperf-mac-shared-cache = { version = "0.1", path = "nperf-mac-shared-cache" }
 mach2 = "0.4"
 
 [dependencies.nwind]
@@ -56,7 +57,7 @@ addr2line = ["nwind/addr2line"]
 debug-logs = ["nwind/debug-logs"]
 
 [workspace]
-members = [".", "cli", "nwind", "proc-maps", "perf_event_open", "thread-local-reentrant", "nerf-mac-capture", "nerf-mac-kperf", "xtask", "nperf-live", "nperf-live-proto", "nperf-demangle"]
+members = [".", "cli", "nwind", "proc-maps", "perf_event_open", "thread-local-reentrant", "nerf-mac-capture", "nerf-mac-kperf", "nperf-mac-shared-cache", "xtask", "nperf-live", "nperf-live-proto", "nperf-demangle"]
 # nerf-mac-preload is built as a standalone workspace because it requires
 # panic="abort" / no_std settings that cannot be expressed at member scope.
 exclude = ["nerf-mac-preload"]

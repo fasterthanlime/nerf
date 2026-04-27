@@ -18,8 +18,9 @@ use nerf_mac_capture::{BinaryLoadedEvent, BinaryUnloadedEvent, SampleSink};
 use object::read::macho::MachOFile64;
 use object::{Endianness, Object, ObjectKind, ObjectSegment, ObjectSymbol};
 
+use nperf_mac_shared_cache::SharedCache;
+
 use crate::libproc;
-use crate::shared_cache::SharedCache;
 
 /// One loaded image, retained between scans so `BinaryLoadedEvent`
 /// can borrow `&[MachOSymbol]` from us.
@@ -43,14 +44,14 @@ pub struct LoadedImage {
 /// and removals since the previous scan.
 pub struct ImageScanner {
     known: HashMap<(String, u64), LoadedImage>,
-    shared_cache: Option<SharedCache>,
+    shared_cache: Option<std::sync::Arc<SharedCache>>,
 }
 
 impl ImageScanner {
-    pub fn new() -> Self {
+    pub fn new(shared_cache: Option<std::sync::Arc<SharedCache>>) -> Self {
         Self {
             known: HashMap::new(),
-            shared_cache: SharedCache::for_host(),
+            shared_cache,
         }
     }
 
@@ -131,7 +132,7 @@ impl ImageScanner {
         let mut with_symbols = 0u32;
         let mut total_symbols = 0usize;
         for (path, base_avma, region_size) in to_add {
-            let img = build_image(&path, base_avma, region_size, self.shared_cache.as_ref());
+            let img = build_image(&path, base_avma, region_size, self.shared_cache.as_deref());
             if !img.symbols.is_empty() {
                 with_symbols += 1;
                 total_symbols += img.symbols.len();

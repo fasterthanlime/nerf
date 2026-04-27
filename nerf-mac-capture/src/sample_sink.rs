@@ -37,6 +37,13 @@ pub trait SampleSink {
     /// the kperf backend.
     #[allow(unused_variables)]
     fn on_wakeup(&mut self, event: WakeupEvent<'_>) {}
+
+    /// The recorder opened a shared resource that the live UI can
+    /// query for raw bytes (today: the dyld shared cache mmap,
+    /// wrapped in an `Arc<dyn MachOByteSource>`). Default no-op so
+    /// archive-only sinks ignore it.
+    #[allow(unused_variables)]
+    fn on_macho_byte_source(&mut self, source: std::sync::Arc<dyn MachOByteSource>) {}
 }
 
 /// One sample. Backtraces are callee-most first; addresses are absolute
@@ -125,6 +132,22 @@ pub struct WakeupEvent<'a> {
     pub wakee_tid: u32,
     pub waker_user_stack: &'a [u64],
     pub waker_kernel_stack: &'a [u64],
+}
+
+/// Typed byte source for Mach-O addresses that aren't on disk and
+/// that we can't `mach_vm_read` against (typically: dyld_shared_cache
+/// dylibs on the kperf-launch path). Implementations live in
+/// downstream crates that own the underlying mmap; the trait is here
+/// so the sink can ferry an `Arc<dyn MachOByteSource>` from the
+/// recorder to the live UI without either side having to know the
+/// concrete impl.
+///
+/// `fetch` returns a slice with lifetime tied to `&self` so the
+/// implementation can hand back a direct reference into its mmap'd
+/// backing without an extra allocation. The caller copies out (Vec,
+/// Cow, etc.) before dropping the borrow.
+pub trait MachOByteSource: Send + Sync {
+    fn fetch<'a>(&'a self, avma: u64, len: usize) -> Option<&'a [u8]>;
 }
 
 pub struct ThreadNameEvent<'a> {

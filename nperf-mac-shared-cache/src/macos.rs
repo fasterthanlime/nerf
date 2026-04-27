@@ -1,35 +1,19 @@
-//! dyld_shared_cache symbol resolution.
-//!
-//! Locates the host's split shared cache, mmaps every subcache file,
-//! parses the whole thing via `object::read::macho::DyldCache`, and
-//! produces LC_SYMTAB-derived MachOSymbols on demand for any image
-//! keyed by its install-name (the path libproc returns for
-//! shared-cache regions like `/usr/lib/libsystem_malloc.dylib`).
-//!
-//! Apple Silicon caches live under
-//! `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/`; Intel
-//! under `/System/Library/dyld/`. We only try the host-arch cache.
-//!
-//! mmaps are intentionally leaked (`Box::leak`): the cache is
-//! process-wide, immutable for the program's lifetime, and the API
-//! is much simpler with `'static` lifetimes than with self-referential
-//! bookkeeping. Worst-case "leak" on Apple Silicon is the union of
-//! subcache sizes (a few hundred MB of mapped, file-backed pages),
-//! which the kernel evicts under memory pressure anyway.
+//! macOS implementation. See the crate-level docs for the leak
+//! rationale.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 
 use memmap2::Mmap;
 use nerf_mac_capture::proc_maps::MachOSymbol;
+use nerf_mac_capture::MachOByteSource;
 use object::read::macho::DyldCache;
 use object::{Endianness, Object, ObjectSegment, ObjectSymbol};
 
-/// Per-image info we hand back to `image_scan` for shared-cache
-/// dylibs. `text_svma` is in dyld-cache address space (the same space
-/// `MachOSymbol::start_svma` lives in), so the analysis side
-/// reconstructs the slide as `base_avma - text_svma` exactly the way
-/// it does for on-disk Mach-O.
+/// Per-image symbol set returned by `lookup`. `text_svma` is in
+/// dyld-cache address space (the same space `MachOSymbol::start_svma`
+/// lives in), so the analysis side reconstructs the slide as
+/// `base_avma - text_svma` exactly the way it does for on-disk Mach-O.
 pub struct SharedCacheImage {
     pub text_svma: u64,
     pub text_vmsize: u64,
@@ -148,11 +132,8 @@ impl SharedCache {
         out
     }
 
-    /// Resolve `install_name` (the `/usr/lib/...` path libproc gives
-    /// us for cache-resident dylibs) to LC_SYMTAB symbols + __TEXT
-    /// extents. Linear scan of the cache's image list -- a few
-    /// thousand entries, runs once per newly-loaded shared-cache
-    /// image, well below the rounding error on the kperf drain loop.
+    /// Resolve `install_name` to LC_SYMTAB symbols + __TEXT extents.
+    /// Linear scan; fine for the few-thousand-entry case.
     pub fn lookup(&self, install_name: &str) -> Option<SharedCacheImage> {
         for image in self.cache.images() {
             let Ok(path) = image.path() else { continue };
@@ -183,6 +164,28 @@ impl SharedCache {
             });
         }
         None
+    }
+}
+
+/// `MachOByteSource` impl: translate avma -> cache_svma via slide,
+/// walk the parsed mapping table to find which subcache + file
+/// offset, and return a slice straight into the leaked mmap. No
+/// allocation, no copy.
+impl MachOByteSource for SharedCache {
+    fn fetch<'a>(&'a self, avma: u64, len: usize) -> Option<&'a [u8]> {
+        let slide = self.runtime_slide?;
+        let svma = (avma as i64).checked_sub(slide)? as u64;
+        let (data, offset) = self.cache.data_and_offset_for_address(svma)?;
+        let end = offset.checked_add(len as u64)?;
+        // `data` is `&'static [u8]` (the leaked mmap of one
+        // subcache file); slice straight in.
+        let bytes: &'static [u8] = data;
+        let off = usize::try_from(offset).ok()?;
+        let end = usize::try_from(end).ok()?;
+        if end > bytes.len() {
+            return None;
+        }
+        Some(&bytes[off..end])
     }
 }
 
@@ -244,17 +247,7 @@ extern "C" {
 /// cache UUID maps it at the same VM address -- which means the
 /// slide we observe in *our* image list applies verbatim to the
 /// target.
-///
-/// We pick any image our process has loaded that's also present in
-/// the cache (libSystem.B.dylib, libobjc.A.dylib, etc.), look up its
-/// stored `__TEXT` SVMA, and subtract from its runtime header
-/// address.
 fn compute_runtime_slide(cache: &DyldCache<'static, Endianness>) -> Option<i64> {
-    // Index cache images by install-name -> __TEXT SVMA. We use
-    // `parse_object()` to read the segment list rather than the raw
-    // image_info.address, since they can drift slightly for split
-    // caches and `text_svma` is what the BinaryLoadedEvent ultimately
-    // wants matched up.
     let mut by_name: HashMap<String, u64> = HashMap::with_capacity(4096);
     for image in cache.images() {
         let Ok(path) = image.path() else { continue };
@@ -290,6 +283,8 @@ fn compute_runtime_slide(cache: &DyldCache<'static, Endianness>) -> Option<i64> 
     None
 }
 
+/// Mmap a file and `Box::leak` so callers see a `&'static [u8]`.
+/// See the crate-level docs for why we leak.
 fn mmap_static(path: &str) -> Result<&'static [u8], String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
     let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {path}: {e}"))?;

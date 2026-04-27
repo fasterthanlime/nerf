@@ -15,6 +15,8 @@ use nperf_core::live_sink::{
     BinaryLoadedEvent, BinaryUnloadedEvent, LiveSink, SampleEvent, TargetAttached, ThreadName,
     WakeupEvent as LiveWakeupEvent,
 };
+#[cfg(target_os = "macos")]
+use nperf_core::live_sink::MachOByteSource;
 use nperf_live_proto::{
     AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, LiveFilter, NeighborsUpdate,
     Profiler, ProfilerDispatcher, ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate,
@@ -64,6 +66,8 @@ pub(crate) enum LiveEvent {
         waker_user_stack: Vec<u64>,
         waker_kernel_stack: Vec<u64>,
     },
+    #[cfg(target_os = "macos")]
+    MachOByteSource(Arc<dyn MachOByteSource>),
 }
 
 #[derive(Clone)]
@@ -148,6 +152,11 @@ impl LiveSink for LiveSinkImpl {
             waker_user_stack: event.waker_user_stack.to_vec(),
             waker_kernel_stack: event.waker_kernel_stack.to_vec(),
         });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_macho_byte_source(&self, source: Arc<dyn MachOByteSource>) {
+        let _ = self.tx.send(LiveEvent::MachOByteSource(source));
     }
 }
 
@@ -1197,6 +1206,10 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
                             waker_user_stack,
                             waker_kernel_stack,
                         );
+                    }
+                    #[cfg(target_os = "macos")]
+                    LiveEvent::MachOByteSource(source) => {
+                        binaries.write().set_macho_byte_source(source);
                     }
                     LiveEvent::ThreadName { tid, name } => {
                         aggregator.write().set_thread_name(tid, name);

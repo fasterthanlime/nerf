@@ -1,0 +1,12 @@
+[package]
+name = "nperf-mac-shared-cache"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Parses macOS dyld_shared_cache and resolves runtime addresses to bytes."
+
+[target.'cfg(target_os = "macos")'.dependencies]
+log = "0.4"
+memmap2 = "0.9"
+nerf-mac-capture = { version = "0.1", path = "../nerf-mac-capture" }
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "macho", "unaligned"] }

@@ -27,7 +27,8 @@ pub mod offcpu;
 pub mod parser;
 pub mod pmu_events;
 pub mod recorder;
-pub mod shared_cache;
+
+pub use nperf_mac_shared_cache as shared_cache;
 
 pub use error::Error;
 

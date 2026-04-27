@@ -120,6 +120,12 @@ pub struct BinaryRegistry {
     /// address falls outside any mapped image (typically JIT'd code).
     target_pid: Option<u32>,
     target_task_port: Option<u64>,
+    /// Typed byte source the recorder shares with us once at attach
+    /// for SC dylib disassembly. Last-resort fallback in `resolve`
+    /// when no on-disk file, no `mach_vm_read`, and no inline
+    /// `text_bytes` are available.
+    #[cfg(target_os = "macos")]
+    macho_byte_source: Option<Arc<dyn nerf_mac_capture::MachOByteSource>>,
 }
 
 struct DyldCacheBundle {
@@ -136,6 +142,8 @@ impl BinaryRegistry {
             dyld_arch: None,
             target_pid: None,
             target_task_port: None,
+            #[cfg(target_os = "macos")]
+            macho_byte_source: None,
         }
     }
 
@@ -144,6 +152,14 @@ impl BinaryRegistry {
         if task_port != 0 {
             self.target_task_port = Some(task_port);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_macho_byte_source(
+        &mut self,
+        source: Arc<dyn nerf_mac_capture::MachOByteSource>,
+    ) {
+        self.macho_byte_source = Some(source);
     }
 
     pub fn insert(&mut self, mut binary: LoadedBinary) {
@@ -273,13 +289,19 @@ impl BinaryRegistry {
         let base_address = avma_for_svma(base_avma, text_svma, fn_start_svma);
         let end_address = avma_for_svma(base_avma, text_svma, fn_end_svma);
 
-        // Prefer disk bytes when we have them (lets DWARF/source work);
-        // fall back to live target memory for binaries we couldn't
-        // load (typically when the dyld shared cache lookup failed);
-        // finally fall back to the inline `text_bytes` shipped with
-        // the load event -- the path JIT'd functions take, since
-        // they exist neither on disk nor at a stable target avma we
-        // can `mach_vm_read` without a task port.
+        // Disassembly bytes have four fallbacks, in order of
+        // preference:
+        //   1. on-disk `CodeImage` -- gives us DWARF + source;
+        //   2. `mach_vm_read` against the target -- only when we
+        //      have a task port (samply backend / `--pid` path);
+        //   3. inline `text_bytes` from the load event -- JIT'd
+        //      code where the recorder shipped the bytes alongside
+        //      the symbol;
+        //   4. shared `MachOByteSource` -- typically the dyld
+        //      shared cache mmap'd by the recorder, queried by
+        //      avma. Lets system-library disassembly work on the
+        //      kperf-launch path where there's no on-disk file
+        //      and AMFI denies us a task port.
         let bytes = match image
             .as_ref()
             .and_then(|img| img.fetch(fn_start_svma, len))
@@ -287,15 +309,18 @@ impl BinaryRegistry {
             Some(b) => b.to_vec(),
             None => match self.read_target_memory(base_address, len) {
                 Some(b) => b,
-                None => {
-                    let inline = inline_bytes.as_ref()?;
+                None => match inline_bytes.as_ref().and_then(|inline| {
                     let off = fn_start_svma.checked_sub(text_svma)? as usize;
                     let end = off.checked_add(len)?;
                     if end > inline.len() {
-                        return None;
+                        None
+                    } else {
+                        Some(inline[off..end].to_vec())
                     }
-                    inline[off..end].to_vec()
-                }
+                }) {
+                    Some(b) => b,
+                    None => self.macho_byte_source_fetch(base_address, len)?,
+                },
             },
         };
 
@@ -374,6 +399,23 @@ impl BinaryRegistry {
     #[cfg(not(target_os = "macos"))]
     fn read_target_memory(&self, _address: u64, _len: usize) -> Option<Vec<u8>> {
         // TODO: pread /proc/<pid>/mem on Linux.
+        None
+    }
+
+    /// Fourth-tier disassembly fallback (after disk image,
+    /// `mach_vm_read`, and inline `text_bytes`). Asks the shared
+    /// `MachOByteSource` for `len` bytes at `address`; on success
+    /// the trait hands us a slice straight into the leaked cache
+    /// mmap and we copy out into an owned `Vec` to fit the existing
+    /// `ResolvedAddress::bytes` shape.
+    #[cfg(target_os = "macos")]
+    fn macho_byte_source_fetch(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+        let src = self.macho_byte_source.as_ref()?;
+        src.fetch(address, len).map(|b| b.to_vec())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn macho_byte_source_fetch(&self, _address: u64, _len: usize) -> Option<Vec<u8>> {
         None
     }
 

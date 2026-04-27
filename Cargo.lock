@@ -1826,6 +1826,7 @@ dependencies = [
  "log",
  "memmap2",
  "nerf-mac-capture",
+ "nperf-mac-shared-cache",
  "object 0.39.1",
  "thiserror",
 ]
@@ -1857,6 +1858,7 @@ dependencies = [
  "memmap2",
  "nerf-mac-capture",
  "nerf-mac-kperf",
+ "nperf-mac-shared-cache",
  "num_cpus",
  "nwind",
  "object 0.32.2",
@@ -1894,6 +1896,7 @@ dependencies = [
  "eyre",
  "mach2 0.4.3",
  "memmap2",
+ "nerf-mac-capture",
  "nperf-core",
  "nperf-demangle",
  "nperf-live-proto",
@@ -1913,6 +1916,16 @@ version = "0.1.0"
 dependencies = [
  "facet",
  "vox",
+]
+
+[[package]]
+name = "nperf-mac-shared-cache"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "memmap2",
+ "nerf-mac-capture",
+ "object 0.39.1",
 ]
 
 [[package]]

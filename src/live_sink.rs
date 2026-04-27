@@ -1,4 +1,9 @@
+use std::sync::Arc;
+
 use nwind::UserFrame;
+
+#[cfg(target_os = "macos")]
+pub use nerf_mac_capture::MachOByteSource;
 
 pub struct SampleEvent< 'a > {
     pub timestamp: u64,
@@ -130,4 +135,18 @@ pub trait LiveSink: Send + Sync {
     /// records). Default no-op so other backends compile.
     #[allow(unused_variables)]
     fn on_wakeup( &self, event: &WakeupEvent ) {}
+
+    /// Recorder hands the live side a typed byte source it can use
+    /// to satisfy disassembly requests for addresses inside the
+    /// dyld shared cache. Fires once at startup (after the cache
+    /// is opened), so the `Arc` is shared between the recorder
+    /// (for image enumeration) and the live binary registry (for
+    /// the disassembly fallback).
+    ///
+    /// macOS-only because the cache itself is a macOS construct.
+    /// Cross-platform `LiveSink` impls compile fine; nothing on
+    /// Linux ever calls this method.
+    #[cfg(target_os = "macos")]
+    #[allow(unused_variables)]
+    fn on_macho_byte_source( &self, source: Arc<dyn MachOByteSource> ) {}
 }

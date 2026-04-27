@@ -93,7 +93,18 @@ pub fn record<S: SampleSink>(
     // don't actually need a Mach task port. libproc gives us the
     // image regions and thread names by PID, with read-permission
     // gating instead of task-port policy.
-    let mut images = ImageScanner::new();
+    //
+    // Open the shared cache once and share it via `Arc` -- the
+    // image scanner needs it for symbol enumeration, and the live
+    // sink needs the same parsed cache as a `MachOByteSource` so
+    // the binary registry can disassemble system code without
+    // re-parsing. Single parse, two consumers.
+    let shared_cache: Option<std::sync::Arc<nperf_mac_shared_cache::SharedCache>> =
+        nperf_mac_shared_cache::SharedCache::for_host().map(std::sync::Arc::new);
+    if let Some(sc) = shared_cache.clone() {
+        sink.on_macho_byte_source(sc);
+    }
+    let mut images = ImageScanner::new(shared_cache);
     let mut thread_names = ThreadNameCache::new();
 
     let t0 = Instant::now();

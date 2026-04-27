@@ -718,6 +718,17 @@ impl SampleSink for MacSink {
             });
         }
     }
+
+    fn on_macho_byte_source(
+        &mut self,
+        source: std::sync::Arc<dyn nerf_mac_capture::MachOByteSource>,
+    ) {
+        // Forward to the live sink so the binary registry can use
+        // it for disassembly fallback; offline archive ignores.
+        if let Some(sink) = self.live_sink.as_ref() {
+            sink.on_macho_byte_source(source);
+        }
+    }
 }
 
 /// Look up the executable path for `pid` via `proc_pidpath(3)`.
