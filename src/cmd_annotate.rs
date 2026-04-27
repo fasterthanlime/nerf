@@ -622,23 +622,10 @@ fn disassemble_aarch64< W: Write, F >(
 }
 
 pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
-    // Parse the jitdump up front (if any), capturing the actual code bytes
-    // alongside the per-record VA. State::jitdump_names already remembers the
-    // VA->name mapping, but throws the bytes away — we need them here.
-    let jit_code: HashMap< AbsoluteAddr, Vec< u8 > > = if let Some( path ) = args.collation_args.jitdump.as_ref() {
-        let dump = crate::jitdump::JitDump::load( std::path::Path::new( path ) )
-            .map_err( |err| format!( "failed to open jitdump {:?}: {}", path, err ) )?;
-        let mut map = HashMap::new();
-        for record in dump.records {
-            if let crate::jitdump::Record::CodeLoad { virtual_address, code, .. } = record {
-                map.insert( AbsoluteAddr( virtual_address ), code.into_owned() );
-            }
-        }
-        map
-    } else {
-        HashMap::new()
-    };
-
+    // JIT code bytes live on `State` now: `read_data` populates them
+    // from both the explicit `--jitdump` file (if any) and any
+    // `jit-*.dump` blobs the recorder embedded in the archive
+    // (FileBlob packets at session end). We just consume them here.
     let (_, read_data_args) = repack_cli_args( &args.collation_args );
 
     let mut funcs: HashMap< FuncKey, FuncRecord > = HashMap::new();
@@ -825,10 +812,10 @@ pub fn main( args: AnnotateArgs ) -> Result< (), Box< dyn Error > > {
                 }
             }
             (FuncSourceTag::Jit, FuncRecord::Jit { range, counts, total }) => {
-                let bytes = match jit_code.get( &range.start ) {
+                let bytes = match state.jit_code().get( &range.start.raw() ) {
                     Some( b ) => b.as_slice(),
                     None => {
-                        writeln!( out, "==== {} [JIT]  range 0x{:x}..0x{:x}  total={}  (no jitdump code bytes; pass --jitdump?) ====\n",
+                        writeln!( out, "==== {} [JIT]  range 0x{:x}..0x{:x}  total={}  (no jitdump code bytes — recorder didn't embed a jit-*.dump FileBlob; pass --jitdump to override) ====\n",
                                   name, range.start.raw(), range.end.raw(), total )?;
                         continue;
                     }

@@ -267,6 +267,12 @@ pub(crate) struct State {
     cpu_count: u32,
     frequency: Option< u32 >,
     jitdump_names: RangeMap< String >,
+    /// JIT code bytes, keyed by virtual address. Populated from both
+    /// the explicit --jitdump file (if any) and from any jit-*.dump
+    /// `FileBlob` packets the recorder embedded in the archive.
+    /// `cmd_annotate` reads this to disassemble JIT'd functions when
+    /// the user asks for `--function <jit_name>`.
+    jit_code: HashMap< u64, Vec< u8 > >,
     architecture: String,
     platform: crate::archive::Platform,
 }
@@ -320,6 +326,10 @@ impl State {
 
     pub(crate) fn jitdump_names( &self ) -> &RangeMap< String > {
         &self.jitdump_names
+    }
+
+    pub(crate) fn jit_code( &self ) -> &HashMap< u64, Vec< u8 > > {
+        &self.jit_code
     }
 }
 
@@ -540,6 +550,7 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
         cpu_count: 1,
         frequency: None,
         jitdump_names: RangeMap::new(),
+        jit_code: HashMap::new(),
         architecture: String::new(),
         platform: crate::archive::Platform::Linux,
     };
@@ -565,7 +576,9 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
         for record in jitdump.records {
             match record {
                 crate::jitdump::Record::CodeLoad { timestamp, virtual_address, name, code, .. } => {
-                    jitdump_events.push_back( (timestamp, virtual_address..virtual_address + code.len() as u64, name) );
+                    let len = code.len() as u64;
+                    state.jit_code.insert( virtual_address, code.into_owned() );
+                    jitdump_events.push_back( (timestamp, virtual_address..virtual_address + len, name) );
                 },
                 crate::jitdump::Record::Unknown { .. } => {}
             }
@@ -596,7 +609,9 @@ pub(crate) fn read_data< F >( args: ReadDataArgs, mut on_event: F ) -> Result< S
                             debug!( "Loading embedded jitdump {:?} ({} bytes)", String::from_utf8_lossy( path.as_ref() ), data.len() );
                             for record in jitdump.records {
                                 if let crate::jitdump::Record::CodeLoad { timestamp, virtual_address, name, code, .. } = record {
-                                    jitdump_events.push_back( (timestamp, virtual_address..virtual_address + code.len() as u64, name) );
+                                    let len = code.len() as u64;
+                                    state.jit_code.insert( virtual_address, code.into_owned() );
+                                    jitdump_events.push_back( (timestamp, virtual_address..virtual_address + len, name) );
                                 }
                             }
                         }
