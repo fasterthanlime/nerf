@@ -3,21 +3,15 @@
 //! Two modes, dispatched on euid at runtime:
 //!
 //!   * **non-root**: ad-hoc-codesign the current `stax` binary with the
-//!     `com.apple.security.cs.debugger` entitlement so `task_for_pid`
-//!     works against non-hardened processes without sudo. This is the
-//!     legacy behaviour, adapted from samply/src/mac/codesign_setup.rs
-//!     (1920bd32, MIT OR Apache-2.0).
+//!     `com.apple.security.cs.debugger` entitlement. (Adapted from
+//!     samply/src/mac/codesign_setup.rs, 1920bd32, MIT OR Apache-2.0.)
 //!
 //!   * **root** (`sudo stax setup`): install `staxd` as a
 //!     LaunchDaemon. Copies `~$SUDO_USER/.cargo/bin/staxd` to
 //!     `/usr/local/bin/staxd`, drops the LaunchDaemon plist into
-//!     `/Library/LaunchDaemons/`, and `launchctl bootstrap`s it. After
-//!     this, `stax record --mac-backend daemon …` runs without sudo
-//!     and the recorder reaches kperf via the privileged daemon.
-//!
-//! The broker (`stax-task-broker`, a per-user LaunchAgent) gets
-//! installed in a follow-up; for now `cargo xtask install` already
-//! drops a codesigned copy in `~/.cargo/bin/` so it's exec'able.
+//!     `/Library/LaunchDaemons/`, and `launchctl bootstrap`s it.
+//!     After this, `stax record …` runs without sudo because the
+//!     privileged kperf calls happen in `staxd`.
 
 use std::env;
 use std::error::Error;
@@ -143,14 +137,11 @@ Press Enter to continue, or Ctrl-C to cancel."#,
     }
 
     println!("Code signing successful: {}", exe.display());
-    println!(
-        "You can now run `stax record --pid <PID> ...` against most user processes \
-         without sudo. Hardened-runtime apps (App Store / system) still need root.",
-    );
+    println!("You can now run `stax record …` without sudo.");
     println!();
     println!(
-        "To enable the daemon backend (`--mac-backend daemon`, no sudo even for \
-         hardened-runtime targets), run: sudo stax setup",
+        "To install staxd as a LaunchDaemon (so the privileged kperf \
+         calls happen there, not in your CLI), run: sudo stax setup",
     );
     Ok(())
 }
@@ -182,8 +173,8 @@ Steps:
   2. Write {} from embedded plist
   3. launchctl bootstrap system {} (or load on older macOS)
 
-After install, stax record --mac-backend daemon works without sudo
-because the privileged kperf calls happen in staxd.
+After install, `stax record …` works without sudo because the
+privileged kperf calls happen in staxd.
 
 Press Enter to continue, or Ctrl-C to cancel."#,
             staged.display(),
@@ -232,7 +223,7 @@ Press Enter to continue, or Ctrl-C to cancel."#,
     println!(":: staxd installed and running.");
     println!(":: socket    : /var/run/staxd.sock");
     println!(":: logs      : /var/log/staxd.log");
-    println!(":: now: stax record --mac-backend daemon --pid <PID>");
+    println!(":: now: stax record --serve 127.0.0.1:8080 -- /bin/foo");
     Ok(())
 }
 

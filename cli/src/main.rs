@@ -1,9 +1,9 @@
 use std::env;
 use std::error::Error;
 use std::process::exit;
-use structopt::StructOpt;
 
-use stax_core::{args, cmd_record_mac, cmd_setup_mac};
+use figue as args;
+use stax_core::{args::{Cli, Command, RecordArgs}, cmd_record_mac, cmd_setup_mac};
 
 fn main_impl() -> Result<(), Box<dyn Error>> {
     if env::var("RUST_LOG").is_err() {
@@ -14,23 +14,34 @@ fn main_impl() -> Result<(), Box<dyn Error>> {
 
     env_logger::init();
 
-    let opt = args::Opt::from_args();
-    match opt {
-        args::Opt::Record(args) => run_record(args)?,
-        args::Opt::Setup(args) => cmd_setup_mac::main(args)?,
-    }
+    let cli: Cli = args::Driver::new(
+        args::builder::<Cli>()
+            .expect("failed to build CLI")
+            .cli(|c| c.args(env::args().skip(1)))
+            .help(|h| {
+                h.program_name(env!("CARGO_PKG_NAME"))
+                    .version(env!("CARGO_PKG_VERSION"))
+            })
+            .build(),
+    )
+    .run()
+    .unwrap();
 
+    match cli.command {
+        Command::Record(args) => run_record(args)?,
+        Command::Setup(args) => cmd_setup_mac::main(args)?,
+    }
     Ok(())
 }
 
 fn main() {
     if let Err(error) = main_impl() {
-        eprintln!("error: {}", error);
+        eprintln!("error: {error}");
         exit(1);
     }
 }
 
-fn run_record(args: args::RecordArgs) -> Result<(), Box<dyn Error>> {
+fn run_record(args: RecordArgs) -> Result<(), Box<dyn Error>> {
     let (live_sink, _runtime): (Option<Box<dyn stax_core::live_sink::LiveSink>>, _) =
         if let Some(ref addr) = args.serve {
             let runtime = tokio::runtime::Builder::new_multi_thread()

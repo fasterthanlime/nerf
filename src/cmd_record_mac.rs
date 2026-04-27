@@ -29,11 +29,10 @@ pub fn main_with_live_sink(
     args: args::RecordArgs,
     live_sink: Option<Box<dyn LiveSink>>,
 ) -> Result<(), Box<dyn Error>> {
-    match TargetProcess::from(args.process_filter.clone()) {
+    match args.target()? {
         TargetProcess::ByPid(pid) => record_existing_pid(args, pid, live_sink),
-        TargetProcess::ByName(name) => {
-            let prog_args = args.program_args.clone();
-            record_child_launch(args, name, prog_args, live_sink)
+        TargetProcess::Launch { program, args: prog_args } => {
+            record_child_launch(args, program, prog_args, live_sink)
         }
     }
 }

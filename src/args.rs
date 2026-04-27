@@ -1,95 +1,85 @@
-use structopt::StructOpt;
+use facet::Facet;
+use figue as args;
 
 pub enum TargetProcess {
     ByPid(u32),
-    ByName(String),
+    Launch { program: String, args: Vec<String> },
 }
 
-#[derive(StructOpt, Clone, Debug)]
-#[structopt(rename_all = "kebab-case")]
-pub struct ProcessFilter {
-    /// Profile a process with a given PID (conflicts with --process)
-    #[structopt(
-        long,
-        short = "p",
-        raw(required_unless_one = r#"&["process"]"#)
-    )]
-    pid: Option<u32>,
-    /// Profile a process with a given name (conflicts with --pid)
-    #[structopt(
-        long,
-        short = "P",
-        raw(required_unless_one = r#"&["pid"]"#)
-    )]
-    process: Option<String>,
+/// stax — live profiler frontend that drives the staxd daemon backend
+/// over a local socket and streams aggregated samples over WebSocket.
+#[derive(Facet, Debug)]
+pub struct Cli {
+    #[facet(args::subcommand)]
+    pub command: Command,
+
+    #[facet(flatten)]
+    pub builtins: args::FigueBuiltins,
 }
 
-impl From<ProcessFilter> for TargetProcess {
-    fn from(args: ProcessFilter) -> Self {
-        if let Some(process) = args.process {
-            TargetProcess::ByName(process)
-        } else if let Some(pid) = args.pid {
-            TargetProcess::ByPid(pid)
-        } else {
-            unreachable!();
-        }
-    }
-}
-
-#[derive(StructOpt, Debug)]
-#[structopt(rename_all = "kebab-case")]
-pub struct RecordArgs {
-    /// PET sampling frequency, in Hz.
-    #[structopt(long, short = "F", default_value = "900")]
-    pub frequency: u32,
-
-    /// Stop sampling after this many seconds. Unlimited by default
-    /// (Ctrl-C to stop).
-    #[structopt(long, short = "l")]
-    pub time_limit: Option<u64>,
-
-    #[structopt(flatten)]
-    pub process_filter: ProcessFilter,
-
-    /// Start a live RPC/WebSocket server on the given host:port (e.g.
-    /// 127.0.0.1:8080).
-    #[structopt(long)]
-    pub serve: Option<String>,
-
-    /// Local socket path of the running `staxd` daemon. Defaults to the
-    /// path `sudo stax setup` installs.
-    #[structopt(long, default_value = "/var/run/staxd.sock")]
-    pub daemon_socket: String,
-
-    /// Arguments to pass to the launched child process. Use `--` to
-    /// separate stax flags from the target's arguments:
-    ///
-    ///     stax record --process /bin/foo -- --some-flag bar baz
-    #[structopt(raw(last = "true"), name = "PROGRAM_ARGS")]
-    pub program_args: Vec<String>,
-}
-
-#[derive(StructOpt, Debug)]
-#[structopt(
-    raw(setting = "structopt::clap::AppSettings::ArgRequiredElseHelp")
-)]
-pub enum Opt {
+#[derive(Facet, Debug)]
+#[repr(u8)]
+pub enum Command {
     /// Record live profiling data, streamed over `--serve`.
-    #[structopt(name = "record")]
     Record(RecordArgs),
 
     /// Codesign this stax binary (or, when run as root, install staxd
     /// as a LaunchDaemon).
-    #[cfg(target_os = "macos")]
-    #[structopt(name = "setup")]
     Setup(SetupArgs),
 }
 
-#[cfg(target_os = "macos")]
-#[derive(StructOpt, Debug)]
-#[structopt(rename_all = "kebab-case")]
+#[derive(Facet, Debug)]
+pub struct RecordArgs {
+    /// PET sampling frequency, in Hz.
+    #[facet(args::named, args::short = 'F', default = 900)]
+    pub frequency: u32,
+
+    /// Stop sampling after this many seconds. Unlimited by default
+    /// (Ctrl-C to stop).
+    #[facet(args::named, args::short = 'l', default)]
+    pub time_limit: Option<u64>,
+
+    /// Profile an existing process by PID instead of launching one.
+    #[facet(args::named, args::short = 'p', default)]
+    pub pid: Option<u32>,
+
+    /// Start a live RPC/WebSocket server on the given host:port (e.g.
+    /// 127.0.0.1:8080).
+    #[facet(args::named, default)]
+    pub serve: Option<String>,
+
+    /// Local socket path of the running `staxd` daemon. Defaults to the
+    /// path `sudo stax setup` installs.
+    #[facet(args::named, default = "/var/run/staxd.sock")]
+    pub daemon_socket: String,
+
+    /// Command to launch and profile. Use `--` to keep the target's
+    /// flags from being interpreted by stax:
+    ///
+    ///     stax record -- /bin/foo --some-flag bar baz
+    #[facet(args::positional, default)]
+    pub command: Vec<String>,
+}
+
+impl RecordArgs {
+    pub fn target(&self) -> Result<TargetProcess, String> {
+        match (self.pid, self.command.split_first()) {
+            (Some(_), Some(_)) => {
+                Err("specify either --pid or a command to launch, not both".to_owned())
+            }
+            (Some(pid), None) => Ok(TargetProcess::ByPid(pid)),
+            (None, Some((program, rest))) => Ok(TargetProcess::Launch {
+                program: program.clone(),
+                args: rest.to_vec(),
+            }),
+            (None, None) => Err("specify either --pid <PID> or a command to launch".to_owned()),
+        }
+    }
+}
+
+#[derive(Facet, Debug)]
 pub struct SetupArgs {
     /// Skip the confirmation prompt before running `codesign`.
-    #[structopt(long, short = "y")]
+    #[facet(args::named, args::short = 'y', default)]
     pub yes: bool,
 }
