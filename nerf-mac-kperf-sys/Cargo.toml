@@ -1,0 +1,16 @@
+[package]
+name = "nerf-mac-kperf-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Privileged-side macOS kperf/kdebug/kpc bindings for nerf. Wraps Apple's private kperf/kperfdata frameworks plus the KERN_KDEBUG sysctl surface; everything in this crate requires either root or an Apple-private entitlement to actually exercise. Pair with `nerf-mac-kperf-parse` for the unprivileged half (sample assembly, libproc, symbol scanning)."
+
+# References:
+# - mperf (https://github.com/tmcgilchrist/mperf, MIT) for the PET driver.
+# - ibireme's kpc_demo.c (public domain).
+# - Apple's kperf/kperfdata private frameworks (loaded at runtime via dlopen).
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+log = "0.4"
+thiserror = "2"

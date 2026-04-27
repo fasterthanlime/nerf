@@ -1,0 +1,17 @@
+[package]
+name = "nerf-mac-kperf-parse"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Unprivileged-side parsing and symbolication for nerf's macOS sampling backend. Consumes the `KdBuf` record stream from `nerf-mac-kperf-sys` (which is the privileged half) and assembles `Sample`s, walks libproc image regions, parses the on-disk kernel for symbol tables, and tails `/tmp/jit-<pid>.dump` for JIT'd code. Nothing here calls into a privileged kernel interface at runtime — the intent is that this crate works as the client side of an eventual nperfd RPC."
+
+[dependencies]
+log = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nerf-mac-kperf-sys = { version = "0.1", path = "../nerf-mac-kperf-sys" }
+nerf-mac-capture = { version = "0.1", path = "../nerf-mac-capture" }
+nperf-mac-shared-cache = { version = "0.1", path = "../nperf-mac-shared-cache" }
+libc = "0.2"
+memmap2 = "0.9"
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "macho", "unaligned"] }

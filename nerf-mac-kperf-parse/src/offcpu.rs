@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use crate::kdebug::{kdbg_code, kdbg_subclass, mach_sched, KdBuf, KDBG_TIMESTAMP_MASK};
+use nerf_mac_kperf_sys::kdebug::{kdbg_code, kdbg_subclass, mach_sched, KdBuf, KDBG_TIMESTAMP_MASK};
 
 #[derive(Default)]
 pub struct CpuIntervalTracker {
@@ -141,7 +141,7 @@ impl CpuIntervalTracker {
 
     pub fn feed(&mut self, rec: &KdBuf) {
         let subclass = kdbg_subclass(rec.debugid);
-        if subclass != crate::kdebug::DBG_MACH_SCHED {
+        if subclass != nerf_mac_kperf_sys::kdebug::DBG_MACH_SCHED {
             return;
         }
         let code = kdbg_code(rec.debugid);

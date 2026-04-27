@@ -1824,10 +1824,31 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "nerf-mac-capture",
+ "nerf-mac-kperf-parse",
+ "nerf-mac-kperf-sys",
+ "nperf-mac-shared-cache",
+]
+
+[[package]]
+name = "nerf-mac-kperf-parse"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
  "memmap2",
  "nerf-mac-capture",
+ "nerf-mac-kperf-sys",
  "nperf-mac-shared-cache",
  "object 0.39.1",
+]
+
+[[package]]
+name = "nerf-mac-kperf-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
  "thiserror",
 ]
 

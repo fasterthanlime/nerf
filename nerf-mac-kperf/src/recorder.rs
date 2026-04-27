@@ -15,16 +15,16 @@ use nerf_mac_capture::{
     BinaryLoadedEvent, JitdumpEvent, SampleEvent, SampleSink, ThreadNameEvent, WakeupEvent,
 };
 
-use crate::bindings::{self, sampler, Frameworks};
-use crate::error::Error;
-use crate::image_scan::ImageScanner;
-use crate::jitdump_tail::JitdumpTailer;
-use crate::kdebug::{self, kdbg_class, kdbg_code, kdbg_func, kdbg_subclass, KdBuf, KdRegtype, DBG_PERF};
-use crate::kernel_symbols::{KernelImage, SlideEstimator};
-use crate::libproc;
-use crate::offcpu::CpuIntervalTracker;
-use crate::parser::Parser;
-use crate::pmu_events::{self, ConfiguredPmu, PmuSlot};
+use nerf_mac_kperf_parse::image_scan::ImageScanner;
+use nerf_mac_kperf_parse::jitdump_tail::JitdumpTailer;
+use nerf_mac_kperf_parse::kernel_symbols::{KernelImage, SlideEstimator};
+use nerf_mac_kperf_parse::libproc;
+use nerf_mac_kperf_parse::offcpu::CpuIntervalTracker;
+use nerf_mac_kperf_parse::parser::Parser;
+use nerf_mac_kperf_sys::bindings::{self, sampler, Frameworks};
+use nerf_mac_kperf_sys::error::Error;
+use nerf_mac_kperf_sys::kdebug::{self, kdbg_class, kdbg_code, kdbg_func, kdbg_subclass, KdBuf, KdRegtype, DBG_PERF};
+use nerf_mac_kperf_sys::pmu_events::{self, ConfiguredPmu, PmuSlot};
 
 /// Configuration for a kperf-driven recording session.
 pub struct RecordOptions {

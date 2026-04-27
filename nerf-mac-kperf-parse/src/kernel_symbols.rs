@@ -27,7 +27,7 @@ use object::macho::{MachHeader64, N_SECT, N_STAB, N_TYPE};
 use object::read::macho::{LoadCommandVariant, MachHeader as _, Nlist as _};
 use object::LittleEndian;
 
-use crate::error::Error;
+use nerf_mac_kperf_sys::error::Error;
 
 /// KASLR slides on arm64-darwin are page-aligned at 16KB.
 const SLIDE_ALIGNMENT: u64 = 0x4000;

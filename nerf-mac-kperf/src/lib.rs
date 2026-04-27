@@ -7,6 +7,14 @@
 //! than task-local, the kernel walks frame pointers itself instead of
 //! framehop, and kernel stacks come for free.
 //!
+//! This is the orchestration crate. It depends on
+//! [`nerf-mac-kperf-sys`] (the privileged half — framework loading,
+//! kdebug sysctls, PMU config) and [`nerf-mac-kperf-parse`] (the
+//! unprivileged half — sample assembly, libproc, symbols), and ties
+//! them together in `record()`. The split is in preparation for an
+//! eventual `nperfd` daemon: the daemon will link `-sys` and stream
+//! `KdBuf` records to clients that only need `-parse`.
+//!
 //! References:
 //! - mperf (<https://github.com/tmcgilchrist/mperf>, MIT) for the PET
 //!   driver shape.
@@ -16,20 +24,14 @@
 
 #![cfg(target_os = "macos")]
 
-pub mod bindings;
-pub mod error;
-pub mod image_scan;
-pub mod jitdump_tail;
-pub mod kdebug;
-pub mod kernel_symbols;
-pub mod libproc;
-pub mod offcpu;
-pub mod parser;
-pub mod pmu_events;
 pub mod recorder;
 
-pub use nperf_mac_shared_cache as shared_cache;
+// Re-export the sub-crates so existing consumers (nperf-core,
+// examples, downstream crates) can keep saying
+// `nerf_mac_kperf::kdebug::*` etc. without churn.
+pub use nerf_mac_kperf_parse::{image_scan, jitdump_tail, kernel_symbols, libproc, offcpu, parser};
+pub use nerf_mac_kperf_sys::{bindings, error, kdebug, pmu_events, Error};
 
-pub use error::Error;
+pub use nperf_mac_shared_cache as shared_cache;
 
 pub use recorder::{record, RecordOptions};
