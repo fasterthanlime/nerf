@@ -11,9 +11,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use parking_lot::Mutex;
 use stax_live_proto::{
-    RunControl, RunControlDispatcher, RunSummary, ServerStatus, WaitCondition, WaitOutcome,
+    IngestEvent, RunConfig, RunControl, RunControlDispatcher, RunId, RunIngest,
+    RunIngestDispatcher, RunState, RunSummary, ServerStatus, StopReason, WaitCondition,
+    WaitOutcome,
 };
 
 const DEFAULT_SOCK_NAME: &str = "stax-server.sock";
@@ -56,10 +60,30 @@ async fn main() -> eyre::Result<()> {
         };
         let server = server.clone();
         tokio::spawn(async move {
-            let dispatcher = RunControlDispatcher::new(server);
+            let factory = vox::acceptor_fn({
+                let server = server.clone();
+                move |request: &vox::ConnectionRequest,
+                      connection: vox::PendingConnection|
+                      -> Result<(), vox::Metadata<'static>> {
+                    match request.service() {
+                        "RunControl" => {
+                            connection.handle_with(RunControlDispatcher::new(server.clone()));
+                            Ok(())
+                        }
+                        "RunIngest" => {
+                            connection.handle_with(RunIngestDispatcher::new(server.clone()));
+                            Ok(())
+                        }
+                        other => {
+                            log::warn!("stax-server: rejecting unknown service {other:?}");
+                            Err(vec![])
+                        }
+                    }
+                }
+            });
             let result = vox::acceptor_on(link)
                 .non_resumable()
-                .on_connection(dispatcher)
+                .on_connection(factory)
                 .establish::<vox::NoopClient>()
                 .await;
             match result {
@@ -88,6 +112,7 @@ fn resolve_socket_path() -> PathBuf {
 struct ServerState {
     inner: Arc<Mutex<Inner>>,
     started_at_unix_ns: u64,
+    next_run_id: Arc<AtomicU64>,
 }
 
 struct Inner {
@@ -107,6 +132,7 @@ impl ServerState {
                 history: Vec::new(),
             })),
             started_at_unix_ns: now_unix_ns(),
+            next_run_id: Arc::new(AtomicU64::new(1)),
         }
     }
 }
@@ -163,11 +189,113 @@ impl RunControl for ServerState {
     async fn stop_active(&self) -> Result<RunSummary, String> {
         let mut inner = self.inner.lock();
         match inner.active.take() {
-            Some(summary) => {
+            Some(mut summary) => {
+                summary.state = RunState::Stopped;
+                summary.stop_reason = Some(StopReason::UserStop);
+                summary.stopped_at_unix_ns = Some(now_unix_ns());
                 inner.history.push(summary.clone());
                 Ok(summary)
             }
             None => Err("no active run".to_owned()),
         }
+    }
+}
+
+impl RunIngest for ServerState {
+    async fn start_run(
+        &self,
+        config: RunConfig,
+        mut events: vox::Rx<IngestEvent>,
+    ) -> Result<RunId, String> {
+        let id = RunId(self.next_run_id.fetch_add(1, Ordering::Relaxed));
+        let summary = RunSummary {
+            id,
+            state: RunState::Recording,
+            stop_reason: None,
+            started_at_unix_ns: now_unix_ns(),
+            stopped_at_unix_ns: None,
+            target_pid: None,
+            label: config.label,
+            pet_samples: 0,
+            off_cpu_intervals: 0,
+        };
+        {
+            let mut inner = self.inner.lock();
+            if inner.active.is_some() {
+                return Err("another run is already active; \
+                    call RunControl::stop_active or wait_active first"
+                    .to_owned());
+            }
+            inner.active = Some(summary);
+        }
+
+        log::info!(
+            "stax-server: run {} started (frequency_hz={})",
+            id.0,
+            config.frequency_hz
+        );
+
+        // Drain the events channel in the background. When the
+        // recorder closes the channel we mark the run Stopped.
+        //
+        // SelfRef<IngestEvent> has no Reborrow impl (the enum holds
+        // Strings / Vecs); `.map` consumes the SelfRef so we can match
+        // on the owned value, then drop it together with the backing.
+        let state = self.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(event_sref)) = events.recv().await {
+                let state = state.clone();
+                let _ = event_sref.map(|event| {
+                    state.apply_event(id, &event);
+                });
+            }
+            state.finalize_run(id, StopReason::TargetExited);
+        });
+
+        Ok(id)
+    }
+}
+
+impl ServerState {
+    /// Update the active run's stats from one ingest event. Today this
+    /// just bumps counters; once the in-memory aggregator lands the
+    /// real implementation will fan events into it.
+    fn apply_event(&self, run_id: RunId, event: &IngestEvent) {
+        let mut inner = self.inner.lock();
+        let Some(active) = inner.active.as_mut() else {
+            return;
+        };
+        if active.id != run_id {
+            return;
+        }
+        match event {
+            IngestEvent::Sample(_) => active.pet_samples += 1,
+            IngestEvent::OffCpuInterval(_) => active.off_cpu_intervals += 1,
+            IngestEvent::TargetAttached { pid, .. } => {
+                active.target_pid = Some(*pid);
+            }
+            _ => {}
+        }
+    }
+
+    fn finalize_run(&self, run_id: RunId, reason: StopReason) {
+        let mut inner = self.inner.lock();
+        let Some(active) = inner.active.as_ref() else {
+            return;
+        };
+        if active.id != run_id {
+            return;
+        }
+        let mut summary = inner.active.take().expect("checked above");
+        summary.state = RunState::Stopped;
+        summary.stop_reason = Some(reason);
+        summary.stopped_at_unix_ns = Some(now_unix_ns());
+        log::info!(
+            "stax-server: run {} stopped after {} samples / {} intervals",
+            summary.id.0,
+            summary.pet_samples,
+            summary.off_cpu_intervals
+        );
+        inner.history.push(summary);
     }
 }

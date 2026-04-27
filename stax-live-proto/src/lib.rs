@@ -685,6 +685,115 @@ pub enum WaitOutcome {
     NoActiveRun,
 }
 
+/// One symbol entry from a Mach-O `LC_SYMTAB`. Same shape as the
+/// recorder's internal `MachOSymbol`, lifted onto the wire so we can
+/// ferry the symbol table from recorder to server. Addresses are
+/// SVMAs.
+#[derive(Clone, Debug, Facet)]
+pub struct WireMachOSymbol {
+    pub start_svma: u64,
+    pub end_svma: u64,
+    pub name: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct WireBinaryLoaded {
+    pub path: String,
+    pub base_avma: u64,
+    pub vmsize: u64,
+    pub text_svma: u64,
+    pub arch: Option<String>,
+    pub is_executable: bool,
+    pub symbols: Vec<WireMachOSymbol>,
+    /// `__TEXT` bytes embedded inline (today: JIT'd code via the
+    /// jitdump tailer). `None` for on-disk images.
+    pub text_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct WireSampleEvent {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub kernel_backtrace: Vec<u64>,
+    pub user_backtrace: Vec<u64>,
+    pub cycles: u64,
+    pub instructions: u64,
+    pub l1d_misses: u64,
+    pub branch_mispreds: u64,
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct WireOnCpuInterval {
+    pub tid: u32,
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct WireOffCpuInterval {
+    pub tid: u32,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub stack: Vec<u64>,
+    pub waker_tid: Option<u32>,
+    pub waker_user_stack: Option<Vec<u64>>,
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct WireWakeup {
+    pub timestamp_ns: u64,
+    pub waker_tid: u32,
+    pub wakee_tid: u32,
+    pub waker_user_stack: Vec<u64>,
+    pub waker_kernel_stack: Vec<u64>,
+}
+
+/// One ingest event the recorder ships to the server. Mirrors the
+/// in-process `LiveSink` trait minus `on_macho_byte_source` (which
+/// holds an mmap-backed `Arc<dyn Trait>` that doesn't cross a
+/// process boundary directly; the server will open the shared cache
+/// itself by path in a follow-up).
+#[derive(Clone, Debug, Facet)]
+#[repr(u8)]
+pub enum IngestEvent {
+    /// Recorder acquired its handle on the target. Fires once at
+    /// the start of recording.
+    TargetAttached { pid: u32, task_port: u64 },
+    Sample(WireSampleEvent),
+    OnCpuInterval(WireOnCpuInterval),
+    OffCpuInterval(WireOffCpuInterval),
+    BinaryLoaded(WireBinaryLoaded),
+    BinaryUnloaded { path: String, base_avma: u64 },
+    ThreadName { pid: u32, tid: u32, name: String },
+    Wakeup(WireWakeup),
+}
+
+#[derive(Clone, Debug, Facet)]
+pub struct RunConfig {
+    /// Free-form label (typically the launch command's basename).
+    pub label: String,
+    /// PET sampling frequency the recorder requested, Hz. Surfaced in
+    /// `RunSummary` so the UI can label samples.
+    pub frequency_hz: u32,
+}
+
+/// Recorder → server ingest plane. Open one channel per run; close
+/// the channel to signal end-of-recording.
+#[vox::service]
+pub trait RunIngest {
+    /// Open a new run. Returns the assigned `RunId` and consumes the
+    /// `events` channel; the server treats channel-close as
+    /// end-of-recording. Errors if another run is currently active
+    /// — callers should `RunControl::wait_active` or `stop_active`
+    /// before retrying.
+    async fn start_run(
+        &self,
+        config: RunConfig,
+        events: vox::Rx<IngestEvent>,
+    ) -> Result<RunId, String>;
+}
+
 /// Agent-facing control plane. One service instance per server; runs
 /// are addressed by `RunId`. The web UI uses the existing `Profiler`
 /// trait for view subscriptions; agents use `RunControl` for
@@ -719,5 +828,9 @@ pub trait RunControl {
 /// All service descriptors exposed by stax-live; the codegen iterates over
 /// this list.
 pub fn all_services() -> Vec<&'static vox::session::ServiceDescriptor> {
-    vec![profiler_service_descriptor(), run_control_service_descriptor()]
+    vec![
+        profiler_service_descriptor(),
+        run_control_service_descriptor(),
+        run_ingest_service_descriptor(),
+    ]
 }
