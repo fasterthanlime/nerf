@@ -8,6 +8,8 @@ use std::ffi::{CStr, OsString};
 use std::fs::File;
 use std::io::{self, BufWriter};
 use std::path::PathBuf;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::prelude::*;
@@ -185,7 +187,8 @@ fn record_child_launch(
     .map_err(|err| format!("preparing TaskLauncher: {:?}", err))?;
 
     info!("Launching {}...", program);
-    let mut child = launcher.launch_child();
+    let child_guard = ChildGuard::new(launcher.launch_child());
+    let child_for_stop = child_guard.share();
 
     info!("Waiting for child to bootstrap via preload dylib...");
     let accepted_task = wait_for_my_task(&mut accepter, Duration::from_secs(10))?;
@@ -226,9 +229,9 @@ fn record_child_launch(
             return true;
         }
         // Also stop if the child has exited.
-        match child.try_wait() {
-            Ok(Some(_)) => true,
-            _ => false,
+        match child_for_stop.lock() {
+            Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
+            Err(_) => true,
         }
     };
 
@@ -263,9 +266,7 @@ fn record_child_launch(
         return Err(format!("nerf-mac-capture::record failed: {}", err).into());
     }
 
-    // Best-effort shutdown of the child if it's still running.
-    let _ = child.kill();
-    let _ = child.wait();
+    // child_guard drops at end of scope, killing + reaping the child.
 
     sink.finish()?;
     Ok(())
@@ -292,10 +293,12 @@ fn record_child_launch_kperf(
     let mut cmd = Command::new(&program);
     cmd.args(&program_args);
     drop_sudo_privileges(&mut cmd);
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|err| format!("failed to spawn {program}: {err}"))?;
     let pid = child.id();
+    let child_guard = ChildGuard::new(child);
+    let child_for_stop = child_guard.share();
     info!("Child started: PID {}", pid);
 
     let exe_path = proc_pidpath(pid).unwrap_or_else(|_| program.clone());
@@ -318,7 +321,10 @@ fn record_child_launch_kperf(
         if sigint.was_triggered() {
             return true;
         }
-        matches!(child.try_wait(), Ok(Some(_)))
+        match child_for_stop.lock() {
+            Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
+            Err(_) => true,
+        }
     };
 
     info!("Running... press Ctrl-C to stop.");
@@ -326,6 +332,7 @@ fn record_child_launch_kperf(
         return Err(format!("nerf-mac-kperf::record failed: {}", err).into());
     }
 
+    // child_guard drops at end of scope, killing + reaping the child.
     sink.finish()?;
     Ok(())
 }
@@ -346,10 +353,12 @@ fn record_child_launch_daemon(
     info!("Launching {}...", program);
     let mut cmd = Command::new(&program);
     cmd.args(&program_args);
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|err| format!("failed to spawn {program}: {err}"))?;
     let pid = child.id();
+    let child_guard = ChildGuard::new(child);
+    let child_for_stop = child_guard.share();
     info!("Child started: PID {}", pid);
 
     let exe_path = proc_pidpath(pid).unwrap_or_else(|_| program.clone());
@@ -373,7 +382,10 @@ fn record_child_launch_daemon(
         if sigint.was_triggered() {
             return true;
         }
-        matches!(child.try_wait(), Ok(Some(_)))
+        match child_for_stop.lock() {
+            Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
+            Err(_) => true,
+        }
     };
 
     info!("Running... press Ctrl-C to stop.");
@@ -385,6 +397,7 @@ fn record_child_launch_daemon(
         return Err(format!("nperfd-client failed: {err}").into());
     }
 
+    // child_guard drops at end of scope, killing + reaping the child.
     sink.finish()?;
     Ok(())
 }
@@ -872,6 +885,41 @@ impl SampleSink for MacSink {
         // it for disassembly fallback; offline archive ignores.
         if let Some(sink) = self.live_sink.as_ref() {
             sink.on_macho_byte_source(source);
+        }
+    }
+}
+
+/// RAII guard for a child process we launched: kill + wait on drop.
+///
+/// `std::process::Child` deliberately doesn't kill on drop (the
+/// stdlib leaves the policy to the caller), but the contract for
+/// `nperf record --process` is "if nperf detached, the child should
+/// detach too." We share the inner `Child` between the guard (for
+/// kill+wait on the way out) and the `should_stop` closure (which
+/// polls `try_wait()` so the recorder stops when the child exits on
+/// its own).
+struct ChildGuard {
+    child: Arc<Mutex<Child>>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Arc::new(Mutex::new(child)) }
+    }
+
+    fn share(&self) -> Arc<Mutex<Child>> {
+        self.child.clone()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Ok(mut c) = self.child.lock() {
+            // Both calls are best-effort: child may have already
+            // exited (kill returns EPERM or NotFound) and wait may
+            // race with a try_wait that already reaped the zombie.
+            let _ = c.kill();
+            let _ = c.wait();
         }
     }
 }
