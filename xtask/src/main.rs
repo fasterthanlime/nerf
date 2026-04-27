@@ -22,6 +22,7 @@ mod codegen;
 
 const BIN_NAME: &str = "stax";
 const DAEMON_BIN: &str = "staxd";
+const SERVER_BIN: &str = "stax-server";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
@@ -64,7 +65,7 @@ fn install() -> Result<(), Box<dyn Error>> {
     let cargo_bin = cargo_bin_dir()?;
     fs::create_dir_all(&cargo_bin)?;
 
-    for bin in [BIN_NAME, DAEMON_BIN] {
+    for bin in [BIN_NAME, DAEMON_BIN, SERVER_BIN] {
         println!(":: Building {bin} (release)...");
         cargo_build_release(&workspace_root, bin)?;
 
@@ -82,16 +83,77 @@ fn install() -> Result<(), Box<dyn Error>> {
         }
         // DAEMON_BIN: no codesign — runs as root under launchd, no
         // entitlement needed.
+        // SERVER_BIN: unprivileged user-level LaunchAgent, no codesign.
     }
+
+    #[cfg(target_os = "macos")]
+    install_server_launch_agent(&cargo_bin)?;
 
     println!();
     println!(":: Installed binaries to {}.", cargo_bin.display());
     println!();
-    println!("     sudo stax setup");
+    println!(":: Two install steps remain:");
     println!();
-    println!(":: This installs staxd as a LaunchDaemon. After that,");
-    println!(":: stax record --serve … works without sudo.");
+    println!("     sudo stax setup       # installs staxd as a LaunchDaemon (root)");
+    println!();
+    println!(":: stax-server (the unprivileged daemon agents talk to)");
+    println!(":: was just bootstrapped under your user via launchctl.");
+    println!(":: Logs at ~/Library/Logs/stax-server.log.");
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_server_launch_agent(cargo_bin: &Path) -> Result<(), Box<dyn Error>> {
+    let workspace_root = workspace_root();
+    let template = workspace_root
+        .join(SERVER_BIN)
+        .join("launchd")
+        .join("eu.bearcove.stax-server.plist");
+    let plist_text = fs::read_to_string(&template)?;
+
+    let bin_path = cargo_bin.join(SERVER_BIN);
+    let logs_dir = home_dir().join("Library").join("Logs");
+    fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join("stax-server.log");
+
+    let resolved = plist_text
+        .replace("__BIN__", &bin_path.to_string_lossy())
+        .replace("__LOG__", &log_path.to_string_lossy());
+
+    let agents_dir = home_dir().join("Library").join("LaunchAgents");
+    fs::create_dir_all(&agents_dir)?;
+    let plist_dst = agents_dir.join("eu.bearcove.stax-server.plist");
+    println!(":: Writing LaunchAgent plist -> {}", plist_dst.display());
+    fs::write(&plist_dst, resolved)?;
+
+    let uid_str = unsafe { libc::getuid() }.to_string();
+    let domain = format!("gui/{uid_str}");
+    let label_target = format!("{domain}/eu.bearcove.stax-server");
+
+    println!(":: launchctl bootout {label_target} (best-effort)");
+    let _ = Command::new("launchctl")
+        .args(["bootout", &label_target])
+        .status();
+
+    println!(":: launchctl bootstrap {domain} {}", plist_dst.display());
+    let status = Command::new("launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&plist_dst)
+        .status()?;
+    if !status.success() {
+        return Err(format!(
+            "launchctl bootstrap exited with {status} (try `launchctl load {}` manually)",
+            plist_dst.display()
+        )
+        .into());
+    }
+    println!(":: stax-server LaunchAgent loaded.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn home_dir() -> PathBuf {
+    PathBuf::from(env::var_os("HOME").expect("HOME is not set"))
 }
 
 #[cfg(target_os = "macos")]

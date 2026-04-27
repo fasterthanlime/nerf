@@ -3086,6 +3086,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "arborium-theme",
+ "libc",
  "stax-live-proto",
  "vox-codegen",
 ]

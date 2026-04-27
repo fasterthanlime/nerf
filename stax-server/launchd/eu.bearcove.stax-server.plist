@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+    LaunchAgent for stax-server. Runs as the current user (no root) —
+    everything privileged lives in staxd. stax-server owns the run
+    registry, the live aggregator, and the agent / WS query surface.
+
+    Install via `cargo xtask install`, which copies the binary into
+    ~/.cargo/bin/, drops this plist into ~/Library/LaunchAgents/, and
+    bootstraps it. Or by hand:
+
+      cp stax-server/launchd/eu.bearcove.stax-server.plist \
+         ~/Library/LaunchAgents/
+      launchctl bootstrap "gui/$(id -u)" \
+        ~/Library/LaunchAgents/eu.bearcove.stax-server.plist
+-->
+<dict>
+    <key>Label</key>
+    <string>eu.bearcove.stax-server</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- ProgramArguments resolved at install time so the binary's
+         absolute path lands here (no $HOME expansion in plists). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info,stax_server=info</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>

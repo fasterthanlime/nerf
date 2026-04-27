@@ -10,3 +10,4 @@ description = "Dev-only entrypoints (cargo xtask install, ...)."
 stax-live-proto = { path = "../stax-live-proto" }
 vox-codegen = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d" }
 arborium-theme = "2.16"
+libc = "0.2"
