@@ -973,6 +973,30 @@ fn compute_flame_update(
         children.push(extra);
     }
 
+    // Samples whose user-stack walk returned zero frames (kernel-only
+    // samples, walk failures, etc.) increment `total_samples` but
+    // never touch `flame_root.children`. Without this synthetic leaf
+    // the (all) row says "100%" but the visible cells fill <100% of
+    // the width, leaving black space that looks like a bug. Spell it
+    // out instead.
+    let visible_sum: u64 = children.iter().map(|c| c.count).sum();
+    if total > visible_sum {
+        let missing = total - visible_sum;
+        children.push(FlameNode {
+            address: u64::MAX - 1,
+            count: missing,
+            function_name: Some(format!("(in-kernel / no user stack: {missing} samples)")),
+            binary: None,
+            is_main: false,
+            language: nperf_demangle::Language::Unknown.as_str().to_owned(),
+            cycles: 0,
+            instructions: 0,
+            l1d_misses: 0,
+            branch_mispreds: 0,
+            children: Vec::new(),
+        });
+    }
+
     // Root sums counters across all children so the "(all)" row
     // shows the recording's grand totals.
     let total_cycles: u64 = children.iter().map(|c| c.cycles).sum();
