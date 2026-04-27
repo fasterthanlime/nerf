@@ -23,7 +23,7 @@ use nperf_live_proto::{
     TopEntry, TopSort, TopUpdate, ViewParams,
 };
 
-use crate::aggregator::{PmuSample, RawSample, RawTopEntry};
+use crate::aggregator::{PmcAccum, PmuSample, RawSample, RawTopEntry};
 
 mod aggregator;
 mod binaries;
@@ -964,7 +964,7 @@ fn compute_flame_update(
     // catches the truly-tiny tail.
     let threshold = (total / 2000).max(1);
     let (mut children, residue) =
-        build_children_with_residue(&flame_root.children, threshold, binaries);
+        build_children_with_residue(&[flame_root], threshold, binaries);
     for c in &mut children {
         fold_recursion(c);
     }
@@ -1041,64 +1041,111 @@ fn symbol_eq(a: &FlameNode, b: &FlameNode) -> bool {
     a.function_name.is_some() && a.function_name == b.function_name && a.binary == b.binary
 }
 
-fn flame_node_to_proto(
-    address: u64,
-    node: &aggregator::StackNode,
-    threshold: u64,
-    binaries: &BinaryRegistry,
-) -> FlameNode {
-    let resolved = binaries.lookup_symbol(address);
-    let (function_name, binary, is_main, language) = match resolved {
-        Some(r) => (
-            Some(r.function_name),
-            Some(r.binary),
-            r.is_main,
-            r.language,
-        ),
-        None => (None, None, false, nperf_demangle::Language::Unknown),
-    };
-    let (mut children, residue) =
-        build_children_with_residue(&node.children, threshold, binaries);
-    children.sort_by(|a, b| b.count.cmp(&a.count));
-    if let Some(extra) = residue {
-        children.push(extra);
-    }
-    FlameNode {
-        address,
-        count: node.count,
-        function_name,
-        binary,
-        is_main,
-        language: language.as_str().to_owned(),
-        cycles: node.pmc.cycles,
-        instructions: node.pmc.instructions,
-        l1d_misses: node.pmc.l1d_misses,
-        branch_mispreds: node.pmc.branch_mispreds,
-        children,
-    }
-}
-
-/// Walk a `StackNode`'s children, recursing on every child with
-/// count >= threshold and folding the rest into a single greyed-out
-/// `(rest)` sibling so the renderer doesn't leave black space where
-/// the long tail used to live. Without this, a node with thousands
-/// of small contributors (think 1.5M samples spread across hundreds
-/// of stacks) renders as one or two visible boxes plus a giant
-/// empty area on the right that looks like idle but is actually
-/// "lots of small frames I dropped from the wire."
+/// Walk a list of "sibling" StackNodes that should be considered
+/// together, group their children by resolved (function, binary)
+/// symbol, apply a count threshold, and recurse. The siblings list
+/// lets us fold multiple call-site addresses that map to the same
+/// symbol into one cell without copying subtrees: callers below pass
+/// the borrowed `StackNode`s of the merged group on to the recursive
+/// step.
+///
+/// Without this grouping, the flame is keyed by raw PC address —
+/// recursive functions and any function called from multiple sites
+/// fragment into a row of skinny same-name cells, and the same-name
+/// children in the subtree never merge either. The neighbours view
+/// already groups by symbol; the main flame now matches.
+///
+/// Sub-threshold groups are folded into a single greyed-out residue
+/// sibling so the renderer doesn't leave black space where the long
+/// tail used to live.
 fn build_children_with_residue(
-    children: &std::collections::HashMap<u64, aggregator::StackNode>,
+    sources: &[&aggregator::StackNode],
     threshold: u64,
     binaries: &BinaryRegistry,
 ) -> (Vec<FlameNode>, Option<FlameNode>) {
+    use std::collections::HashMap;
+
+    type SymbolKey = (Option<String>, Option<String>);
+
+    struct Acc<'a> {
+        count: u64,
+        pmc: PmcAccum,
+        rep_addr: u64,
+        rep_count: u64,
+        is_main: bool,
+        language: nperf_demangle::Language,
+        sub_sources: Vec<&'a aggregator::StackNode>,
+    }
+
+    let mut groups: HashMap<SymbolKey, Acc> = HashMap::new();
+    for src in sources {
+        for (&addr, child) in &src.children {
+            let resolved = binaries.lookup_symbol(addr);
+            let (fname, bin, is_main, lang) = match resolved {
+                Some(r) => (
+                    Some(r.function_name),
+                    Some(r.binary),
+                    r.is_main,
+                    r.language,
+                ),
+                None => (None, None, false, nperf_demangle::Language::Unknown),
+            };
+            let key = (fname, bin);
+            let acc = groups.entry(key).or_insert_with(|| Acc {
+                count: 0,
+                pmc: PmcAccum::default(),
+                rep_addr: addr,
+                rep_count: 0,
+                is_main,
+                language: lang,
+                sub_sources: Vec::new(),
+            });
+            acc.count += child.count;
+            acc.pmc.cycles = acc.pmc.cycles.saturating_add(child.pmc.cycles);
+            acc.pmc.instructions = acc.pmc.instructions.saturating_add(child.pmc.instructions);
+            acc.pmc.l1d_misses = acc.pmc.l1d_misses.saturating_add(child.pmc.l1d_misses);
+            acc.pmc.branch_mispreds = acc
+                .pmc
+                .branch_mispreds
+                .saturating_add(child.pmc.branch_mispreds);
+            // Largest single contributor's address is the click-through
+            // representative (matches what compute_neighbors_update does).
+            if child.count > acc.rep_count {
+                acc.rep_addr = addr;
+                acc.rep_count = child.count;
+                acc.is_main = is_main;
+                acc.language = lang;
+            }
+            acc.sub_sources.push(child);
+        }
+    }
+
     let mut visible: Vec<FlameNode> = Vec::new();
     let mut residue_count: u64 = 0;
     let mut residue_dropped: u64 = 0;
-    for (&a, c) in children {
-        if c.count >= threshold {
-            visible.push(flame_node_to_proto(a, c, threshold, binaries));
+    for ((fname, bin), acc) in groups {
+        if acc.count >= threshold {
+            let (mut grandchildren, gres) =
+                build_children_with_residue(&acc.sub_sources, threshold, binaries);
+            grandchildren.sort_by(|a, b| b.count.cmp(&a.count));
+            if let Some(extra) = gres {
+                grandchildren.push(extra);
+            }
+            visible.push(FlameNode {
+                address: acc.rep_addr,
+                count: acc.count,
+                function_name: fname,
+                binary: bin,
+                is_main: acc.is_main,
+                language: acc.language.as_str().to_owned(),
+                cycles: acc.pmc.cycles,
+                instructions: acc.pmc.instructions,
+                l1d_misses: acc.pmc.l1d_misses,
+                branch_mispreds: acc.pmc.branch_mispreds,
+                children: grandchildren,
+            });
         } else {
-            residue_count = residue_count.saturating_add(c.count);
+            residue_count = residue_count.saturating_add(acc.count);
             residue_dropped += 1;
         }
     }
