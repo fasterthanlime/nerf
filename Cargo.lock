@@ -960,7 +960,6 @@ dependencies = [
 [[package]]
 name = "facet-cbor"
 version = "0.3.3"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "facet",
  "facet-core",
@@ -1999,6 +1998,7 @@ dependencies = [
 name = "nperfd-client"
 version = "0.1.0"
 dependencies = [
+ "log",
  "nerf-mac-capture",
  "nerf-mac-kperf-parse",
  "nerf-mac-kperf-sys",
@@ -2006,7 +2006,6 @@ dependencies = [
  "nperfd-proto",
  "thiserror",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "vox",
 ]
@@ -3127,7 +3126,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vox"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "facet",
  "facet-pretty",
@@ -3147,7 +3145,6 @@ dependencies = [
 [[package]]
 name = "vox-codegen"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "facet-cbor",
  "facet-core",
@@ -3158,7 +3155,6 @@ dependencies = [
 [[package]]
 name = "vox-core"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "facet",
  "facet-cbor",
@@ -3181,7 +3177,6 @@ dependencies = [
 [[package]]
 name = "vox-jit"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "arc-swap",
  "cranelift-codegen",
@@ -3202,7 +3197,6 @@ dependencies = [
 [[package]]
 name = "vox-jit-abi"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "facet-core",
  "vox-jit-cal",
@@ -3211,7 +3205,6 @@ dependencies = [
 [[package]]
 name = "vox-jit-cal"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "facet",
  "facet-core",
@@ -3220,7 +3213,6 @@ dependencies = [
 [[package]]
 name = "vox-macros-core"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "facet-cargo-toml",
  "heck 0.5.0",
@@ -3232,7 +3224,6 @@ dependencies = [
 [[package]]
 name = "vox-macros-parse"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "proc-macro2 1.0.106",
  "unsynn",
@@ -3241,7 +3232,6 @@ dependencies = [
 [[package]]
 name = "vox-postcard"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "facet",
  "facet-core",
@@ -3253,7 +3243,6 @@ dependencies = [
 [[package]]
 name = "vox-schema"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "blake3",
  "facet",
@@ -3265,7 +3254,6 @@ dependencies = [
 [[package]]
 name = "vox-service-macros"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "proc-macro2 1.0.106",
  "vox-macros-core",
@@ -3274,7 +3262,6 @@ dependencies = [
 [[package]]
 name = "vox-stream"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "libc",
  "moire",
@@ -3286,7 +3273,6 @@ dependencies = [
 [[package]]
 name = "vox-types"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "bitflags 2.11.1",
  "blake3",
@@ -3310,7 +3296,6 @@ dependencies = [
 [[package]]
 name = "vox-websocket"
 version = "0.4.0"
-source = "git+https://github.com/bearcove/vox?rev=1bdc0aa4911765af726a4142ceb67812b0f6963d#1bdc0aa4911765af726a4142ceb67812b0f6963d"
 dependencies = [
  "futures-channel",
  "futures-util",

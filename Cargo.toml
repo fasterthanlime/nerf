@@ -64,6 +64,27 @@ members = [".", "cli", "nwind", "proc-maps", "perf_event_open", "thread-local-re
 # panic="abort" / no_std settings that cannot be expressed at member scope.
 exclude = ["nerf-mac-preload"]
 
+# Local override pulling vox from the sibling checkout so we can use
+# the unreleased `non_resumable()` opt-out on the transport-acceptor
+# builder. Drop this block once a vox release that includes
+# non_resumable lands and the rev pins on individual crates are
+# bumped past it.
+[patch."https://github.com/bearcove/vox"]
+vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
+vox-core = { path = "/Users/amos/bearcove/vox/rust/vox-core" }
+vox-types = { path = "/Users/amos/bearcove/vox/rust/vox-types" }
+vox-stream = { path = "/Users/amos/bearcove/vox/rust/vox-stream" }
+vox-websocket = { path = "/Users/amos/bearcove/vox/rust/vox-websocket" }
+vox-postcard = { path = "/Users/amos/bearcove/vox/rust/vox-postcard" }
+vox-jit = { path = "/Users/amos/bearcove/vox/rust/vox-jit" }
+vox-jit-abi = { path = "/Users/amos/bearcove/vox/rust/vox-jit-abi" }
+vox-jit-cal = { path = "/Users/amos/bearcove/vox/rust/vox-jit-cal" }
+vox-macros-core = { path = "/Users/amos/bearcove/vox/rust/vox-macros-core" }
+vox-macros-parse = { path = "/Users/amos/bearcove/vox/rust/vox-macros-parse" }
+vox-schema = { path = "/Users/amos/bearcove/vox/rust/vox-schema" }
+vox-service-macros = { path = "/Users/amos/bearcove/vox/rust/vox-macros" }
+vox-codegen = { path = "/Users/amos/bearcove/vox/rust/vox-codegen" }
+
 [[bench]]
 name = "unwinding"
 harness = false

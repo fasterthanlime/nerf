@@ -62,7 +62,6 @@ async fn main() -> Result<()> {
     }
 
     let server = NperfdServer::new();
-    let dispatcher = NperfdDispatcher::new(server);
 
     let listener = vox::transport::local::LocalLinkAcceptor::bind(
         socket_path.to_string_lossy().into_owned(),
@@ -79,16 +78,51 @@ async fn main() -> Result<()> {
         std::fs::Permissions::from_mode(0o666),
     );
 
+    // Inline accept loop instead of `vox::serve_listener` so we can
+    // pass `.non_resumable()` to the session builder. Default for
+    // `SessionTransportAcceptorBuilder` is resumable, which means
+    // when the client process exits the session goes into recovery
+    // mode and the per-channel `Tx<KdBufBatch>::send().await` keeps
+    // succeeding into a void instead of returning Err — the daemon
+    // never notices the client is gone and ktrace ownership leaks
+    // until something else evicts it. For Unix-socket IPC the peer
+    // *is* a process; non_resumable is the right default for us.
     let serve = tokio::spawn(async move {
-        if let Err(e) = vox::serve_listener(listener, dispatcher).await {
-            warn!("vox serve_listener exited: {e}");
+        loop {
+            let link = match listener.accept().await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("nperfd: accept failed: {e}");
+                    continue;
+                }
+            };
+            let server = server.clone();
+            tokio::spawn(async move {
+                let dispatcher = NperfdDispatcher::new(server);
+                let result = vox::acceptor_on(link)
+                    .non_resumable()
+                    .on_connection(dispatcher)
+                    .establish::<vox::NoopClient>()
+                    .await;
+                match result {
+                    Ok(client) => {
+                        client.caller.closed().await;
+                    }
+                    Err(e) => warn!("nperfd: session establish failed: {e:?}"),
+                }
+            });
         }
     });
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("nperfd: SIGINT, shutting down"),
         r = serve => {
-            if let Err(e) = r { warn!("serve task panicked: {e}"); }
+            // r: Result<!, JoinError> — the inner future is `loop {}`,
+            // so the only way it resolves is via panic/cancellation.
+            match r {
+                Ok(never) => match never {},
+                Err(e) => warn!("serve task panicked: {e}"),
+            }
         }
     }
 
