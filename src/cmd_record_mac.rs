@@ -152,7 +152,9 @@ struct LiveOnlySink {
 /// know the pid.
 fn notify_target_attached(sink: &LiveOnlySink, pid: u32) {
     if let Some(live) = sink.live_sink.as_ref() {
-        live.on_target_attached(&TargetAttached { pid, task_port: 0 });
+        futures::executor::block_on(
+            live.on_target_attached(&TargetAttached { pid, task_port: 0 }),
+        );
     }
 }
 
@@ -172,6 +174,22 @@ impl LiveOnlySink {
     }
 }
 
+/// Bridge between the kperf-parse pipeline (sync `SampleSink`)
+/// and the async `LiveSink`. Each callback drives the async fn to
+/// completion via `futures::executor::block_on` — that's
+/// independent of tokio so it's safe to invoke from inside an
+/// already-async context.
+///
+/// The contract with `LiveSink` impls is that hot-path callbacks
+/// (`on_sample`, `on_cpu_interval`) don't yield: their bodies push
+/// onto a sync-friendly mpsc and return. Slow paths
+/// (`on_binary_loaded` for parallel image walks) can yield
+/// freely; block_on still works, the caller just blocks until the
+/// future settles.
+fn block_sink<F: std::future::Future<Output = ()>>(fut: F) {
+    futures::executor::block_on(fut);
+}
+
 impl SampleSink for LiveOnlySink {
     fn on_sample(&mut self, ev: SampleEvent<'_>) {
         let Some(sink) = self.live_sink.as_ref() else {
@@ -185,7 +203,7 @@ impl SampleSink for LiveOnlySink {
                 initial_address: None,
             })
             .collect();
-        sink.on_sample(&LiveSampleEvent {
+        block_sink(sink.on_sample(&LiveSampleEvent {
             timestamp: ev.timestamp_ns,
             pid: ev.pid,
             tid: ev.tid,
@@ -196,7 +214,7 @@ impl SampleSink for LiveOnlySink {
             instructions: ev.instructions,
             l1d_misses: ev.l1d_misses,
             branch_mispreds: ev.branch_mispreds,
-        });
+        }));
     }
 
     fn on_cpu_interval(&mut self, ev: stax_mac_capture::sample_sink::CpuIntervalEvent<'_>) {
@@ -205,13 +223,13 @@ impl SampleSink for LiveOnlySink {
         };
         match ev.kind {
             stax_mac_capture::sample_sink::CpuIntervalKind::OnCpu => {
-                sink.on_cpu_interval(&crate::live_sink::CpuIntervalEvent {
+                block_sink(sink.on_cpu_interval(&crate::live_sink::CpuIntervalEvent {
                     pid: ev.pid,
                     tid: ev.tid,
                     start_ns: ev.start_ns,
                     end_ns: ev.end_ns,
                     kind: crate::live_sink::CpuIntervalKind::OnCpu,
-                });
+                }));
             }
             stax_mac_capture::sample_sink::CpuIntervalKind::OffCpu {
                 stack,
@@ -225,7 +243,7 @@ impl SampleSink for LiveOnlySink {
                         initial_address: None,
                     })
                     .collect();
-                sink.on_cpu_interval(&crate::live_sink::CpuIntervalEvent {
+                block_sink(sink.on_cpu_interval(&crate::live_sink::CpuIntervalEvent {
                     pid: ev.pid,
                     tid: ev.tid,
                     start_ns: ev.start_ns,
@@ -235,7 +253,7 @@ impl SampleSink for LiveOnlySink {
                         waker_tid,
                         waker_user_stack,
                     },
-                });
+                }));
             }
         }
     }
@@ -253,7 +271,7 @@ impl SampleSink for LiveOnlySink {
                 name: &s.name,
             })
             .collect();
-        sink.on_binary_loaded(&LiveBinaryLoadedEvent {
+        block_sink(sink.on_binary_loaded(&LiveBinaryLoadedEvent {
             path: ev.path,
             base_avma: ev.base_avma,
             vmsize: ev.vmsize,
@@ -262,28 +280,28 @@ impl SampleSink for LiveOnlySink {
             is_executable: ev.is_executable,
             symbols: &live_symbols,
             text_bytes: ev.text_bytes,
-        });
+        }));
     }
 
     fn on_binary_unloaded(&mut self, ev: BinaryUnloadedEvent<'_>) {
         let Some(sink) = self.live_sink.as_ref() else {
             return;
         };
-        sink.on_binary_unloaded(&LiveBinaryUnloadedEvent {
+        block_sink(sink.on_binary_unloaded(&LiveBinaryUnloadedEvent {
             path: ev.path,
             base_avma: ev.base_avma,
-        });
+        }));
     }
 
     fn on_thread_name(&mut self, ev: ThreadNameEvent<'_>) {
         let Some(sink) = self.live_sink.as_ref() else {
             return;
         };
-        sink.on_thread_name(&LiveThreadName {
+        block_sink(sink.on_thread_name(&LiveThreadName {
             pid: ev.pid,
             tid: ev.tid,
             name: ev.name,
-        });
+        }));
     }
 
     fn on_jitdump(&mut self, _ev: JitdumpEvent<'_>) {}
@@ -292,14 +310,14 @@ impl SampleSink for LiveOnlySink {
         let Some(sink) = self.live_sink.as_ref() else {
             return;
         };
-        sink.on_wakeup(&LiveWakeupEvent {
+        block_sink(sink.on_wakeup(&LiveWakeupEvent {
             timestamp: ev.timestamp_ns,
             pid: ev.pid,
             waker_tid: ev.waker_tid,
             wakee_tid: ev.wakee_tid,
             waker_user_stack: ev.waker_user_stack,
             waker_kernel_stack: ev.waker_kernel_stack,
-        });
+        }));
     }
 
     fn on_macho_byte_source(
@@ -307,7 +325,7 @@ impl SampleSink for LiveOnlySink {
         source: std::sync::Arc<dyn stax_mac_capture::MachOByteSource>,
     ) {
         if let Some(sink) = self.live_sink.as_ref() {
-            sink.on_macho_byte_source(source);
+            block_sink(sink.on_macho_byte_source(source));
         }
     }
 }

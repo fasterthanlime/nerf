@@ -1,8 +1,9 @@
 //! Forward `LiveSink` events to `stax-server` over a vox local
-//! socket. The recorder's `LiveSink` trait is sync (callbacks fire
-//! from the privileged-side drain loop); vox `Tx::send` is async, so
-//! we bridge through a tokio mpsc::UnboundedSender that a forwarder
-//! task drains.
+//! socket. Async-trait callbacks are intentionally tiny: each one
+//! pushes an owned `IngestEvent` into a sync-friendly tokio mpsc
+//! and returns immediately. A separate forwarder task drains the
+//! mpsc and pumps events through `vox::Tx::send` at whatever rate
+//! the wire allows.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,12 +41,13 @@ impl IngestSink {
     }
 }
 
+#[async_trait::async_trait]
 impl LiveSink for IngestSink {
     fn stop_flag(&self) -> Option<Arc<AtomicBool>> {
         Some(self.stop_requested.clone())
     }
 
-    fn on_sample(&self, ev: &SampleEvent) {
+    async fn on_sample(&self, ev: &SampleEvent) {
         let user_backtrace = ev.user_backtrace.iter().map(|f| f.address).collect();
         let _ = self.tx.send(IngestEvent::Sample(WireSampleEvent {
             timestamp_ns: ev.timestamp,
@@ -60,14 +62,14 @@ impl LiveSink for IngestSink {
         }));
     }
 
-    fn on_target_attached(&self, ev: &TargetAttached) {
+    async fn on_target_attached(&self, ev: &TargetAttached) {
         let _ = self.tx.send(IngestEvent::TargetAttached {
             pid: ev.pid,
             task_port: ev.task_port,
         });
     }
 
-    fn on_binary_loaded(&self, ev: &BinaryLoadedEvent) {
+    async fn on_binary_loaded(&self, ev: &BinaryLoadedEvent) {
         let symbols = ev
             .symbols
             .iter()
@@ -89,14 +91,14 @@ impl LiveSink for IngestSink {
         }));
     }
 
-    fn on_binary_unloaded(&self, ev: &BinaryUnloadedEvent) {
+    async fn on_binary_unloaded(&self, ev: &BinaryUnloadedEvent) {
         let _ = self.tx.send(IngestEvent::BinaryUnloaded {
             path: ev.path.to_owned(),
             base_avma: ev.base_avma,
         });
     }
 
-    fn on_thread_name(&self, ev: &ThreadName) {
+    async fn on_thread_name(&self, ev: &ThreadName) {
         let _ = self.tx.send(IngestEvent::ThreadName {
             pid: ev.pid,
             tid: ev.tid,
@@ -104,7 +106,7 @@ impl LiveSink for IngestSink {
         });
     }
 
-    fn on_wakeup(&self, ev: &WakeupEvent) {
+    async fn on_wakeup(&self, ev: &WakeupEvent) {
         let _ = self.tx.send(IngestEvent::Wakeup(WireWakeup {
             timestamp_ns: ev.timestamp,
             waker_tid: ev.waker_tid,
@@ -114,7 +116,7 @@ impl LiveSink for IngestSink {
         }));
     }
 
-    fn on_cpu_interval(&self, ev: &CpuIntervalEvent) {
+    async fn on_cpu_interval(&self, ev: &CpuIntervalEvent) {
         match &ev.kind {
             CpuIntervalKind::OnCpu => {
                 let _ = self.tx.send(IngestEvent::OnCpuInterval(WireOnCpuInterval {
@@ -141,7 +143,7 @@ impl LiveSink for IngestSink {
     }
 
     #[cfg(target_os = "macos")]
-    fn on_macho_byte_source(&self, _source: Arc<dyn MachOByteSource>) {
+    async fn on_macho_byte_source(&self, _source: Arc<dyn MachOByteSource>) {
         // The shared-cache mmap can't cross the vox boundary as an
         // Arc<dyn Trait>; the server will open it itself by path
         // (follow-up). For now, drop silently.

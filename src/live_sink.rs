@@ -127,6 +127,17 @@ pub struct WakeupEvent< 'a > {
     pub waker_kernel_stack: &'a [u64],
 }
 
+/// Recording-side observer. Methods are async so consumers can do
+/// real I/O — buffer drains, vox sends, parallel image walks —
+/// without blocking the recorder's runtime.
+///
+/// Note on hot-path overhead: `on_sample` fires every PET tick
+/// (~hundreds of thousands per second on a busy target).
+/// async_trait wraps each call in a `Box<dyn Future>`, so the
+/// concrete `on_sample` impl should keep its body tiny — push
+/// onto a sync channel and return. The actual processing belongs
+/// behind that channel.
+#[async_trait::async_trait]
 pub trait LiveSink: Send + Sync {
     /// Hand the recorder a clonable handle on this sink's "stop
     /// now" signal. `IngestSink` returns `Some(_)` and flips it
@@ -138,38 +149,38 @@ pub trait LiveSink: Send + Sync {
         None
     }
 
-    fn on_sample( &self, event: &SampleEvent );
+    async fn on_sample(&self, event: &SampleEvent);
 
     /// Recorder acquired its handle on the target. Fires once at the
     /// start of recording, before any samples.
     #[allow(unused_variables)]
-    fn on_target_attached( &self, event: &TargetAttached ) {}
+    async fn on_target_attached(&self, event: &TargetAttached) {}
 
     /// A new image was mapped into the target process.
     #[allow(unused_variables)]
-    fn on_binary_loaded( &self, event: &BinaryLoadedEvent ) {}
+    async fn on_binary_loaded(&self, event: &BinaryLoadedEvent) {}
 
     /// A previously-loaded image was unmapped.
     #[allow(unused_variables)]
-    fn on_binary_unloaded( &self, event: &BinaryUnloadedEvent ) {}
+    async fn on_binary_unloaded(&self, event: &BinaryUnloadedEvent) {}
 
     /// A thread was discovered (or renamed). Fires whenever the
     /// recorder learns a tid → name mapping.
     #[allow(unused_variables)]
-    fn on_thread_name( &self, event: &ThreadName ) {}
+    async fn on_thread_name(&self, event: &ThreadName) {}
 
     /// One thread woke another. Backend-specific: only the kperf
     /// path on macOS emits these (via MACH_MAKERUNNABLE kdebug
     /// records). Default no-op so other backends compile.
     #[allow(unused_variables)]
-    fn on_wakeup( &self, event: &WakeupEvent ) {}
+    async fn on_wakeup(&self, event: &WakeupEvent) {}
 
     /// One closed CPU interval (on-CPU or off-CPU) sourced from
     /// MACH_SCHED records. Drives the live aggregator's time
     /// attribution. Default no-op for backends that don't track
     /// scheduling events.
     #[allow(unused_variables)]
-    fn on_cpu_interval( &self, event: &CpuIntervalEvent ) {}
+    async fn on_cpu_interval(&self, event: &CpuIntervalEvent) {}
 
     /// Recorder hands the live side a typed byte source it can use
     /// to satisfy disassembly requests for addresses inside the
@@ -183,5 +194,5 @@ pub trait LiveSink: Send + Sync {
     /// Linux ever calls this method.
     #[cfg(target_os = "macos")]
     #[allow(unused_variables)]
-    fn on_macho_byte_source( &self, source: Arc<dyn MachOByteSource> ) {}
+    async fn on_macho_byte_source(&self, source: Arc<dyn MachOByteSource>) {}
 }
