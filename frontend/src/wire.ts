@@ -17,7 +17,8 @@ import type {
 
 export interface FlameView {
   address: bigint;
-  count: bigint;
+  /// Wall-clock time spent at (or under) this node, in nanoseconds.
+  duration_ns: bigint;
   function_name: string | null;
   binary: string | null;
   is_main: boolean;
@@ -30,7 +31,7 @@ export interface FlameView {
 }
 
 export interface FlamegraphView {
-  total_samples: bigint;
+  total_duration_ns: bigint;
   root: FlameView;
 }
 
@@ -39,7 +40,7 @@ export interface NeighborsView {
   binary: string | null;
   is_main: boolean;
   language: string;
-  own_count: bigint;
+  own_duration_ns: bigint;
   callers_tree: FlameView;
   callees_tree: FlameView;
 }
@@ -51,7 +52,7 @@ function lookup(strings: string[], idx: number | null): string | null {
 function hydrateNode(node: WireFlameNode, strings: string[]): FlameView {
   return {
     address: node.address,
-    count: node.count,
+    duration_ns: node.duration_ns,
     function_name: lookup(strings, node.function_name),
     binary: lookup(strings, node.binary),
     is_main: node.is_main,
@@ -66,7 +67,7 @@ function hydrateNode(node: WireFlameNode, strings: string[]): FlameView {
 
 export function hydrateFlamegraph(u: WireFlamegraphUpdate): FlamegraphView {
   return {
-    total_samples: u.total_samples,
+    total_duration_ns: u.total_duration_ns,
     root: hydrateNode(u.root, u.strings),
   };
 }
@@ -77,8 +78,22 @@ export function hydrateNeighbors(u: WireNeighborsUpdate): NeighborsView {
     binary: lookup(u.strings, u.binary),
     is_main: u.is_main,
     language: u.strings[u.language],
-    own_count: u.own_count,
+    own_duration_ns: u.own_duration_ns,
     callers_tree: hydrateNode(u.callers_tree, u.strings),
     callees_tree: hydrateNode(u.callees_tree, u.strings),
   };
+}
+
+/// Format a nanosecond duration as a human-readable string. Used
+/// across the UI now that the aggregator's unit is wall-clock time.
+export function formatDuration(ns: bigint): string {
+  if (ns === 0n) return "0";
+  const n = Number(ns);
+  if (n < 1_000) return `${n}ns`;
+  if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}µs`;
+  if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}ms`;
+  if (n < 60_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}s`;
+  const minutes = Math.floor(n / 60_000_000_000);
+  const seconds = (n % 60_000_000_000) / 1_000_000_000;
+  return `${minutes}m${seconds.toFixed(1)}s`;
 }

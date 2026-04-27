@@ -6,6 +6,7 @@ import type {
   ProfilerClient,
 } from "./generated/profiler.generated.ts";
 import {
+  formatDuration,
   hydrateFlamegraph,
   type FlamegraphView,
   type FlameView,
@@ -101,10 +102,10 @@ function layout(
     });
     if (depth > maxDepth) maxDepth = depth;
     const span = x1 - x0;
-    const denom = node.count > 0n ? Number(node.count) : 1;
+    const denom = node.duration_ns > 0n ? Number(node.duration_ns) : 1;
     let cursor = x0;
     node.children.forEach((c, i) => {
-      const cw = (Number(c.count) / denom) * span;
+      const cw = (Number(c.duration_ns) / denom) * span;
       // Address 0 = synthetic root marker; never filter that out.
       if (c.address !== 0n && hiddenKinds.has(objKindOf(c))) {
         cursor += cw;
@@ -282,7 +283,7 @@ export function Flamegraph({
     ? layout(renderRoot, hiddenKinds)
     : { boxes: [], depth: 0 };
   const innerHeight = (depth + 1) * ROW_H;
-  const total = update?.total_samples ?? 0n;
+  const total = update?.total_duration_ns ?? 0n;
 
   return (
     <div
@@ -338,15 +339,16 @@ export function Flamegraph({
           <>
             <span className="flame-status-label">{labelFor(hover.node)}</span>
             <span className="flame-status-meta">
-              {hover.node.count.toString()} / {total.toString()} ·{" "}
-              {pct(hover.node.count, total)}
+              {formatDuration(hover.node.duration_ns)} / {formatDuration(total)} ·{" "}
+              {pct(hover.node.duration_ns, total)}
               {ipcFor(hover.node) ? ` · ${ipcFor(hover.node)} ipc` : ""}
               {hover.node.binary ? ` · ${hover.node.binary}` : ""}
             </span>
           </>
         ) : update ? (
           <span className="flame-status-meta">
-            {total.toString()} samples · click to open · right-click to focus
+            {formatDuration(total)} of activity · click to open · right-click
+            to focus
           </span>
         ) : (
           <span className="flame-status-meta">building flamegraph…</span>
@@ -380,9 +382,9 @@ function FlameBoxLabel({ node }: { node: FlameView }) {
   );
 }
 
-function pct(count: bigint, total: bigint): string {
+function pct(part: bigint, total: bigint): string {
   if (total === 0n) return "0%";
-  const r = Number((count * 10000n) / total) / 100;
+  const r = Number((part * 10000n) / total) / 100;
   return `${r.toFixed(1)}%`;
 }
 
@@ -395,7 +397,7 @@ function ipcFor(node: FlameView): string | null {
 }
 
 function tooltipFor(node: FlameView, total: bigint): string {
-  const base = `${labelFor(node)} · ${node.count.toString()}/${total.toString()}`;
+  const base = `${labelFor(node)} · ${formatDuration(node.duration_ns)} / ${formatDuration(total)} (${pct(node.duration_ns, total)})`;
   const ipc = ipcFor(node);
   return ipc
     ? `${base} · ${ipc} ipc (${node.instructions.toString()} insns / ${node.cycles.toString()} cycles)`

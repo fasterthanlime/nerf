@@ -32,6 +32,7 @@ import {
 import { Flamegraph } from "./Flamegraph.tsx";
 import { Neighbors } from "./Neighbors.tsx";
 import { Timeline } from "./Timeline.tsx";
+import { formatDuration } from "./wire.ts";
 
 type Status = "pending" | "ok" | "err";
 type Theme = "dark" | "light";
@@ -267,8 +268,8 @@ export function App() {
             "App: top update",
             next.entries.length,
             "entries,",
-            next.total_samples.toString(),
-            "samples",
+            next.total_duration_ns.toString(),
+            "ns wall",
           );
           latest.current = next;
           // While frozen we accumulate into `latest` but don't render.
@@ -427,7 +428,7 @@ export function App() {
           <span className="spacer" />
           <span className="meta">
             {displayed
-              ? `${displayed.total_samples.toLocaleString()} samples · ${displayed.entries.length} symbols`
+              ? `${formatDuration(displayed.total_duration_ns)} · ${displayed.entries.length} symbols`
               : "waiting for samples..."}
           </span>
         </div>
@@ -515,7 +516,7 @@ export function App() {
         >
           <TopTable
             entries={displayed?.entries ?? []}
-            totalSamples={displayed?.total_samples ?? 0n}
+            totalDurationNs={displayed?.total_duration_ns ?? 0n}
             selected={selected}
             onSelect={setSelected}
             sort={sort}
@@ -1066,7 +1067,7 @@ function entryMatches(
 
 function TopTable({
   entries,
-  totalSamples,
+  totalDurationNs,
   selected,
   onSelect,
   sort,
@@ -1077,7 +1078,7 @@ function TopTable({
   onContextMenu,
 }: {
   entries: TopEntry[];
-  totalSamples: bigint;
+  totalDurationNs: bigint;
   selected: bigint | null;
   onSelect: (a: bigint) => void;
   sort: SortKey;
@@ -1087,6 +1088,7 @@ function TopTable({
   pmuMetric: PmuMetric;
   onContextMenu: (t: ContextMenuTarget) => void;
 }) {
+  void totalDurationNs;
   const visible = entries.filter((e) => !hiddenKinds.has(objKindOf(e)));
   // Scale every row's progress bar against the busiest visible row,
   // not the recording's grand total. With 1M+ samples spread across
@@ -1094,7 +1096,7 @@ function TopTable({
   // a hairline -- now the leader fills the bar and the rest are
   // proportional to it (the "Activity Monitor" model).
   const barDenom = visible.reduce((m, e) => {
-    const v = sort === "self" ? e.self_count : e.total_count;
+    const v = sort === "self" ? e.self_duration_ns : e.total_duration_ns;
     return v > m ? v : m;
   }, 1n);
   return (
@@ -1160,14 +1162,14 @@ function TopTable({
               </td>
               <td className="num">
                 <div className="num-line">
-                  {e.self_count === e.total_count ? (
-                    e.self_count.toString()
+                  {e.self_duration_ns === e.total_duration_ns ? (
+                    formatDuration(e.self_duration_ns)
                   ) : (
                     <>
-                      {e.self_count.toString()}
+                      {formatDuration(e.self_duration_ns)}
                       <span className="num-sep"> / </span>
                       <span className="num-total">
-                        {e.total_count.toString()}
+                        {formatDuration(e.total_duration_ns)}
                       </span>
                     </>
                   )}
@@ -1177,7 +1179,7 @@ function TopTable({
                     className="num-bar-fill"
                     style={{
                       width: barPct(
-                        sort === "self" ? e.self_count : e.total_count,
+                        sort === "self" ? e.self_duration_ns : e.total_duration_ns,
                         barDenom,
                       ),
                     }}
@@ -1258,10 +1260,10 @@ function ThreadSwitcher({
     }
   }, [open]);
 
-  const total = threads.reduce((s, t) => s + t.sample_count, 0n);
+  const total = threads.reduce((s, t) => s + t.duration_ns, 0n);
   const totalF = total === 0n ? 1 : Number(total);
   const max = threads.reduce(
-    (m, t) => (t.sample_count > m ? t.sample_count : m),
+    (m, t) => (t.duration_ns > m ? t.duration_ns : m),
     0n,
   );
   const maxF = max === 0n ? 1 : Number(max);
@@ -1335,11 +1337,11 @@ function ThreadSwitcher({
               filtered.map((t) => {
                 const sel = selectedTid === t.tid;
                 const wPct =
-                  max === 0n ? 0 : (Number(t.sample_count) / maxF) * 100;
+                  max === 0n ? 0 : (Number(t.duration_ns) / maxF) * 100;
                 const rPct =
                   total === 0n
                     ? 0
-                    : Math.round((Number(t.sample_count) / totalF) * 1000) /
+                    : Math.round((Number(t.duration_ns) / totalF) * 1000) /
                       10;
                 return (
                   <button
@@ -1347,7 +1349,7 @@ function ThreadSwitcher({
                     key={t.tid}
                     className={`thread-row${sel ? " selected" : ""}`}
                     onClick={() => pick(t.tid)}
-                    title={`${t.sample_count.toString()} samples (${rPct}%)`}
+                    title={`${formatDuration(t.duration_ns)} (${rPct}%)`}
                   >
                     <span className="thread-check">{sel && <LuCheck />}</span>
                     <span className="thread-name">
@@ -1363,7 +1365,7 @@ function ThreadSwitcher({
                       />
                     </span>
                     <span className="thread-count">
-                      {t.sample_count.toLocaleString()}
+                      {formatDuration(t.duration_ns)}
                     </span>
                   </button>
                 );
@@ -1371,7 +1373,7 @@ function ThreadSwitcher({
             )}
           </div>
           <div className="thread-popover-footer">
-            {threads.length} threads · sorted by samples
+            {threads.length} threads · sorted by wall time
           </div>
         </div>
       )}
@@ -1418,7 +1420,7 @@ function Annotation({
 
   const lines = view?.lines ?? [];
   const maxSelf = lines.reduce(
-    (m, l) => (l.self_count > m ? l.self_count : m),
+    (m, l) => (l.self_duration_ns > m ? l.self_duration_ns : m),
     0n,
   );
 
@@ -1471,10 +1473,12 @@ function Annotation({
                   <tr
                     key={String(line.address)}
                     data-addr={String(line.address)}
-                    style={{ background: heatBg(line.self_count, maxSelf) }}
+                    style={{ background: heatBg(line.self_duration_ns, maxSelf) }}
                   >
                     <td className="num">
-                      {line.self_count > 0n ? line.self_count.toString() : ""}
+                      {line.self_duration_ns > 0n
+                        ? formatDuration(line.self_duration_ns)
+                        : ""}
                     </td>
                     <td className="addr">+0x{off.toString(16)}</td>
                     <td
@@ -1494,8 +1498,8 @@ function Annotation({
               <div
                 key={String(line.address)}
                 className="mm-row"
-                title={`+0x${(line.address - view!.base_address).toString(16)} · ${line.self_count.toString()} samples`}
-                style={{ background: heatBg(line.self_count, maxSelf) }}
+                title={`+0x${(line.address - view!.base_address).toString(16)} · ${formatDuration(line.self_duration_ns)}`}
+                style={{ background: heatBg(line.self_duration_ns, maxSelf) }}
                 onClick={() => jumpTo(line.address)}
               />
             ))}

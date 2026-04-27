@@ -48,12 +48,12 @@ export function Timeline({
   }
 
   const max = update.buckets.reduce(
-    (m, b) => (b.count > m ? b.count : m),
+    (m, b) => (b.duration_ns > m ? b.duration_ns : m),
     0n,
   );
   const maxF = max === 0n ? 1 : Number(max);
-  const durSec = Number(update.duration_ns) / 1e9;
-  const durNs = update.duration_ns;
+  const durSec = Number(update.recording_duration_ns) / 1e9;
+  const durNs = update.recording_duration_ns;
 
   /// Map a clientX coordinate inside `barsRef` to a [0,1] fraction
   /// along the bars row, clamped to the visible area.
@@ -114,7 +114,7 @@ export function Timeline({
   const points: string[] = [];
   for (let i = 0; i < n; i++) {
     const x = ((i + 0.5) / n) * 100;
-    const y = max === 0n ? 100 : 100 - (Number(update.buckets[i].count) / maxF) * 100;
+    const y = max === 0n ? 100 : 100 - (Number(update.buckets[i].duration_ns) / maxF) * 100;
     points.push(`${x.toFixed(3)},${y.toFixed(3)}`);
   }
   const areaD =
@@ -148,8 +148,8 @@ export function Timeline({
         )}
       </svg>
       <div className="timeline-footer">
-        {update.total_samples.toLocaleString()} samples · {durSec.toFixed(1)}s
-        elapsed
+        {(Number(update.total_duration_ns) / 1e9).toFixed(2)}s of activity ·{" "}
+        {durSec.toFixed(1)}s elapsed
         {range && (
           <>
             {" · "}
