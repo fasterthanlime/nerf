@@ -106,6 +106,12 @@ pub struct LiveSinkImpl {
     /// for the aggregator; binary registry + thread-name updates
     /// keep flowing so already-frozen data still resolves cleanly.
     paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Diagnostic counter — number of PetSample events handed off to
+    /// the aggregator's channel. Sampled at log emit time to confirm
+    /// recordings are actually flowing through the live path. Atomic
+    /// because LiveSinkImpl is shared by clone across the recorder
+    /// thread and the live-server thread.
+    pet_samples_sent: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl LiveSink for LiveSinkImpl {
@@ -114,7 +120,7 @@ impl LiveSink for LiveSinkImpl {
             return;
         }
         let user_addrs: Vec<u64> = event.user_backtrace.iter().map(|f| f.address).collect();
-        let _ = self.tx.send(LiveEvent::PetSample {
+        let send_result = self.tx.send(LiveEvent::PetSample {
             tid: event.tid,
             timestamp_ns: event.timestamp,
             user_addrs,
@@ -123,6 +129,21 @@ impl LiveSink for LiveSinkImpl {
             l1d_misses: event.l1d_misses,
             branch_mispreds: event.branch_mispreds,
         });
+        let n = self
+            .pet_samples_sent
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        // Heartbeat: first sample, then every 10k. Tells us the
+        // sample path from MacSink → live_sink → channel is actually
+        // exercised (the parser stats on the recorder side are
+        // already logged independently by nperfd-client).
+        if n == 1 || n.is_multiple_of(10_000) {
+            tracing::info!(
+                count = n,
+                send_ok = send_result.is_ok(),
+                "live_sink: handed off PetSample to aggregator channel",
+            );
+        }
     }
 
     fn on_cpu_interval(&self, event: &LiveCpuIntervalEvent) {
@@ -1623,6 +1644,12 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
         let aggregator = aggregator.clone();
         let binaries = binaries.clone();
         tokio::spawn(async move {
+            // Diagnostic counter: how many PetSample events the
+            // drainer has actually pulled off the channel. Sister
+            // metric to LiveSinkImpl::pet_samples_sent — if `sent`
+            // grows but this stays at zero, the drainer task isn't
+            // being polled (e.g. wrong runtime, blocked elsewhere).
+            let mut pet_samples_drained: u64 = 0;
             while let Some(event) = rx.recv().await {
                 match event {
                     LiveEvent::PetSample {
@@ -1645,6 +1672,15 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
                                 branch_mispreds,
                             },
                         );
+                        pet_samples_drained += 1;
+                        if pet_samples_drained == 1
+                            || pet_samples_drained.is_multiple_of(10_000)
+                        {
+                            tracing::info!(
+                                count = pet_samples_drained,
+                                "aggregator: drained PetSample"
+                            );
+                        }
                     }
                     LiveEvent::CpuInterval {
                         tid,
@@ -1725,5 +1761,12 @@ pub async fn start(addr: &str) -> Result<(LiveSinkImpl, tokio::task::JoinHandle<
         }
     });
 
-    Ok((LiveSinkImpl { tx, paused }, handle))
+    Ok((
+        LiveSinkImpl {
+            tx,
+            paused,
+            pet_samples_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        },
+        handle,
+    ))
 }
