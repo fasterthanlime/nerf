@@ -20,6 +20,7 @@ import {
   type LiveFilter,
   type ProfilerClient,
   type SampleMode,
+  type SymbolRef,
   type ThreadInfo,
   type ThreadsUpdate,
   type TopEntry,
@@ -58,6 +59,34 @@ export const EMPTY_FILTER: LiveFilter = {
   sample_mode: { tag: "Both" },
 };
 
+/// One step in the drill-down stack. Renders as a breadcrumb chip
+/// above the flamegraph: clicking the body truncates the stack to
+/// (and including) that step, clicking × removes just that one step.
+///
+/// `focus`   — narrows the flame to a subtree (absolute key in
+///             `update.root`). Multiple focus steps nest.
+/// `exclude` — drops every sample whose stack contains this symbol;
+///             accumulates into `LiveFilter.exclude_symbols`.
+export type DrillStep =
+  | { kind: "focus"; absKey: string; label: string; binary: string | null }
+  | { kind: "exclude"; symbol: SymbolRef; label: string };
+
+/// Project a drill stack into the two derived view-state pieces:
+/// the active flame focus key (the most recent focus step), and the
+/// flat list of exclude symbols feeding into LiveFilter.
+function deriveDrillView(stack: DrillStep[]): {
+  currentAbsKey: string | null;
+  excludeSymbols: SymbolRef[];
+} {
+  let currentAbsKey: string | null = null;
+  const excludeSymbols: SymbolRef[] = [];
+  for (const step of stack) {
+    if (step.kind === "focus") currentAbsKey = step.absKey;
+    else excludeSymbols.push(step.symbol);
+  }
+  return { currentAbsKey, excludeSymbols };
+}
+
 /// Bundle thread/filter knobs for a subscription. Centralising this so
 /// every subscriber uses identical defaults; later we can thread a
 /// filter object down from the UI (timeline brush, exclude pills, etc).
@@ -93,9 +122,23 @@ export function App() {
   const [regexMode, setRegexMode] = useState(false);
   const [hiddenKinds, setHiddenKinds] = useState<Set<ObjKind>>(new Set());
   const [paneTab, setPaneTab] = useState<PaneTab>("asm");
-  const [flameFocusKey, setFlameFocusKey] = useState<string | null>(null);
+  // Drill-down stack: each step is either a flame focus or a
+  // symbol exclusion. Renders as breadcrumbs above the flamegraph.
+  // F / right-click "Focus" / D / right-click "Drop" all push here;
+  // clicking a breadcrumb truncates to that depth, the × on a
+  // breadcrumb removes just that one step, Esc pops one level.
+  const [drillStack, setDrillStack] = useState<DrillStep[]>([]);
   const [menu, setMenu] = useState<ContextMenuTarget | null>(null);
+  // `filter` carries the non-stack filter knobs (time range, sample
+  // mode). exclude_symbols is derived from drillStack and merged in
+  // on the way to the wire so the two stay consistent.
   const [filter, setFilter] = useState<LiveFilter>(EMPTY_FILTER);
+  const { currentAbsKey: flameFocusAbsKey, excludeSymbols: drillExcludes } =
+    useMemo(() => deriveDrillView(drillStack), [drillStack]);
+  const effectiveFilter: LiveFilter = useMemo(
+    () => ({ ...filter, exclude_symbols: drillExcludes }),
+    [filter, drillExcludes],
+  );
   const [pmuMetric, setPmuMetric] = useState<PmuMetric>("ipc");
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [paused, setPaused] = useState(false);
@@ -111,27 +154,33 @@ export function App() {
   }, [theme]);
 
   const dropSymbol = (s: { function_name: string | null; binary: string | null }) => {
-    setFilter((prev) => {
-      const exists = prev.exclude_symbols.some(
-        (e) => e.function_name === s.function_name && e.binary === s.binary,
+    setDrillStack((prev) => {
+      const alreadyExcluded = prev.some(
+        (step) =>
+          step.kind === "exclude" &&
+          step.symbol.function_name === s.function_name &&
+          step.symbol.binary === s.binary,
       );
-      if (exists) return prev;
-      return {
+      if (alreadyExcluded) return prev;
+      return [
         ...prev,
-        exclude_symbols: [
-          ...prev.exclude_symbols,
-          { function_name: s.function_name, binary: s.binary },
-        ],
-      };
+        {
+          kind: "exclude",
+          symbol: { function_name: s.function_name, binary: s.binary },
+          label: s.function_name ?? "(unresolved)",
+        },
+      ];
     });
   };
 
-  const removeExcludeAt = (idx: number) => {
-    setFilter((prev) => ({
-      ...prev,
-      exclude_symbols: prev.exclude_symbols.filter((_, i) => i !== idx),
-    }));
+  const pushFocus = (step: { absKey: string; label: string; binary: string | null }) => {
+    setDrillStack((prev) => [...prev, { kind: "focus", ...step }]);
   };
+
+  const truncateDrill = (n: number) => setDrillStack((prev) => prev.slice(0, n));
+  const removeDrillAt = (idx: number) =>
+    setDrillStack((prev) => prev.filter((_, i) => i !== idx));
+  const popDrill = () => setDrillStack((prev) => prev.slice(0, -1));
 
   const setTimeRange = (tr: LiveFilter["time_range"]) => {
     setFilter((prev) => ({ ...prev, time_range: tr }));
@@ -203,7 +252,7 @@ export function App() {
         const sortArg: TopSort =
           sort === "self" ? { tag: "BySelf" } : { tag: "ByTotal" };
         console.debug("App: subscribeTop", { sort: sortArg, tid: selectedTid });
-        await c.subscribeTop(50, sortArg, viewParams(selectedTid, filter), tx).catch((err) => {
+        await c.subscribeTop(50, sortArg, viewParams(selectedTid, effectiveFilter), tx).catch((err) => {
           console.debug("App: subscribeTop call failed", err);
           if (!cancelled) {
             setStatus("err");
@@ -239,7 +288,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [committedUrl, sort, selectedTid, filter]);
+  }, [committedUrl, sort, selectedTid, effectiveFilter]);
 
   // Subscribe to the live thread list whenever the client connects.
   useEffect(() => {
@@ -419,23 +468,44 @@ export function App() {
           />
         </section>
       )}
-      {filter.exclude_symbols.length > 0 && (
-        <section className="filter-bar">
-          <span className="filter-bar-label">excluded:</span>
-          <div className="filter-chips">
-            {filter.exclude_symbols.map((s, i) => (
-              <span key={i} className="filter-chip" title={s.binary ?? ""}>
-                {s.function_name ?? "(unresolved)"}
-                <button
-                  className="filter-chip-x"
-                  onClick={() => removeExcludeAt(i)}
-                  title="remove this exclusion"
-                >
-                  ×
-                </button>
-              </span>
-            ))}
-          </div>
+      {drillStack.length > 0 && (
+        <section className="drill-bar" aria-label="drill-down breadcrumbs">
+          <button
+            className="drill-crumb drill-root"
+            onClick={() => truncateDrill(0)}
+            title="clear all drill-down filters"
+          >
+            (all)
+          </button>
+          {drillStack.map((step, i) => (
+            <span
+              key={i}
+              className={`drill-crumb drill-${step.kind}${i === drillStack.length - 1 ? " drill-current" : ""}`}
+              title={
+                step.kind === "exclude"
+                  ? `excluded ${step.symbol.function_name ?? "(unresolved)"}`
+                  : `focused ${step.label}`
+              }
+            >
+              <button
+                className="drill-crumb-body"
+                onClick={() => truncateDrill(i + 1)}
+                title="back to here (drops everything after)"
+              >
+                <span className="drill-kind">
+                  {step.kind === "focus" ? "▸" : "−"}
+                </span>
+                <span className="drill-label">{step.label}</span>
+              </button>
+              <button
+                className="drill-crumb-x"
+                onClick={() => removeDrillAt(i)}
+                title="remove just this step"
+              >
+                ×
+              </button>
+            </span>
+          ))}
         </section>
       )}
       {wakers && wakers.entries.length > 0 && (
@@ -450,11 +520,12 @@ export function App() {
           <Flamegraph
             client={client}
             tid={selectedTid}
-            filter={filter}
+            filter={effectiveFilter}
             matchText={matchText}
             hiddenKinds={hiddenKinds}
-            focusKey={flameFocusKey}
-            onFocusKeyChange={setFlameFocusKey}
+            currentAbsKey={flameFocusAbsKey}
+            onPushFocus={pushFocus}
+            onPopDrill={popDrill}
             onSelectAddress={setSelected}
             onFrozenChange={setFlameFrozen}
             onContextMenu={openMenu}
@@ -508,14 +579,14 @@ export function App() {
                     client={client}
                     address={selected}
                     tid={selectedTid}
-                    filter={filter}
+                    filter={effectiveFilter}
                   />
                 ) : (
                   <Neighbors
                     client={client}
                     address={selected}
                     tid={selectedTid}
-                    filter={filter}
+                    filter={effectiveFilter}
                     matchText={matchText}
                     hiddenKinds={hiddenKinds}
                     onSelectAddress={setSelected}
@@ -563,7 +634,13 @@ export function App() {
           {menu.flameKey && (
             <button
               onClick={() => {
-                setFlameFocusKey(menu.flameKey!);
+                pushFocus({
+                  absKey: menu.flameKey!,
+                  label:
+                    menu.functionName ??
+                    `0x${menu.address.toString(16)}`,
+                  binary: menu.binary,
+                });
                 setMenu(null);
               }}
             >

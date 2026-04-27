@@ -557,22 +557,6 @@ table.top-table tr.match {
   z-index: 1;
 }
 
-/* Reset-focus button + context menu */
-.flame-reset {
-  background: var(--bg-button);
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent) 33%, transparent);
-  border-radius: 3px;
-  padding: 2px 8px;
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.flame-reset:hover {
-  background: var(--bg-button-hover);
-}
-
 .context-menu {
   position: fixed;
   background: var(--bg-button);
@@ -741,57 +725,94 @@ table.top-table tr.match {
   color: var(--text-primary);
 }
 
-.filter-bar {
+/* Drill-down breadcrumb bar above the flamegraph. Each step (focus
+   or exclude) renders as a chip; clicking the body truncates the
+   stack to that depth, clicking × removes just that step. The last
+   chip is the active state and gets a brighter accent. */
+.drill-bar {
   display: flex;
   flex: 0 0 auto;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px;
   align-items: center;
   padding: 4px 12px;
   border-bottom: 1px solid var(--border-soft);
   background: var(--bg-elevated);
   font-size: 11px;
   color: var(--text-muted);
-}
-
-.filter-bar-label {
   font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-size: 9px;
 }
 
-.filter-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  align-items: center;
-}
-
-.filter-chip {
+.drill-crumb {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
   background: var(--bg-hover);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
-  padding: 1px 6px 1px 8px;
+  padding: 0 0 0 2px;
   font-size: 10px;
   color: var(--text-secondary);
-  font-family: var(--font-mono);
+  overflow: hidden;
 }
 
-.filter-chip-x {
+.drill-crumb-body {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  padding: 1px 4px 1px 6px;
+  cursor: pointer;
+}
+
+.drill-crumb-body:hover {
+  background: var(--bg-button-hover);
+}
+
+.drill-crumb .drill-kind {
+  color: var(--text-muted);
+  font-weight: bold;
+}
+
+.drill-root {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+  padding: 1px 6px;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.drill-root:hover {
+  color: var(--text-secondary);
+}
+
+.drill-current {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border-strong));
+  color: var(--text-primary);
+}
+
+.drill-exclude .drill-kind {
+  color: var(--danger);
+}
+
+.drill-crumb-x {
   background: transparent;
   border: none;
   color: var(--text-icon);
   cursor: pointer;
   font-size: 12px;
   line-height: 1;
-  padding: 0;
+  padding: 0 6px;
+  align-self: stretch;
 }
 
-.filter-chip-x:hover {
+.drill-crumb-x:hover {
   color: var(--danger);
+  background: var(--bg-button-hover);
 }
 
 /* "Who woke this thread?" panel — styled like the exclude bar but
@@ -893,16 +914,22 @@ table.top-table tr.match {
   gap: 4px;
 }
 
-/* Flame-box label parts: language-coloured icon, function name
-   (truncates first when there's room for it), then a dimmed binary
-   basename (drops out before the name does when space gets tight). */
-.flame-box .glyph {
+/* Flame-box label parts: a small monochrome language icon, function
+   name (truncates first when there's room for it), then a dimmed
+   binary basename (drops out before the name does when space gets
+   tight). The icon stays monochrome inside the box -- the saturated
+   `.glyph.lang-*` palette reads as visual noise on top of the
+   already-coloured kind backgrounds. */
+.flame-box .glyph,
+.flame-box .glyph[class*="lang-"] {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 12px;
   height: 12px;
+  color: inherit;
+  opacity: 0.7;
 }
 
 .flame-box .glyph svg {

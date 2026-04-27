@@ -47,6 +47,18 @@ function nodeMatches(
   );
 }
 
+/// Splice a relative box key (always rooted at "r" inside the
+/// rendered subtree) onto an absolute parent key (rooted at "r" in
+/// `update.root`). Used when the user pushes a focus while already
+/// focused: the box's "r/x/y" layout key needs to become
+/// "r/...parent.../x/y" so findByKey can resolve it from the live
+/// root on the next render.
+function combineKey(parentAbs: string | null, childRel: string): string {
+  if (!parentAbs) return childRel;
+  if (childRel === "r") return parentAbs;
+  return parentAbs + childRel.slice(1); // drop the leading "r"
+}
+
 /// Find a node by its layout key (e.g. "r/2/1/0"). Mirrors the
 /// `${keyPrefix}/${i}` numbering in `layout`.
 function findByKey(node: FlameView, target: string): FlameView | null {
@@ -112,8 +124,9 @@ export function Flamegraph({
   filter,
   matchText,
   hiddenKinds,
-  focusKey,
-  onFocusKeyChange,
+  currentAbsKey,
+  onPushFocus,
+  onPopDrill,
   onSelectAddress,
   onFrozenChange,
   onContextMenu,
@@ -124,8 +137,17 @@ export function Flamegraph({
   filter: LiveFilter;
   matchText: ((t: string) => boolean) | null;
   hiddenKinds: Set<ObjKind>;
-  focusKey: string | null;
-  onFocusKeyChange: (k: string | null) => void;
+  /// Absolute flame key (relative to `update.root`) of the currently
+  /// focused subtree, or null when there's no focus.
+  currentAbsKey: string | null;
+  /// Push a focus step onto the drill stack. The Flamegraph
+  /// composes the absolute key (so callers don't have to know about
+  /// the "r/.../..." encoding) and supplies a label suitable for a
+  /// breadcrumb chip.
+  onPushFocus: (step: { absKey: string; label: string; binary: string | null }) => void;
+  /// Pop the most recent drill step (focus or exclude). Bound to
+  /// Esc while the cursor is over the flamegraph.
+  onPopDrill: () => void;
   onSelectAddress: (a: bigint) => void;
   onFrozenChange?: (frozen: boolean) => void;
   onContextMenu: (t: ContextMenuTarget) => void;
@@ -175,7 +197,6 @@ export function Flamegraph({
     let cancelled = false;
     setUpdate(null);
     latestRef.current = null;
-    onFocusKeyChange(null);
     const [tx, rx] = channel<WireFlamegraphUpdate>();
     client.subscribeFlamegraph(viewParams(tid, filter), tx).catch(() => {});
     (async () => {
@@ -199,9 +220,13 @@ export function Flamegraph({
     onFrozenChange?.(frozen);
   }, [frozen, onFrozenChange]);
 
-  // F: focus the hovered subtree. D: drop the hovered symbol from
-  // future aggregations. Only active while the cursor is inside the
-  // flamegraph (frozen=true also means hovering).
+  // F: focus the hovered subtree (push). D: drop the hovered symbol
+  // from future aggregations. Esc: pop one drill step. Only active
+  // while the cursor is inside the flamegraph (frozen=true means
+  // hovering). Box keys delivered by `layout` are relative to the
+  // rendered subtree; we splice the relative tail onto currentAbsKey
+  // so the pushed focus key is still resolvable from update.root via
+  // findByKey.
   useEffect(() => {
     hoverRef.current = hover;
   }, [hover]);
@@ -209,7 +234,6 @@ export function Flamegraph({
     if (!frozen) return;
     const onKey = (e: KeyboardEvent) => {
       const h = hoverRef.current;
-      if (!h || h.node.address === 0n) return;
       // Don't fire when the user is typing into a search/regex input.
       const target = e.target as HTMLElement | null;
       if (
@@ -220,9 +244,19 @@ export function Flamegraph({
       ) {
         return;
       }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onPopDrill();
+        return;
+      }
+      if (!h || h.node.address === 0n) return;
       if (e.key === "f" || e.key === "F") {
         e.preventDefault();
-        onFocusKeyChange(h.key);
+        onPushFocus({
+          absKey: combineKey(currentAbsKey, h.key),
+          label: labelFor(h.node),
+          binary: h.node.binary,
+        });
       } else if (e.key === "d" || e.key === "D") {
         e.preventDefault();
         onDropSymbol({
@@ -233,15 +267,15 @@ export function Flamegraph({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [frozen, onFocusKeyChange, onDropSymbol]);
+  }, [frozen, currentAbsKey, onPushFocus, onPopDrill, onDropSymbol]);
 
   // Pick the rendering root: focused subtree if set and findable,
   // otherwise the live root. When `update` is null we render an empty
   // shell so the outer `.flame` keeps its user-resized height across
   // filter changes (the ref + ResizeObserver stay attached).
   const renderRoot = update
-    ? focusKey
-      ? findByKey(update.root, focusKey) ?? update.root
+    ? currentAbsKey
+      ? findByKey(update.root, currentAbsKey) ?? update.root
       : update.root
     : null;
   const { boxes, depth } = renderRoot
@@ -289,7 +323,7 @@ export function Flamegraph({
                   functionName: b.node.function_name,
                   binary: b.node.binary,
                   kind: b.node.address === 0n ? undefined : objKindOf(b.node),
-                  flameKey: b.key,
+                  flameKey: combineKey(currentAbsKey, b.key),
                 });
               }}
               title={tooltipFor(b.node, total)}
@@ -300,15 +334,6 @@ export function Flamegraph({
         })}
       </div>
       <div className="flame-status">
-        {focusKey && (
-          <button
-            className="flame-reset"
-            onClick={() => onFocusKeyChange(null)}
-            title="clear focus and show the full tree"
-          >
-            ↩ reset focus
-          </button>
-        )}
         {hover ? (
           <>
             <span className="flame-status-label">{labelFor(hover.node)}</span>
