@@ -33,7 +33,7 @@ use nerf_mac_kperf_sys::kdebug::{
     self, kdbg_class, kdbg_subclass, KdBuf, DBG_MACH, DBG_MACH_SCHED, DBG_PERF,
 };
 use nperfd_proto::{KdBufBatch, KdBufWire, NperfdClient, SessionConfig};
-use tracing::{info, warn};
+use log::{info, warn};
 
 /// User-facing options. Mirrors the shape of
 /// `nerf_mac_kperf::RecordOptions` so plumbing through the existing
@@ -185,6 +185,10 @@ pub async fn drive_session<S: SampleSink>(
     let mut parser = Parser::new();
     let mut offcpu = CpuIntervalTracker::default();
     let mut total_drained: u64 = 0;
+    // First-batch log: tells the user "yes, the daemon is streaming
+    // records" without spamming the per-batch case. Once the first
+    // batch lands we go quiet until the session ends.
+    let mut seen_first_batch = false;
 
     loop {
         if should_stop() {
@@ -232,6 +236,14 @@ pub async fn drive_session<S: SampleSink>(
         // of the closure, which is all we need.
         let pid = opts.pid;
         let _ = batch_sref.map(|batch| {
+            if !seen_first_batch {
+                seen_first_batch = true;
+                info!(
+                    "nperfd-client: first batch ({} records) arrived {:?} after session start",
+                    batch.records.len(),
+                    session_start.elapsed(),
+                );
+            }
             total_drained += batch.records.len() as u64;
             process_batch(&batch.records, &mut parser, &mut offcpu, sink, pid);
         });

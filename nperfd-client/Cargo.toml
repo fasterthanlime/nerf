@@ -14,7 +14,7 @@ nerf-mac-capture = { version = "0.1", path = "../nerf-mac-capture" }
 nperf-mac-shared-cache = { version = "0.1", path = "../nperf-mac-shared-cache" }
 vox = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d", features = ["transport-local"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
-tracing = "0.1"
+log = "0.4"
 thiserror = "2"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
