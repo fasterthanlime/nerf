@@ -1,0 +1,21 @@
+[package]
+name = "nperfd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+description = "Root daemon for nperf. Owns the kperf + kdebug + kpc surface, validates per-connection authorisation, and streams raw KdBuf records to clients over a vox local socket. Designed to run under launchd as a LaunchDaemon; one active recording session at a time (kperf is single-owner globally)."
+
+[[bin]]
+name = "nperfd"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nperfd-proto = { path = "../nperfd-proto" }
+nerf-mac-kperf-sys = { version = "0.1", path = "../nerf-mac-kperf-sys" }
+vox = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d", features = ["transport-local"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+eyre = "0.6"
