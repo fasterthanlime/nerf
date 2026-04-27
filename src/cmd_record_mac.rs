@@ -80,17 +80,6 @@ fn record_existing_pid(
     let mut sink = open_sink(&output_path, pid, &exe_path, &args)?;
     sink.live_sink = live_sink;
 
-    // Acquire the task port up front so we can hand it to the live sink
-    // (lets it read JIT'd bytes directly from the target via
-    // mach_vm_read), then pass the same port to `record_with_task`.
-    let task = task_for_pid_existing(pid)?;
-    if let Some(live) = sink.live_sink.as_ref() {
-        live.on_target_attached(&TargetAttached {
-            pid,
-            task_port: task as u64,
-        });
-    }
-
     let sigint = SigintHandler::new();
     let start = std::time::Instant::now();
     let time_limit = args.profiler_args.time_limit.map(Duration::from_secs);
@@ -105,6 +94,18 @@ fn record_existing_pid(
     info!("Running... press Ctrl-C to stop.");
     match args.mac_backend.as_str() {
         "samply" => {
+            // samply needs the task port up front: `record_with_task`
+            // takes it and the live sink wants it for mach_vm_read of
+            // JIT bytes. kperf reacquires internally; daemon doesn't
+            // need it at all (yet — once the broker is wired, that's
+            // where it'll come from).
+            let task = task_for_pid_existing(pid)?;
+            if let Some(live) = sink.live_sink.as_ref() {
+                live.on_target_attached(&TargetAttached {
+                    pid,
+                    task_port: task as u64,
+                });
+            }
             if let Err(err) = record_with_task(task, opts, &mut sink, should_stop) {
                 return Err(format!("nerf-mac-capture::record failed: {}", err).into());
             }
@@ -126,6 +127,32 @@ fn record_existing_pid(
                 return Err(format!("nerf-mac-kperf::record failed: {}", err).into());
             }
         }
+        "daemon" => {
+            // Same time-budget shape as the kperf branch: the
+            // daemon's drain loop continues until we close the
+            // records channel, which the client driver does when
+            // either the duration elapses or `should_stop` returns
+            // true. SIGINT alone is enough to watch for here.
+            let opts = nperfd_client::RemoteOptions {
+                daemon_socket: args.daemon_socket.clone(),
+                pid,
+                frequency_hz: args.frequency,
+                duration: time_limit,
+                ..Default::default()
+            };
+            let daemon_should_stop = || sigint.was_triggered();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| format!("daemon backend: tokio runtime build: {err}"))?;
+            if let Err(err) = rt.block_on(nperfd_client::drive_session(
+                opts,
+                &mut sink,
+                daemon_should_stop,
+            )) {
+                return Err(format!("nperfd-client failed: {err}").into());
+            }
+        }
         other => {
             return Err(format!("unknown --mac-backend value: {other}").into());
         }
@@ -143,6 +170,9 @@ fn record_child_launch(
 ) -> Result<(), Box<dyn Error>> {
     if args.mac_backend == "kperf" {
         return record_child_launch_kperf(args, program, program_args, live_sink);
+    }
+    if args.mac_backend == "daemon" {
+        return record_child_launch_daemon(args, program, program_args, live_sink);
     }
     let mut accepter = TaskAccepter::new()
         .map_err(|err| format!("setting up Mach IPC accepter: {:?}", err))?;
@@ -294,6 +324,65 @@ fn record_child_launch_kperf(
     info!("Running... press Ctrl-C to stop.");
     if let Err(err) = kperf_record(kopts, &mut sink, should_stop) {
         return Err(format!("nerf-mac-kperf::record failed: {}", err).into());
+    }
+
+    sink.finish()?;
+    Ok(())
+}
+
+/// Child-launch path for the daemon backend. Same shape as
+/// `record_child_launch_kperf` — plain `Command::spawn`, no preload
+/// dylib, no Mach IPC bootstrap — but the privileged kperf calls
+/// happen in `nperfd` (which we connect to over a vox local socket)
+/// instead of in-process. The CLI itself runs unprivileged.
+fn record_child_launch_daemon(
+    args: args::RecordArgs,
+    program: String,
+    program_args: Vec<String>,
+    live_sink: Option<Box<dyn LiveSink>>,
+) -> Result<(), Box<dyn Error>> {
+    use std::process::Command;
+
+    info!("Launching {}...", program);
+    let mut cmd = Command::new(&program);
+    cmd.args(&program_args);
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to spawn {program}: {err}"))?;
+    let pid = child.id();
+    info!("Child started: PID {}", pid);
+
+    let exe_path = proc_pidpath(pid).unwrap_or_else(|_| program.clone());
+    let output_path = resolve_output_path(&args, pid, &exe_path);
+    info!("Recording PID {} -> {}", pid, output_path.display());
+    let mut sink = open_sink(&output_path, pid, &exe_path, &args)?;
+    sink.live_sink = live_sink;
+
+    let sigint = SigintHandler::new();
+    let time_limit = args.profiler_args.time_limit.map(Duration::from_secs);
+
+    let opts = nperfd_client::RemoteOptions {
+        daemon_socket: args.daemon_socket.clone(),
+        pid,
+        frequency_hz: args.frequency,
+        duration: time_limit,
+        ..Default::default()
+    };
+
+    let should_stop = move || {
+        if sigint.was_triggered() {
+            return true;
+        }
+        matches!(child.try_wait(), Ok(Some(_)))
+    };
+
+    info!("Running... press Ctrl-C to stop.");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("daemon backend: tokio runtime build: {err}"))?;
+    if let Err(err) = rt.block_on(nperfd_client::drive_session(opts, &mut sink, should_stop)) {
+        return Err(format!("nperfd-client failed: {err}").into());
     }
 
     sink.finish()?;

@@ -209,11 +209,23 @@ pub struct RecordArgs {
     #[structopt(long)]
     pub serve: Option< String >,
 
-    /// macOS-only: which sampling backend to use. `samply` (default)
-    /// drives nerf-mac-capture's suspend-and-walk loop with framehop;
-    /// `kperf` drives Apple's private kperf framework via PET.
-    #[structopt(long, default_value = "samply", raw(possible_values = r#"&["samply", "kperf"]"#))]
+    /// macOS-only: which sampling backend to use.
+    ///   * `samply` (default) drives nerf-mac-capture's suspend-and-walk
+    ///     loop with framehop;
+    ///   * `kperf` drives Apple's private kperf framework via PET in-process
+    ///     (requires sudo);
+    ///   * `daemon` connects to a running `nperfd` over a vox local socket
+    ///     and consumes the streamed `KdBufBatch` records (no sudo from
+    ///     this CLI; see `cargo xtask build-daemon`).
+    #[structopt(long, default_value = "samply", raw(possible_values = r#"&["samply", "kperf", "daemon"]"#))]
     pub mac_backend: String,
+
+    /// macOS-only: when `--mac-backend daemon` is selected, the local
+    /// socket path to connect to. Defaults to /tmp/nperfd.sock for
+    /// hand-running the daemon; production deployments via launchd put
+    /// it under /var/run/nperfd.sock.
+    #[structopt(long, default_value = "/tmp/nperfd.sock")]
+    pub daemon_socket: String,
 
     /// Arguments to pass to the launched child process. Use `--` to
     /// separate nperf flags from the target's arguments:

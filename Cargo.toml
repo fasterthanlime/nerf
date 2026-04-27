@@ -32,6 +32,8 @@ memmap2 = "0.9"
 nerf-mac-capture = { version = "0.1", path = "nerf-mac-capture" }
 nerf-mac-kperf = { version = "0.1", path = "nerf-mac-kperf" }
 nperf-mac-shared-cache = { version = "0.1", path = "nperf-mac-shared-cache" }
+nperfd-client = { version = "0.1", path = "nperfd-client" }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 mach2 = "0.4"
 
 [dependencies.nwind]
