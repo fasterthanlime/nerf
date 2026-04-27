@@ -1,0 +1,18 @@
+[package]
+name = "nperf-trinity-smoke"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+description = "End-to-end smoke test for the trinity (root nperfd + same-uid nperf-task-broker + caller process). Connects to the daemon, calls status(); connects to the broker, calls task_for_pid(self). Lets us validate the trinity shape works before wiring it into nperf-live proper."
+
+[[bin]]
+name = "nperf-trinity-smoke"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nperfd-proto = { path = "../nperfd-proto" }
+vox = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d", features = ["transport-local"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+mach2 = "0.4"
+libc = "0.2"

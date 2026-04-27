@@ -1969,6 +1969,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nperf-trinity-smoke"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mach2 0.4.3",
+ "nperfd-proto",
+ "tokio",
+ "vox",
+]
+
+[[package]]
 name = "nperfd"
 version = "0.1.0"
 dependencies = [
