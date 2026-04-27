@@ -2109,6 +2109,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "stax-server"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "eyre",
+ "libc",
+ "log",
+ "parking_lot",
+ "stax-live-proto",
+ "tokio",
+ "vox",
+]
+
+[[package]]
 name = "staxd"
 version = "0.1.0"
 dependencies = [

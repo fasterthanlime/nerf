@@ -587,11 +587,11 @@ pub struct RunId(pub u64);
 #[repr(u8)]
 pub enum RunState {
     /// Recording is in progress; samples are streaming in.
-    Recording = 0,
+    Recording,
     /// The recorder reported it stopped (target exited, time limit hit,
     /// `stop_active` was called). Aggregator state is frozen but still
     /// queryable.
-    Stopped = 1,
+    Stopped,
 }
 
 /// Why a run stopped. Surfaced once the run transitions to
@@ -600,16 +600,14 @@ pub enum RunState {
 #[repr(u8)]
 pub enum StopReason {
     /// The launched child exited (or the attached PID went away).
-    TargetExited = 0,
+    TargetExited,
     /// `--time-limit` elapsed.
-    TimeLimit = 1,
+    TimeLimit,
     /// User Ctrl-C'd the recorder, or an agent called `stop_active`.
-    UserStop = 2,
+    UserStop,
     /// The recorder errored. `message` carries the human-readable
     /// detail.
-    RecorderError {
-        message: String,
-    } = 3,
+    RecorderError { message: String },
 }
 
 #[derive(Clone, Debug, Facet)]
@@ -653,20 +651,20 @@ pub enum WaitCondition {
     /// Block until the active run transitions to `Stopped`. The
     /// natural choice for "let the recording finish, then I'll
     /// query."
-    UntilStopped = 0,
+    UntilStopped,
     /// Return as soon as the run has ingested at least `count` PET
     /// samples (returns immediately if already past). Useful for
     /// "give me enough data to be statistically meaningful, then
     /// look."
-    ForSamples { count: u64 } = 1,
+    ForSamples { count: u64 },
     /// Return after `seconds` of wall-clock time inside `wait_active`,
     /// even if the run is still recording.
-    ForSeconds { seconds: u64 } = 2,
+    ForSeconds { seconds: u64 },
     /// Return as soon as a symbol whose demangled name contains
     /// `needle` (case-sensitive substring match) has been observed
     /// in the binary registry. Useful for "wait until the JIT has
     /// produced the function I want to look at."
-    UntilSymbolSeen { needle: String } = 3,
+    UntilSymbolSeen { needle: String },
 }
 
 /// Outcome of a `wait_active` call.
@@ -676,15 +674,15 @@ pub enum WaitOutcome {
     /// The wait condition fired. `summary` is the run's snapshot
     /// at the moment the condition fired (still `Recording` if the
     /// condition was, e.g., `ForSamples`).
-    ConditionMet { summary: RunSummary } = 0,
+    ConditionMet { summary: RunSummary },
     /// The run reached `Stopped`. Always returned for `UntilStopped`,
     /// and pre-empts any other condition for the other variants.
-    Stopped { summary: RunSummary } = 1,
+    Stopped { summary: RunSummary },
     /// The caller-supplied `timeout_ms` elapsed first. `summary` is
     /// the run's snapshot at that moment (still `Recording`).
-    TimedOut { summary: RunSummary } = 2,
+    TimedOut { summary: RunSummary },
     /// No run was active when `wait_active` was called.
-    NoActiveRun = 3,
+    NoActiveRun,
 }
 
 /// Agent-facing control plane. One service instance per server; runs

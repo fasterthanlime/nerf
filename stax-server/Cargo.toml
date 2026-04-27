@@ -1,0 +1,22 @@
+[package]
+name = "stax-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+description = "Unprivileged long-running daemon: hosts the run registry, the live aggregator, the web UI, and the agent-facing RunControl service."
+
+[dependencies]
+stax-live-proto = { path = "../stax-live-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+eyre = "0.6"
+libc = "0.2"
+
+vox = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d", features = ["transport-local"] }
+
+[[bin]]
+name = "stax-server"
+path = "src/main.rs"

@@ -43,6 +43,7 @@ members = [
     "xtask",
     "stax-live",
     "stax-live-proto",
+    "stax-server",
     "stax-demangle",
     "staxd-proto",
     "staxd",
