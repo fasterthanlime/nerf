@@ -136,6 +136,14 @@ pub struct BinaryRegistry {
     /// `text_bytes` are available.
     #[cfg(target_os = "macos")]
     macho_byte_source: Option<Arc<dyn stax_mac_capture::MachOByteSource>>,
+    /// Concrete handle on the same dyld shared cache, used for
+    /// symbol-name resolution when an address falls outside any
+    /// registered binary. The recorder used to emit a
+    /// `BinaryLoaded` for every cache image (~3500 of them, ~14M
+    /// symbols on the wire); now the server resolves them locally
+    /// against this cache instead.
+    #[cfg(target_os = "macos")]
+    shared_cache: Option<Arc<stax_mac_shared_cache::SharedCache>>,
 }
 
 struct DyldCacheBundle {
@@ -155,7 +163,14 @@ impl BinaryRegistry {
             target_task_port: None,
             #[cfg(target_os = "macos")]
             macho_byte_source: None,
+            #[cfg(target_os = "macos")]
+            shared_cache: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_shared_cache(&mut self, cache: Arc<stax_mac_shared_cache::SharedCache>) {
+        self.shared_cache = Some(cache);
     }
 
     pub fn set_target(&mut self, pid: u32, task_port: u64) {
@@ -253,8 +268,19 @@ impl BinaryRegistry {
     /// Resolve `address` to a (function name, binary basename, is-main)
     /// triple without loading any image bytes. Used by top-N rendering
     /// where we want labels but don't need disassembly.
+    ///
+    /// Falls through to the locally-mapped dyld shared cache when no
+    /// registered binary covers the address — this is how dyld
+    /// cache-resident symbols (libsystem, libdispatch, …) resolve
+    /// without the recorder ever shipping their tables over the wire.
     pub fn lookup_symbol(&self, address: u64) -> Option<ResolvedSymbol> {
-        let binary = &self.by_base[self.binary_for_address(address)?];
+        let Some(idx) = self.binary_for_address(address) else {
+            #[cfg(target_os = "macos")]
+            return self.lookup_symbol_in_shared_cache(address);
+            #[cfg(not(target_os = "macos"))]
+            return None;
+        };
+        let binary = &self.by_base[idx];
         let svma = svma_for(binary, address);
         let basename = short_path(&binary.path).to_owned();
         let is_main = binary.is_executable;
@@ -286,6 +312,47 @@ impl BinaryRegistry {
             function_name,
             binary: basename,
             is_main,
+            language,
+        })
+    }
+
+    /// Look up a sampled address in the locally-mapped dyld
+    /// shared cache. Returns the dyld install-name's basename as
+    /// `binary` and the demangled symbol name (or the cache-svma
+    /// hex if there's no enclosing symbol).
+    #[cfg(target_os = "macos")]
+    fn lookup_symbol_in_shared_cache(&self, address: u64) -> Option<ResolvedSymbol> {
+        let cache = self.shared_cache.as_ref()?;
+        let img_ref = cache.lookup_address(address)?;
+        let img = img_ref.image();
+        let basename = short_path(&img.install_name).to_owned();
+        // Cache images are linker-laid-out at `text_svma`; the
+        // runtime mapping shifts everything by `runtime_avma -
+        // text_svma`. Translate the sampled AVMA back into that
+        // SVMA space to match the symbols in the LC_SYMTAB.
+        let svma = address.wrapping_sub(img.runtime_avma).wrapping_add(img.text_svma);
+        // Symbols are NOT sorted on the cache side — we use
+        // partition_point regardless because enumerate_runtime_images
+        // emits them in nlist order which is close-to-sorted, but for
+        // safety walk linearly. (Tens of thousands of symbols per
+        // image; binary search would need a sorted invariant we
+        // don't currently enforce on this side.)
+        let demangled = img
+            .symbols
+            .iter()
+            .find(|s| svma >= s.start_svma && svma < s.end_svma)
+            .map(|s| stax_demangle::demangle_bytes(&s.name));
+        let (function_name, language) = match demangled {
+            Some(d) => (d.name, d.language),
+            None => (
+                format!("{}+{:#x}", basename, svma),
+                stax_demangle::Language::Unknown,
+            ),
+        };
+        Some(ResolvedSymbol {
+            function_name,
+            binary: basename,
+            is_main: false,
             language,
         })
     }

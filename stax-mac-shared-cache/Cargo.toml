@@ -10,3 +10,4 @@ log = "0.4"
 memmap2 = "0.9"
 stax-mac-capture = { version = "0.1", path = "../stax-mac-capture" }
 object = { version = "0.39", default-features = false, features = ["std", "read_core", "macho", "unaligned"] }
+parking_lot = "0.12"

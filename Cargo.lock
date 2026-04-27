@@ -2060,6 +2060,7 @@ dependencies = [
  "stax-demangle",
  "stax-live-proto",
  "stax-mac-capture",
+ "stax-mac-shared-cache",
  "tokio",
  "tracing",
  "vox",
@@ -2109,6 +2110,7 @@ dependencies = [
  "log",
  "memmap2",
  "object 0.39.1",
+ "parking_lot",
  "stax-mac-capture",
 ]
 

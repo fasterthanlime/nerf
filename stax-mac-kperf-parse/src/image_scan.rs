@@ -60,13 +60,13 @@ impl ImageScanner {
         let exec_count = regions.iter().filter(|r| r.is_executable && !r.path.is_empty()).count();
         let first_scan = self.known.is_empty();
 
-        // Seed the dyld shared cache once. libproc doesn't surface
-        // cache regions (they live in a shared submap, no vnode path
-        // resolution), so without this the entire 0x180000000+ range
-        // shows up as `(no binary)` in the live UI.
-        if first_scan {
-            self.seed_shared_cache(pid, sink);
-        }
+        // We used to seed the dyld shared cache here — emitting one
+        // BinaryLoaded per cache image, ~3500 images / ~14M symbols
+        // synchronously into the sink. That hammered the recorder's
+        // runtime for several seconds at session start, broke vox
+        // keepalive, and shipped megabytes the server didn't need:
+        // the server has its own SharedCache mapped locally and
+        // resolves cache-resident addresses against it directly.
 
         if first_scan {
             log::info!(
@@ -171,47 +171,6 @@ impl ImageScanner {
         }
     }
 
-    fn seed_shared_cache<S: SampleSink>(&mut self, pid: u32, sink: &mut S) {
-        let Some(cache) = self.shared_cache.as_ref() else {
-            return;
-        };
-        let t0 = std::time::Instant::now();
-        let images = cache.enumerate_runtime_images();
-        let count = images.len();
-        let mut total_symbols = 0usize;
-        for ci in images {
-            total_symbols += ci.symbols.len();
-            let img = LoadedImage {
-                path: ci.install_name,
-                base_avma: ci.runtime_avma,
-                vmsize: ci.vmsize,
-                text_svma: ci.text_svma,
-                uuid: ci.uuid,
-                arch: host_arch(),
-                is_executable: false,
-                symbols: ci.symbols,
-                from_cache: true,
-            };
-            sink.on_binary_loaded(BinaryLoadedEvent {
-                pid,
-                base_avma: img.base_avma,
-                vmsize: img.vmsize,
-                text_svma: img.text_svma,
-                path: &img.path,
-                uuid: img.uuid,
-                arch: img.arch,
-                is_executable: img.is_executable,
-                symbols: &img.symbols,
-                text_bytes: None,
-            });
-            self.known.insert((img.path.clone(), img.base_avma), img);
-        }
-        log::info!(
-            "shared_cache: seeded {count} images / {total_symbols} symbols in {:?}",
-            t0.elapsed()
-        );
-        let _ = pid; // currently unused; logged for symmetry with libproc path
-    }
 }
 
 /// Try the on-disk Mach-O at `path` first; fall back to the

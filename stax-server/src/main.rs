@@ -206,15 +206,18 @@ impl ServerState {
     fn attach_local_shared_cache(&self) {
         match stax_mac_shared_cache::SharedCache::for_host() {
             Some(cache) => {
-                self.binaries.write().set_macho_byte_source(Arc::new(cache));
+                let cache = Arc::new(cache);
+                let mut binaries = self.binaries.write();
+                binaries.set_macho_byte_source(cache.clone());
+                binaries.set_shared_cache(cache);
                 tracing::info!(
-                    "stax-server: dyld shared cache mapped for disassembly fallback"
+                    "stax-server: dyld shared cache mapped for symbol lookup + disassembly fallback"
                 );
             }
             None => {
                 tracing::warn!(
                     "stax-server: no dyld shared cache available; \
-                     stax annotate against libsystem/libdispatch addresses won't disassemble"
+                     dyld-resident symbols will surface as <unresolved>"
                 );
             }
         }

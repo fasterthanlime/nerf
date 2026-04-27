@@ -24,4 +24,5 @@ vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 stax-mac-capture = { version = "0.1", path = "../stax-mac-capture" }
+stax-mac-shared-cache = { version = "0.1", path = "../stax-mac-shared-cache" }
 mach2 = "0.4"

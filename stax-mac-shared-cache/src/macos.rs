@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
+use std::sync::Arc;
 
 use memmap2::Mmap;
 use stax_mac_capture::proc_maps::MachOSymbol;
@@ -33,12 +34,32 @@ pub struct CacheRuntimeImage {
     pub symbols: Vec<MachOSymbol>,
 }
 
+/// Borrowed reference into the cache's address index. The cache
+/// keeps the underlying `Arc<Vec<CacheRuntimeImage>>` alive for as
+/// long as `SharedCache` lives, so callers can hold this across
+/// awaits without taking the mutex back.
+pub struct CacheRuntimeImageRef {
+    index: Arc<Vec<CacheRuntimeImage>>,
+    pos: usize,
+}
+
+impl CacheRuntimeImageRef {
+    pub fn image(&self) -> &CacheRuntimeImage {
+        &self.index[self.pos]
+    }
+}
+
 pub struct SharedCache {
     cache: &'static DyldCache<'static, Endianness>,
     /// `runtime_avma - text_svma` for any cache image. Computed once
     /// from our own process's image table -- same value applies to
     /// every other process sharing this cache.
     runtime_slide: Option<i64>,
+    /// Lazily-populated address-to-image index. Built on first
+    /// `lookup_address` call. Sorted by `runtime_avma`; entries
+    /// hold a fully-parsed `CacheRuntimeImage` (~14M total symbols
+    /// in memory but no allocations on the lookup hot path).
+    address_index: parking_lot::Mutex<Option<Arc<Vec<CacheRuntimeImage>>>>,
 }
 
 impl SharedCache {
@@ -130,6 +151,42 @@ impl SharedCache {
             }
         });
         out
+    }
+
+    /// Find the cache image whose runtime mapping covers `avma`,
+    /// returning a shared reference into the lazily-built address
+    /// index. Both the index build and the binary search happen
+    /// under one mutex, but the returned `Arc<Vec<…>>` lets the
+    /// caller iterate without re-locking.
+    ///
+    /// First call kicks off the full enumeration (~500ms wall on
+    /// Apple Silicon). Subsequent calls are O(log N) over the
+    /// sorted index.
+    pub fn lookup_address(&self, avma: u64) -> Option<CacheRuntimeImageRef> {
+        let index = self.ensure_address_index()?;
+        let pos = index.partition_point(|i| i.runtime_avma <= avma);
+        if pos == 0 {
+            return None;
+        }
+        let img = &index[pos - 1];
+        if avma < img.runtime_avma + img.vmsize {
+            Some(CacheRuntimeImageRef {
+                index: index.clone(),
+                pos: pos - 1,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn ensure_address_index(&self) -> Option<Arc<Vec<CacheRuntimeImage>>> {
+        let mut guard = self.address_index.lock();
+        if guard.is_none() {
+            let mut images = self.enumerate_runtime_images();
+            images.sort_by_key(|i| i.runtime_avma);
+            *guard = Some(Arc::new(images));
+        }
+        guard.clone()
     }
 
     /// Resolve `install_name` to LC_SYMTAB symbols + __TEXT extents.
@@ -233,6 +290,7 @@ fn try_open(main_path: &str) -> Result<SharedCache, String> {
     Ok(SharedCache {
         cache,
         runtime_slide,
+        address_index: parking_lot::Mutex::new(None),
     })
 }
 
