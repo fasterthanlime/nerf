@@ -99,35 +99,7 @@ fn magic_be( bytes: &[u8] ) -> Option< u32 > {
 /// archive. We pick the host cputype because `BinaryData::load_from_fs` is
 /// always called on the same host as the binary it inspects.
 pub fn parse( blob: &[u8] ) -> io::Result< MachO > {
-    let magic = magic_be( blob ).ok_or_else( || io::Error::new(
-        io::ErrorKind::InvalidData, "Mach-O: blob too short for magic"
-    ))?;
-
-    match magic {
-        macho::FAT_MAGIC | macho::FAT_CIGAM => {
-            let arches = FatHeader::parse_arch32( blob ).map_err( other )?;
-            let arch = arches.iter()
-                .find( |a| a.cputype() == HOST_CPUTYPE )
-                .ok_or_else( || io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!( "Mach-O: fat archive has no slice for host cputype 0x{:x}", HOST_CPUTYPE )
-                ))?;
-            let slice = arch.data( blob ).map_err( other )?;
-            parse_thin( slice )
-        }
-        macho::FAT_MAGIC_64 | macho::FAT_CIGAM_64 => {
-            let arches = FatHeader::parse_arch64( blob ).map_err( other )?;
-            let arch = arches.iter()
-                .find( |a| a.cputype() == HOST_CPUTYPE )
-                .ok_or_else( || io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!( "Mach-O: fat archive has no slice for host cputype 0x{:x}", HOST_CPUTYPE )
-                ))?;
-            let slice = arch.data( blob ).map_err( other )?;
-            parse_thin( slice )
-        }
-        _ => parse_thin( blob )
-    }
+    parse_thin( host_thin_slice( blob )? )
 }
 
 fn parse_thin( blob: &[u8] ) -> io::Result< MachO > {
