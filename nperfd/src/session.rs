@@ -151,11 +151,15 @@ async fn drain(
                 return Err(map_kperf_err(e));
             }
         };
-        if n == 0 {
-            continue;
-        }
         total_drained += n as u64;
 
+        // Always send, even when n == 0. The empty batch is a
+        // heartbeat: it doubles as our detection of "client went
+        // away" — without it, an idle target where read_trace
+        // returns 0 records leaves us spinning in the sleep+read
+        // loop forever, holding ktrace ownership long after the
+        // client disconnected. (Empty batches are cheap on the wire
+        // and the client's process_batch is a no-op on them.)
         let batch = KdBufBatch {
             records: buf[..n].iter().map(kdbuf_to_wire).collect(),
             drained_at_unix_ns: unix_ns_now(),
