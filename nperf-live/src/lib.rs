@@ -874,12 +874,23 @@ fn compute_neighbors_update(
             children,
             ..
         } = sn;
-        let mut child_nodes: Vec<FlameNode> = children
+        // Sort by (count desc, fname asc, bin asc) on the SymbolKey
+        // strings, before interning, so the order is stable across
+        // snapshots. See compute_flame_update for the rationale.
+        let mut entries: Vec<(SymbolKey, SymbolNode)> = children
             .into_iter()
             .filter(|(_, c)| c.count >= threshold)
+            .collect();
+        entries.sort_by(|a, b| {
+            b.1.count
+                .cmp(&a.1.count)
+                .then_with(|| a.0.0.cmp(&b.0.0))
+                .then_with(|| a.0.1.cmp(&b.0.1))
+        });
+        let child_nodes: Vec<FlameNode> = entries
+            .into_iter()
             .map(|(k, c)| to_flame_node(c, k, threshold, interner))
             .collect();
-        child_nodes.sort_by(|a, b| b.count.cmp(&a.count));
         FlameNode {
             address: rep_address,
             count,
@@ -1020,10 +1031,13 @@ fn compute_flame_update(
     let mut interner = StringInterner::new();
     let (mut children, residue) =
         build_children_with_residue(&[flame_root], threshold, binaries, &mut interner);
+    // build_children_with_residue already returns children sorted by
+    // (count desc, fname asc, bin asc); fold_recursion only rewrites
+    // a node's children Vec, never the node's own count, so the
+    // top-level order stays correct.
     for c in &mut children {
         fold_recursion(c);
     }
-    children.sort_by(|a, b| b.count.cmp(&a.count));
     if let Some(extra) = residue {
         children.push(extra);
     }
@@ -1183,14 +1197,28 @@ fn build_children_with_residue(
         }
     }
 
+    // Sort by (count desc, function_name asc, binary asc) before
+    // interning so the visible order is stable across snapshots.
+    // Without the symbol-key tie-break, runs of equal-count siblings
+    // (extremely common when many cells hold a single sample) shuffle
+    // on every tick because HashMap iteration order is non-deterministic
+    // and the interner indices we'd otherwise sort on are themselves
+    // assigned in HashMap iteration order.
+    let mut entries: Vec<((Option<String>, Option<String>), Acc)> = groups.into_iter().collect();
+    entries.sort_by(|a, b| {
+        b.1.count
+            .cmp(&a.1.count)
+            .then_with(|| a.0.0.cmp(&b.0.0))
+            .then_with(|| a.0.1.cmp(&b.0.1))
+    });
+
     let mut visible: Vec<FlameNode> = Vec::new();
     let mut residue_count: u64 = 0;
     let mut residue_dropped: u64 = 0;
-    for ((fname, bin), acc) in groups {
+    for ((fname, bin), acc) in entries {
         if acc.count >= threshold {
             let (mut grandchildren, gres) =
                 build_children_with_residue(&acc.sub_sources, threshold, binaries, interner);
-            grandchildren.sort_by(|a, b| b.count.cmp(&a.count));
             if let Some(extra) = gres {
                 grandchildren.push(extra);
             }
