@@ -7,10 +7,8 @@
 //!   - `build-daemon`   Build nperfd in release mode and print the
 //!                      one-time `sudo cp` / `launchctl load` instructions
 //!                      for the LaunchDaemon plist.
-//!   - `build-broker`   Build nperf-task-broker in release mode, ad-hoc
-//!                      codesign with cs.debugger, and print the
-//!                      `cp` / `launchctl load` instructions for the
-//!                      per-user LaunchAgent plist.
+//!   - `codegen`        Generate TypeScript bindings for nperf-live into
+//!                      frontend/src/generated/.
 
 use std::env;
 use std::error::Error;
@@ -21,11 +19,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 mod codegen;
-mod migrate_archive;
 
 const BIN_NAME: &str = "nperf";
 const DAEMON_BIN: &str = "nperfd";
-const BROKER_BIN: &str = "nperf-task-broker";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
@@ -33,8 +29,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     match task {
         "install" => install()?,
         "build-daemon" => build_daemon()?,
-        "build-broker" => build_broker()?,
-        "migrate-archives" => migrate_archive::run(&args[2..])?,
         "codegen" => codegen::run()?,
         "" | "help" | "--help" | "-h" => {
             print_usage();
@@ -61,13 +55,6 @@ fn print_usage() {
         bin = DAEMON_BIN
     );
     eprintln!(
-        "  build-broker         Build {bin} (release), codesign with cs.debugger, print install instructions",
-        bin = BROKER_BIN
-    );
-    eprintln!(
-        "  migrate-archives     Rewrite v1 .nperf archives in place to v2 (one-shot fixture migration)"
-    );
-    eprintln!(
         "  codegen              Generate TypeScript bindings for nperf-live into frontend/src/generated/"
     );
 }
@@ -77,10 +64,7 @@ fn install() -> Result<(), Box<dyn Error>> {
     let cargo_bin = cargo_bin_dir()?;
     fs::create_dir_all(&cargo_bin)?;
 
-    // Build all three: the user-facing CLI plus the trinity binaries.
-    // Both the CLI and the broker need cs.debugger; the daemon doesn't
-    // (it runs under launchd as root, no entitlement needed).
-    for bin in [BIN_NAME, DAEMON_BIN, BROKER_BIN] {
+    for bin in [BIN_NAME, DAEMON_BIN] {
         println!(":: Building {bin} (release)...");
         cargo_build_release(&workspace_root, bin)?;
 
@@ -95,37 +79,23 @@ fn install() -> Result<(), Box<dyn Error>> {
         #[cfg(target_os = "macos")]
         if bin == BIN_NAME {
             codesign_macos(&dst)?;
-        } else if bin == BROKER_BIN {
-            let entitlements = workspace_root.join(BROKER_BIN).join("entitlements.plist");
-            codesign_with_entitlements(&dst, &entitlements)?;
         }
         // DAEMON_BIN: no codesign — runs as root under launchd, no
-        // entitlement needed; gets installed to /usr/local/bin by
-        // `sudo nperf setup`.
+        // entitlement needed.
     }
 
     println!();
-    println!(":: Installed three binaries to {}.", cargo_bin.display());
-    println!(":: To enable the trinity (sudo-less profiling, framehop,");
-    println!(":: future arg-capture), run:");
+    println!(":: Installed binaries to {}.", cargo_bin.display());
     println!();
     println!("     sudo nperf setup");
     println!();
-    println!(":: This installs nperfd as a LaunchDaemon under /usr/local/bin/");
-    println!(":: and /Library/LaunchDaemons/. After that, the same nperf CLI");
-    println!(":: works without sudo via `--mac-backend daemon`.");
+    println!(":: This installs nperfd as a LaunchDaemon. After that,");
+    println!(":: nperf record --serve … works without sudo.");
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn codesign_macos(binary: &Path) -> Result<(), Box<dyn Error>> {
-    // - cs.debugger: lets nperf attach to other processes
-    // - get-task-allow: lets debuggers attach to nperf itself
-    // - cs.allow-jit: required for any JIT mmap (kept for completeness)
-    // - cs.allow-unsigned-executable-memory: cranelift-jit (used by vox)
-    //   uses plain mprotect-PROT_EXEC rather than MAP_JIT, which the
-    //   kernel rejects under hardened runtime + allow-jit alone. The
-    //   broader entitlement accepts non-MAP_JIT executable pages.
     const ENTITLEMENTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -185,46 +155,11 @@ fn build_daemon() -> Result<(), Box<dyn Error>> {
     println!();
     println!(":: To install (one-time, requires sudo):");
     println!("     sudo cp {} /usr/local/bin/", binary.display());
-    println!(
-        "     sudo cp {} /Library/LaunchDaemons/",
-        plist.display()
-    );
-    println!(
-        "     sudo launchctl load /Library/LaunchDaemons/eu.bearcove.nperfd.plist"
-    );
+    println!("     sudo cp {} /Library/LaunchDaemons/", plist.display());
+    println!("     sudo launchctl load /Library/LaunchDaemons/eu.bearcove.nperfd.plist");
     println!();
     println!(":: After install, the daemon listens on /var/run/nperfd.sock.");
     println!(":: Logs at /var/log/nperfd.log.");
-    Ok(())
-}
-
-fn build_broker() -> Result<(), Box<dyn Error>> {
-    let workspace_root = workspace_root();
-
-    println!(":: Building {BROKER_BIN} (release)...");
-    cargo_build_release(&workspace_root, BROKER_BIN)?;
-
-    let binary = workspace_root.join("target").join("release").join(BROKER_BIN);
-    let entitlements = workspace_root.join(BROKER_BIN).join("entitlements.plist");
-
-    #[cfg(target_os = "macos")]
-    codesign_with_entitlements(&binary, &entitlements)?;
-
-    let plist = workspace_root
-        .join(BROKER_BIN)
-        .join("launchd")
-        .join("eu.bearcove.nperf.task-broker.plist");
-    println!();
-    println!(":: Built + codesigned {}", binary.display());
-    println!();
-    println!(":: To install (per-user, no sudo needed for the LaunchAgent):");
-    println!("     sudo cp {} /usr/local/bin/", binary.display());
-    println!("     mkdir -p ~/Library/LaunchAgents");
-    println!("     cp {} ~/Library/LaunchAgents/", plist.display());
-    println!("     launchctl load ~/Library/LaunchAgents/eu.bearcove.nperf.task-broker.plist");
-    println!();
-    println!(":: After install, the broker registers as eu.bearcove.nperf.task-broker.");
-    println!(":: Logs at /tmp/nperf-task-broker.log.");
     Ok(())
 }
 
@@ -240,29 +175,6 @@ fn cargo_build_release(workspace_root: &Path, package: &str) -> Result<(), Box<d
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn codesign_with_entitlements(binary: &Path, entitlements: &Path) -> Result<(), Box<dyn Error>> {
-    println!(
-        ":: Codesigning {} with entitlements from {}...",
-        binary.display(),
-        entitlements.display()
-    );
-    let status = Command::new("codesign")
-        .arg("--force")
-        .arg("--options")
-        .arg("runtime")
-        .arg("--sign")
-        .arg("-")
-        .arg("--entitlements")
-        .arg(entitlements)
-        .arg(binary)
-        .status()?;
-    if !status.success() {
-        return Err(format!("codesign exited with {status}").into());
-    }
-    Ok(())
-}
-
 fn cargo_bin_dir() -> Result<PathBuf, Box<dyn Error>> {
     if let Some(cargo_home) = env::var_os("CARGO_HOME") {
         return Ok(PathBuf::from(cargo_home).join("bin"));
@@ -272,8 +184,6 @@ fn cargo_bin_dir() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn workspace_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR is the xtask crate's directory; its parent is the
-    // workspace root.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask crate has a parent directory")

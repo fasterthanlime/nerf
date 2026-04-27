@@ -7,7 +7,6 @@ publish = false
 description = "Dev-only entrypoints (cargo xtask install, ...)."
 
 [dependencies]
-speedy = "0.8"
 nperf-live-proto = { path = "../nperf-live-proto" }
 vox-codegen = { git = "https://github.com/bearcove/vox", rev = "1bdc0aa4911765af726a4142ceb67812b0f6963d" }
 arborium-theme = "2.16"

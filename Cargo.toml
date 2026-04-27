@@ -1,37 +1,15 @@
 [package]
 name = "nperf-core"
 version = "0.1.1"
-authors = ["Jan Bujak <j@exia.io>"]
 edition = "2018"
 
 [dependencies]
 libc = "0.2"
-regex = "1"
-lazy_static = "1"
 log = "0.4"
-parking_lot = "0.12"
-num_cpus = "1"
-chrono = "0.4"
-speedy = "0.8"
-string-interner = "0.7"
-serde = "1"
-serde_json = "1"
-serde_derive = "1"
 structopt = "0.2"
-inferno = { version = "0.12", default-features = false, optional = true }
-yaxpeax-arch = { version = "0.3", default-features = false, features = ["std"] }
-yaxpeax-x86 = { version = "2", default-features = false, features = ["std", "fmt"] }
-yaxpeax-arm = { version = "0.4.0", default-features = false, features = ["std", "fmt"] }
-
-proc-maps = { version = "0.1", path = "proc-maps" }
-perf_event_open = { version = "0.1", path = "perf_event_open" }
-object = { version = "0.32", default-features = false, features = ["std", "read_core", "elf", "macho", "compression"] }
-memmap2 = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nerf-mac-capture = { version = "0.1", path = "nerf-mac-capture" }
-nerf-mac-kperf = { version = "0.1", path = "nerf-mac-kperf" }
-nperf-mac-shared-cache = { version = "0.1", path = "nperf-mac-shared-cache" }
 nperfd-client = { version = "0.1", path = "nperfd-client" }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 mach2 = "0.4"
@@ -42,33 +20,34 @@ path = "nwind"
 features = ["log"]
 default-features = false
 
-[dev-dependencies]
-quickcheck = { version = "1", default-features = false, features = ["use_logging"] }
-quickcheck_macros = "1"
-criterion = "0.5"
-env_logger = "0.11"
-
 [profile.release]
-# lto = true
-# panic = "abort"
 debug = 1
 
 [features]
-default = ["addr2line", "inferno"]
+default = ["addr2line"]
 addr2line = ["nwind/addr2line"]
 debug-logs = ["nwind/debug-logs"]
 
 [workspace]
-members = [".", "cli", "nwind", "proc-maps", "perf_event_open", "thread-local-reentrant", "nerf-mac-capture", "nerf-mac-kperf", "nerf-mac-kperf-sys", "nerf-mac-kperf-parse", "nperf-mac-shared-cache", "xtask", "nperf-live", "nperf-live-proto", "nperf-demangle", "nperfd-proto", "nperfd", "nperfd-client", "nperf-task-broker", "nperf-trinity-smoke"]
-# nerf-mac-preload is built as a standalone workspace because it requires
-# panic="abort" / no_std settings that cannot be expressed at member scope.
-exclude = ["nerf-mac-preload"]
+members = [
+    ".",
+    "cli",
+    "nwind",
+    "proc-maps",
+    "thread-local-reentrant",
+    "nerf-mac-capture",
+    "nerf-mac-kperf-sys",
+    "nerf-mac-kperf-parse",
+    "nperf-mac-shared-cache",
+    "xtask",
+    "nperf-live",
+    "nperf-live-proto",
+    "nperf-demangle",
+    "nperfd-proto",
+    "nperfd",
+    "nperfd-client",
+]
 
-# Local override pulling vox from the sibling checkout so we can use
-# the unreleased `non_resumable()` opt-out on the transport-acceptor
-# builder. Drop this block once a vox release that includes
-# non_resumable lands and the rev pins on individual crates are
-# bumped past it.
 [patch."https://github.com/bearcove/vox"]
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
 vox-core = { path = "/Users/amos/bearcove/vox/rust/vox-core" }
@@ -84,7 +63,3 @@ vox-macros-parse = { path = "/Users/amos/bearcove/vox/rust/vox-macros-parse" }
 vox-schema = { path = "/Users/amos/bearcove/vox/rust/vox-schema" }
 vox-service-macros = { path = "/Users/amos/bearcove/vox/rust/vox-macros" }
 vox-codegen = { path = "/Users/amos/bearcove/vox/rust/vox-codegen" }
-
-[[bench]]
-name = "unwinding"
-harness = false

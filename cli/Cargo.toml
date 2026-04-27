@@ -1,13 +1,12 @@
 [package]
 name = "nperf"
 version = "0.1.1"
-authors = ["Jan Bujak <jan.bujak@nokia.com>"]
 edition = "2018"
 
 [dependencies]
 structopt = "0.2"
 log = "0.4"
-env_logger = { version = "0.11", optional = true }
+env_logger = "0.11"
 nperf-core = { path = "..", default-features = false }
 
 [dependencies.nperf-live]
@@ -18,7 +17,6 @@ version = "1"
 features = ["rt-multi-thread"]
 
 [features]
-default = ["addr2line", "inferno", "env_logger"]
+default = ["addr2line"]
 addr2line = ["nperf-core/addr2line"]
 debug-logs = ["nperf-core/debug-logs"]
-inferno = ["nperf-core/inferno"]
