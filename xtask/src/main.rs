@@ -97,7 +97,15 @@ fn install() -> Result<(), Box<dyn Error>> {
             // Re-sign every binary at the destination. staxd is
             // re-signed *again* by `stax setup` at its final
             // /usr/local/bin install path.
-            codesign_adhoc(&dst)?;
+            if bin == SHADE_BIN {
+                let entitlements = workspace_root
+                    .join(SHADE_BIN)
+                    .join("entitlements")
+                    .join("eu.bearcove.stax-shade.debugger.plist");
+                codesign_adhoc_with_entitlements(&dst, &entitlements)?;
+            } else {
+                codesign_adhoc(&dst)?;
+            }
         }
     }
 
@@ -214,6 +222,27 @@ fn codesign_adhoc(binary: &Path) -> Result<(), Box<dyn Error>> {
         .status()?;
     if !status.success() {
         return Err(format!("codesign exited with {status}").into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn codesign_adhoc_with_entitlements(binary: &Path, entitlements: &Path) -> Result<(), Box<dyn Error>> {
+    println!(
+        ":: Re-signing {} (ad-hoc, entitlements={})...",
+        binary.display(),
+        entitlements.display()
+    );
+    let status = Command::new("codesign")
+        .arg("--force")
+        .arg("--sign")
+        .arg("-")
+        .arg("--entitlements")
+        .arg(entitlements)
+        .arg(binary)
+        .status()?;
+    if !status.success() {
+        return Err(format!("codesign (with entitlements) exited with {status}").into());
     }
     Ok(())
 }
