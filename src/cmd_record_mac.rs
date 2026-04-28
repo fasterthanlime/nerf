@@ -43,7 +43,7 @@ fn record_existing_pid(
     live_sink: Option<Box<dyn LiveSink>>,
 ) -> Result<(), Box<dyn Error>> {
     info!("Recording PID {pid}");
-    let mut sink = LiveOnlySink { live_sink };
+    let sink = LiveOnlySink { live_sink };
     notify_target_attached(&sink, pid);
 
     let sigint = SigintHandler::new();
@@ -60,17 +60,16 @@ fn record_existing_pid(
     let stop_via_sink = sink.live_sink_stop_flag();
     let should_stop = || sigint.was_triggered() || stop_via_sink();
 
-    // Multi-thread so vox session tasks (keepalive pongs, in particular)
-    // run on a different worker than the synchronous-ish kdebug
-    // parsing, which can otherwise hog the runtime for seconds at a
-    // time and make staxd think the recorder went away.
+    // Multi-thread for keepalive pongs etc. Sync kdebug parsing
+    // + libproc scanning runs on a dedicated OS thread inside
+    // drive_session.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
         .build()
         .map_err(|err| format!("daemon backend: tokio runtime build: {err}"))?;
     info!("Running... press Ctrl-C to stop.");
-    if let Err(err) = rt.block_on(staxd_client::drive_session(opts, &mut sink, should_stop)) {
+    if let Err(err) = rt.block_on(staxd_client::drive_session(opts, sink, should_stop)) {
         return Err(format!("staxd-client failed: {err}").into());
     }
     info!("Recording complete.");
@@ -94,7 +93,7 @@ fn record_child_launch(
     let child_for_stop = child_guard.share();
     info!("Child started: PID {pid}");
 
-    let mut sink = LiveOnlySink { live_sink };
+    let sink = LiveOnlySink { live_sink };
     notify_target_attached(&sink, pid);
 
     let sigint = SigintHandler::new();
@@ -119,17 +118,18 @@ fn record_child_launch(
         }
     };
 
-    // Multi-thread so vox session tasks (keepalive pongs, in particular)
-    // run on a different worker than the synchronous-ish kdebug
-    // parsing, which can otherwise hog the runtime for seconds at a
-    // time and make staxd think the recorder went away.
+    // Multi-thread for keepalive pongs etc. The synchronous kdebug
+    // parsing + libproc scanning has been hoisted onto a dedicated
+    // OS thread inside drive_session, so the tokio workers stay
+    // available for vox I/O regardless of how slow a Mach-O parse
+    // happens to be.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
         .build()
         .map_err(|err| format!("daemon backend: tokio runtime build: {err}"))?;
     info!("Running... press Ctrl-C to stop.");
-    if let Err(err) = rt.block_on(staxd_client::drive_session(opts, &mut sink, should_stop)) {
+    if let Err(err) = rt.block_on(staxd_client::drive_session(opts, sink, should_stop)) {
         return Err(format!("staxd-client failed: {err}").into());
     }
 

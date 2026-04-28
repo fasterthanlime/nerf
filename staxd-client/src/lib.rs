@@ -74,9 +74,9 @@ pub enum Error {
 /// recorder emits — `on_sample`, `on_thread_name`, `on_binary_loaded`,
 /// `on_wakeup`, `on_cpu_interval`, `on_jitdump`, `on_kallsyms`, etc. —
 /// so live aggregators / archive writers plug in without changes.
-pub async fn drive_session<S: SampleSink>(
+pub async fn drive_session<S: SampleSink + Send + 'static>(
     opts: RemoteOptions,
-    sink: &mut S,
+    sink: S,
     mut should_stop: impl FnMut() -> bool,
 ) -> Result<(), Error> {
     let url = if opts.daemon_socket.starts_with("local://") {
@@ -119,27 +119,30 @@ pub async fn drive_session<S: SampleSink>(
 
     // Pipeline owns the parser + off-CPU tracker + image scanner +
     // thread name cache + kernel image + slide estimator + jitdump
-    // tailer, and runs all the periodic libproc scans. The in-process
-    // recorder uses the same Pipeline, so the daemon-driven path
-    // emits the same SampleSink event sequence — feature parity by
-    // construction.
+    // tailer. Its periodic scans (image rescan, thread-name rescan)
+    // are *synchronous* and do disk IO + symbol-table parsing —
+    // running them on the same task as `rx.recv()` would (and did)
+    // wedge the recv path during scans, fill the kdebug ring on the
+    // daemon side, and starve the probe.
     //
-    // v0 doesn't yet plumb configurable PMU events through the
-    // SessionConfig wire surface, so the pmc indices stay None
-    // (Apple Silicon FIXED counters — cycles + insns retired —
-    // still flow through the kperf samplers).
+    // Move the pipeline + sink onto a dedicated OS worker thread.
+    // This recv loop becomes pure I/O: receive, hand off, repeat.
+    // The worker drives its own tick cadence and never touches
+    // anything async.
     let shared_cache: Option<Arc<stax_mac_shared_cache::SharedCache>> =
         stax_mac_shared_cache::SharedCache::for_host().map(Arc::new);
-    let mut pipeline = Pipeline::new(
-        PipelineConfig {
-            pid: opts.pid,
-            frequency_hz: opts.frequency_hz,
-            pmc_idx_l1d: None,
-            pmc_idx_brmiss: None,
-        },
-        shared_cache,
-        sink,
-    );
+    let pipeline_config = PipelineConfig {
+        pid: opts.pid,
+        frequency_hz: opts.frequency_hz,
+        pmc_idx_l1d: None,
+        pmc_idx_brmiss: None,
+    };
+
+    let (worker_tx, worker_rx) = std::sync::mpsc::channel::<WorkerMsg>();
+    let worker_handle = std::thread::Builder::new()
+        .name("staxd-client-worker".to_owned())
+        .spawn(move || worker_thread(pipeline_config, shared_cache, sink, worker_rx))
+        .map_err(|e| Error::VoxCall(format!("spawn worker thread: {e}")))?;
 
     // Build the session config the daemon expects. Filter range covers
     // DBG_MACH..DBG_PERF, mirroring the in-process recorder's default
@@ -181,12 +184,12 @@ pub async fn drive_session<S: SampleSink>(
             break;
         }
 
-        // Wake roughly every 50ms regardless of traffic so the
-        // pipeline's periodic scans (libproc images, thread names,
-        // jitdump probe) keep ticking even on idle targets.
+        // Recv loop: pure I/O. Short timeout so we re-check
+        // should_stop / duration even on idle targets; no work
+        // happens here.
         let recv_timeout = Duration::from_millis(50);
         let batch_sref = match tokio::time::timeout(recv_timeout, rx.recv()).await {
-            Ok(Ok(Some(value))) => Some(value),
+            Ok(Ok(Some(value))) => value,
             Ok(Ok(None)) => {
                 info!("staxd-client: daemon closed records channel");
                 break;
@@ -195,18 +198,9 @@ pub async fn drive_session<S: SampleSink>(
                 warn!("staxd-client: recv error: {e:?}");
                 break;
             }
-            Err(_) => None, // Timeout — fall through to periodic work.
+            Err(_) => continue,
         };
 
-        pipeline.tick(sink);
-
-        let Some(batch_sref) = batch_sref else {
-            continue;
-        };
-        // SelfRef<KdBufBatch> doesn't expose a borrowing accessor for
-        // owned types without a `Reborrow` impl; `.map(...)` consumes
-        // the SelfRef and lets us hold the owned value for the
-        // duration of the closure.
         let _ = batch_sref.map(|batch| {
             if !seen_first_batch {
                 seen_first_batch = true;
@@ -217,27 +211,15 @@ pub async fn drive_session<S: SampleSink>(
                 );
             }
             total_drained += batch.records.len() as u64;
-            let kdbufs: Vec<KdBuf> = batch.records.iter().map(wire_to_kdbuf).collect();
-            pipeline.process_records(&kdbufs, sink);
-
-            // Probe results ride alongside the kperf records — emit
-            // them through the same sink so they reach the same
-            // symbolicator + aggregator + UI as kperf samples. The
-            // pipeline doesn't need to correlate; downstream pairs
-            // by (tid, kperf_ts == sample.timestamp_ns).
-            for pr in &batch.probe_results {
-                sink.on_probe_result(ProbeResultEvent {
-                    tid: pr.tid,
-                    kperf_ts_ns: pr.kperf_ts_mach,
-                    probe_done_ns: pr.probe_done_mach,
-                    mach_pc: pr.mach_pc,
-                    mach_lr: pr.mach_lr,
-                    mach_fp: pr.mach_fp,
-                    mach_sp: pr.mach_sp,
-                    mach_walked: &pr.mach_walked,
-                    used_framehop: pr.used_framehop,
-                });
-            }
+            // Hand off to the worker thread. send is non-blocking
+            // for std::sync::mpsc; a slow worker would let this
+            // grow unbounded, but the worker is fast unless an
+            // image rescan is running, in which case batches
+            // queue briefly here instead of stalling vox credit.
+            let _ = worker_tx.send(WorkerMsg::Batch(OwnedBatch {
+                records: batch.records,
+                probe_results: batch.probe_results,
+            }));
         });
     }
 
@@ -246,6 +228,9 @@ pub async fn drive_session<S: SampleSink>(
     // next send fails with Transport, its drain loop breaks, kperf
     // teardown runs, record() returns with a RecordSummary or error.
     drop(rx);
+    // Tell the worker we're done so it can flush + finish.
+    drop(worker_tx);
+
     let rpc_result = record_fut
         .await
         .map_err(|e| Error::VoxCall(format!("join: {e:?}")))?;
@@ -257,16 +242,86 @@ pub async fn drive_session<S: SampleSink>(
         ),
         Err(vox::VoxError::User(e)) => {
             warn!("staxd-client: daemon returned error: {e:?}");
+            // Still join the worker so it can flush+finish.
+            let _ = tokio::task::spawn_blocking(move || worker_handle.join()).await;
             return Err(Error::Rpc(e));
         }
         Err(e) => {
+            let _ = tokio::task::spawn_blocking(move || worker_handle.join()).await;
             return Err(Error::VoxCall(format!("record rpc: {e:?}")));
         }
     }
 
+    // Wait for the worker to flush remaining batches and call
+    // pipeline.finish(sink). join() is sync — defer to spawn_blocking
+    // so we don't park a tokio worker.
+    let _ = tokio::task::spawn_blocking(move || worker_handle.join())
+        .await
+        .map_err(|e| Error::VoxCall(format!("join worker: {e:?}")))?;
+
     info!("staxd-client: locally drained {total_drained} records");
-    pipeline.finish(sink);
     Ok(())
+}
+
+/// Owned, thread-Send'able mirror of `KdBufBatch`. We can't move
+/// the SelfRef across thread boundaries, so the recv loop pulls
+/// the records + probe_results out and ships them to the worker
+/// via this struct.
+struct OwnedBatch {
+    records: Vec<KdBufWire>,
+    probe_results: Vec<staxd_proto::ProbeResultWire>,
+}
+
+enum WorkerMsg {
+    Batch(OwnedBatch),
+}
+
+/// Dedicated OS thread that owns the Pipeline + Sink. Drives all
+/// the synchronous work: parser, periodic libproc scans (with
+/// their fs::read + Mach-O parsing), probe-result emission. Loops
+/// on `recv_timeout` so periodic ticks fire even when no batches
+/// are arriving.
+fn worker_thread<S: SampleSink>(
+    config: PipelineConfig,
+    shared_cache: Option<Arc<stax_mac_shared_cache::SharedCache>>,
+    mut sink: S,
+    rx: std::sync::mpsc::Receiver<WorkerMsg>,
+) {
+    let mut pipeline = Pipeline::new(config, shared_cache, &mut sink);
+
+    // Tick cadence — drives image / thread-name / jitdump
+    // rescans. Lives here, not on the recv loop.
+    const TICK_INTERVAL: Duration = Duration::from_millis(50);
+
+    loop {
+        match rx.recv_timeout(TICK_INTERVAL) {
+            Ok(WorkerMsg::Batch(batch)) => {
+                let kdbufs: Vec<KdBuf> = batch.records.iter().map(wire_to_kdbuf).collect();
+                pipeline.process_records(&kdbufs, &mut sink);
+                for pr in &batch.probe_results {
+                    sink.on_probe_result(ProbeResultEvent {
+                        tid: pr.tid,
+                        kperf_ts_ns: pr.kperf_ts_mach,
+                        probe_done_ns: pr.probe_done_mach,
+                        mach_pc: pr.mach_pc,
+                        mach_lr: pr.mach_lr,
+                        mach_fp: pr.mach_fp,
+                        mach_sp: pr.mach_sp,
+                        mach_walked: &pr.mach_walked,
+                        used_framehop: pr.used_framehop,
+                    });
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        // Periodic libproc scans — sync, may do disk IO. That's
+        // fine *here*: this thread is dedicated, so a slow scan
+        // can't block recv or vox.
+        pipeline.tick(&mut sink);
+    }
+
+    pipeline.finish(&mut sink);
 }
 
 fn wire_to_kdbuf(w: &KdBufWire) -> KdBuf {
