@@ -26,7 +26,7 @@ use stax_live_proto::{
 };
 use vox::VoxListener;
 use stax_shade_proto::{
-    ShadeAck, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher,
+    ShadeAck, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher, WalkerSample,
 };
 
 const DEFAULT_SOCK_NAME: &str = "stax-server.sock";
@@ -357,6 +357,54 @@ impl ServerState {
             accepted: true,
             reason: None,
         }
+    }
+
+    /// Ingest a batch of framehop walker samples published by the
+    /// shade. We validate the run id under the same lock that
+    /// guards the active run summary, then funnel each sample
+    /// through the same `Aggregator::record_pet_sample` path the
+    /// kperf ingest uses. PMU fields land as zero — kperf is the
+    /// authoritative source for those, and the aggregator will
+    /// pick whichever entry has non-zero PMU when it merges by
+    /// (tid, timestamp).
+    fn ingest_walker_samples(
+        &self,
+        run_id: u64,
+        samples: Vec<WalkerSample>,
+    ) -> Result<(), String> {
+        // Bump the run-summary counters under the run-lock first.
+        // We let the lock go before touching the aggregator so a
+        // long batch can't starve other readers (status / list_runs).
+        let n = samples.len();
+        {
+            let mut inner = self.inner.lock();
+            let Some(active) = inner.active.as_mut() else {
+                return Err("no active run".to_owned());
+            };
+            if active.id.0 != run_id {
+                return Err(format!(
+                    "run id mismatch: shade for {run_id}, server's active run is {}",
+                    active.id.0
+                ));
+            }
+            active.pet_samples = active.pet_samples.saturating_add(n as u64);
+        }
+
+        let mut agg = self.aggregator.write();
+        for s in samples {
+            agg.record_pet_sample(
+                s.tid,
+                s.timestamp_ns,
+                &s.frames,
+                PmuSample {
+                    cycles: 0,
+                    instructions: 0,
+                    l1d_misses: 0,
+                    branch_mispreds: 0,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Called by the accept-loop after a session closes, with the
@@ -708,6 +756,14 @@ impl ShadeRegistry for ShadeRegistryImpl {
             *self.shade_slot.lock() = Some(info.shade_pid);
         }
         Ok(ack)
+    }
+
+    async fn publish_walker_samples(
+        &self,
+        run_id: u64,
+        samples: Vec<WalkerSample>,
+    ) -> Result<(), String> {
+        self.server.ingest_walker_samples(run_id, samples)
     }
 }
 

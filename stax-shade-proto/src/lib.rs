@@ -65,12 +65,45 @@ pub struct ShadeAck {
     pub reason: Option<String>,
 }
 
-/// Server-side handshake. The shade dials in, calls
-/// `register_shade` once, then keeps the session open so the
-/// server can call back into the shade's `Shade` service.
+/// One framehop-walked user-stack sample. The shade collects
+/// these in batches and pushes them to the server via
+/// `publish_walker_samples`. PMU fields are absent — kperf is the
+/// authoritative source for those — so the server-side aggregator
+/// fills in zeroes when merging.
+#[derive(Clone, Debug, Facet)]
+pub struct WalkerSample {
+    /// Mach thread port number (the shade's view; same kernel
+    /// thread id reported by kperf).
+    pub tid: u32,
+    /// Wall-clock nanoseconds at sample capture time, taken on the
+    /// shade. Used by the aggregator to merge walker samples in
+    /// chronological order with kperf's stream.
+    pub timestamp_ns: u64,
+    /// Frame addresses, leaf-first (the leaf PC is `frames[0]`,
+    /// each subsequent entry is the return address of the frame
+    /// below). Same orientation kperf uses on the wire.
+    pub frames: Vec<u64>,
+}
+
+/// Server-side handshake + walker ingest plane. The shade dials
+/// in, calls `register_shade` once, then keeps the session open
+/// to (a) accept reverse calls into the `Shade` service and
+/// (b) push walker samples through `publish_walker_samples`.
 #[vox::service]
 pub trait ShadeRegistry {
     async fn register_shade(&self, info: ShadeInfo) -> Result<ShadeAck, String>;
+
+    /// Hand a batch of framehop-walked samples to the server. The
+    /// server appends them to the active run's aggregator
+    /// alongside kperf samples; ordering is by `timestamp_ns`.
+    /// Returns Err when no run is active (shade should drop the
+    /// batch and try again on next tick) or when the run has
+    /// already been finalised (shade should detach + exit).
+    async fn publish_walker_samples(
+        &self,
+        run_id: u64,
+        samples: Vec<WalkerSample>,
+    ) -> Result<(), String>;
 }
 
 /// Shade-side primitives. Stubs in this commit; implementations

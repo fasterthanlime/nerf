@@ -163,6 +163,25 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     let pid = attached.pid;
     let task = attached.task;
 
+    // If a server socket was provided, dial in and register so the
+    // server knows we're up and which run we belong to. We hold
+    // the resulting client for the lifetime of the shade so the
+    // periodic walker can publish samples through it. When no
+    // socket is configured we just walk locally (smoke-test mode).
+    let (server_client, server_run_id) = match (cli.server_socket.as_deref(), cli.run_id) {
+        (Some(socket), Some(run_id)) => {
+            let c = register_with_server(socket, run_id, pid).await?;
+            (Some(c), Some(run_id))
+        }
+        _ => {
+            tracing::warn!(
+                "no --server-socket / --run-id; running standalone — \
+                 stax-server will not learn about this attachment"
+            );
+            (None, None)
+        }
+    };
+
     // Walk the target's loaded images once and build a framehop
     // unwinder + AVMA→image map out of the parsed sections, then
     // take one snapshot of every thread to validate the path
@@ -173,7 +192,14 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     {
         snapshot_once(task, &mut unwinder, &image_map);
         if cli.walker_hz > 0 {
-            Some(spawn_periodic_walker(task, unwinder, image_map, cli.walker_hz))
+            Some(spawn_periodic_walker(
+                task,
+                unwinder,
+                image_map,
+                cli.walker_hz,
+                server_client.clone(),
+                server_run_id,
+            ))
         } else {
             tracing::info!("--walker-hz=0, framehop sampling disabled");
             None
@@ -181,19 +207,6 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     } else {
         None
     };
-
-    // If a server socket was provided, dial in and register so the
-    // server knows we're up and which run we belong to. When
-    // there's no socket (manual smoke-test invocation) we just
-    // park, same as stage A.
-    if let (Some(socket), Some(run_id)) = (cli.server_socket.as_deref(), cli.run_id) {
-        register_with_server(socket, run_id, pid).await?;
-    } else {
-        tracing::warn!(
-            "no --server-socket / --run-id; running standalone — \
-             stax-server will not learn about this attachment"
-        );
-    }
 
     // For --launch we held the target suspended through
     // task_for_pid + register_shade so neither kperf-side nor
@@ -259,6 +272,8 @@ fn spawn_periodic_walker(
     unwinder: framehop::aarch64::UnwinderAarch64<Vec<u8>>,
     image_map: walker::ImageMap,
     hz: u32,
+    server_client: Option<ShadeRegistryClient>,
+    server_run_id: Option<u64>,
 ) -> tokio::task::JoinHandle<()> {
     // SAFETY (justification): mach_port_t is a u32 and the right
     // is task-scoped to the shade. Sending it to another task in
@@ -291,6 +306,21 @@ fn spawn_periodic_walker(
 
         tracing::info!(hz, period_us = period.as_micros() as u64, "periodic walker started");
 
+        // Publish-side state: we batch samples between server
+        // pushes so we're not making a vox call every 10ms. With
+        // batch_period=200ms the server sees ~5 publishes/sec
+        // carrying ~540 samples each at 100Hz × 27 threads.
+        let publish_period = std::time::Duration::from_millis(200);
+        let mut publish_started = std::time::Instant::now();
+        let mut pending_batch: Vec<stax_shade_proto::WalkerSample> = Vec::new();
+        let mut window_published = 0u64;
+        let mut window_publish_errors = 0u64;
+        // Flips on the first user error from publish_walker_samples
+        // ("no active run", "run id mismatch"). Once stale we stop
+        // trying — stax-server will SIGTERM us on run-end anyway,
+        // and continuing to push wastes a vox call per batch.
+        let mut publishing_stale = false;
+
         loop {
             interval.tick().await;
             let started = std::time::Instant::now();
@@ -304,11 +334,57 @@ fn spawn_periodic_walker(
             window_elapsed_us_total += elapsed_us;
             window_max_us = window_max_us.max(elapsed_us);
 
+            // Convert to wire samples and accumulate. Drop empty
+            // walks (thread suspended but PC=0) — they carry no
+            // information and would just waste server-side merge
+            // work. Use a single nanosecond clock for the whole
+            // pass; per-thread skew within ~1ms doesn't matter
+            // for visualisation.
+            if server_client.is_some() && server_run_id.is_some() && !publishing_stale {
+                let timestamp_ns = sample_timestamp_ns();
+                for s in samples {
+                    if s.pc == 0 || s.frames.is_empty() {
+                        continue;
+                    }
+                    pending_batch.push(stax_shade_proto::WalkerSample {
+                        tid: s.thread,
+                        timestamp_ns,
+                        frames: s.frames,
+                    });
+                }
+            } else {
+                pending_batch.clear();
+            }
+
+            if let (Some(client), Some(rid)) = (server_client.as_ref(), server_run_id)
+                && !pending_batch.is_empty()
+                && publish_started.elapsed() >= publish_period
+                && !publishing_stale
+            {
+                let batch = std::mem::take(&mut pending_batch);
+                let n = batch.len();
+                match client.publish_walker_samples(rid, batch).await {
+                    Ok(()) => window_published += n as u64,
+                    Err(vox::VoxError::User(msg)) => {
+                        // Run id mismatch / no active run — server
+                        // says we're stale. Stop trying; SIGTERM
+                        // from stax-server will take us down.
+                        tracing::warn!(error = %msg, "server rejected walker samples; halting publish");
+                        window_publish_errors += 1;
+                        publishing_stale = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "publish_walker_samples failed");
+                        window_publish_errors += 1;
+                    }
+                }
+                publish_started = std::time::Instant::now();
+            }
+
             if window_started.elapsed() >= report_period {
                 let pass_count = window_started.elapsed().as_secs_f64();
                 let avg_us = window_elapsed_us_total
                     .checked_div(if pass_count > 0.0 {
-                        // approx number of passes in the window
                         (pass_count * f64::from(hz)) as u64
                     } else {
                         1
@@ -317,6 +393,8 @@ fn spawn_periodic_walker(
                 tracing::info!(
                     samples = window_samples,
                     frames = window_frames,
+                    published = window_published,
+                    publish_errors = window_publish_errors,
                     avg_us,
                     max_us = window_max_us,
                     map_entries = image_map.len_for_log(),
@@ -327,9 +405,22 @@ fn spawn_periodic_walker(
                 window_frames = 0;
                 window_elapsed_us_total = 0;
                 window_max_us = 0;
+                window_published = 0;
+                window_publish_errors = 0;
             }
         }
     })
+}
+
+/// Coarse-grained ns-since-epoch clock for tagging walker samples.
+/// `Instant` doesn't expose a unix epoch; the aggregator only
+/// requires monotonicity and rough alignment with kperf's
+/// timestamps, so `SystemTime::now()` is good enough.
+fn sample_timestamp_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// One-shot validation: enumerate threads, walk each one's stack
@@ -553,7 +644,11 @@ fn extern_environ() -> *const *mut std::os::raw::c_char {
     unsafe { environ as *const _ }
 }
 
-async fn register_with_server(socket: &str, run_id: u64, target_pid: u32) -> eyre::Result<()> {
+async fn register_with_server(
+    socket: &str,
+    run_id: u64,
+    target_pid: u32,
+) -> eyre::Result<ShadeRegistryClient> {
     let url = format!("local://{socket}");
     let client: ShadeRegistryClient = vox::connect(&url).await?;
     let info = ShadeInfo {
@@ -561,20 +656,18 @@ async fn register_with_server(socket: &str, run_id: u64, target_pid: u32) -> eyr
         target_pid,
         shade_pid: std::process::id(),
         capabilities: ShadeCapabilities {
-            // Truthful for stage B: we have neither walker nor
-            // peek/poke wired yet, just the registration handshake.
-            // Each capability flips to true in the commit that
-            // implements its server-callable surface.
             peek: false,
             poke: false,
-            framehop_walker: false,
+            // Truthful: walker is wired and pushing samples on the
+            // same vox session below.
+            framehop_walker: true,
             breakpoint_step: false,
         },
     };
     match client.register_shade(info).await {
         Ok(ShadeAck { accepted: true, .. }) => {
             tracing::info!(run_id, "registered with stax-server");
-            Ok(())
+            Ok(client)
         }
         Ok(ShadeAck { accepted: false, reason }) => {
             eyre::bail!(
