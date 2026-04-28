@@ -41,9 +41,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 /// One sample-completed snapshot the drain loop hands to the
-/// probe worker. Keep this struct cheap to clone — channel send
-/// happens on the kdebug consumer's hot path.
-#[derive(Debug, Clone, Copy)]
+/// probe worker. Owns the kperf-walked user backtrace so the
+/// worker can compare it against an FP-walked stack from the
+/// suspended thread.
+#[derive(Debug, Clone)]
 pub struct ProbeRequest {
     pub tid: u32,
     /// Timestamp on the kdebug record that closed the sample
@@ -53,23 +54,18 @@ pub struct ProbeRequest {
     /// drift from kperf_ts to this is the kernel→userspace pipe
     /// latency.
     pub drained_at_mach: u64,
-    /// First frame of `PERF_CS_UDATA` for this sample. With the
-    /// arm64 backtrace_user code path this is the saved-state PC
-    /// at the moment kperf walked the user side.
-    pub kperf_leaf_pc: u64,
-    /// Last frame in the user-stack stream — `callstack_fixup_user`
-    /// appends `get_saved_state_lr(state)` after the FP-walked
-    /// frames on arm64.
-    pub kperf_appended_lr: u64,
+    /// Full user backtrace as kperf observed it: index 0 is the
+    /// leaf PC, indices 1..N-1 are FP-walked return addresses, the
+    /// final index is the LR appended by `callstack_fixup_user`.
+    /// Frames carry their raw (PAC-bearing) values; the worker
+    /// strips before comparison.
+    pub kperf_user_backtrace: Vec<u64>,
     /// Number of frames kperf collected for the kernel side. 0
     /// means the sample was either user-mode at PMI (kperf still
     /// emits a near-empty kstack via the trap entry) or the walk
     /// failed. Lets us split the rate by "interrupt-from-user" vs
     /// "interrupt-from-kernel" downstream.
     pub kperf_kstack_depth: u32,
-    /// Total user frames including the appended LR. Helps spot
-    /// truncation cases.
-    pub kperf_ustack_depth: u32,
 }
 
 /// Probe-side bookkeeping. Lives on a dedicated tokio task so the
@@ -87,7 +83,6 @@ struct ProbeWorker {
     stats: ProbeStats,
 }
 
-#[derive(Default)]
 struct ProbeStats {
     probes_attempted: u64,
     /// Probes that returned KERN_SUCCESS for both
@@ -97,18 +92,49 @@ struct ProbeStats {
     pc_match: u64,
     /// LR matched (after PAC strip).
     lr_match: u64,
-    /// Both PC and LR matched — the strong validation signal.
-    pc_and_lr_match: u64,
     /// Per-bucket sample counts split by interrupt-from-kernel
     /// (kperf_kstack_depth > some threshold) vs from-user. The
     /// "interesting" stitch is the kernel bucket.
     samples_kstack: u64,
     samples_no_kstack: u64,
-    /// Walltime (mach ticks) used to compute aggregate drift
-    /// statistics later.
-    drift_ticks_total_when_pc_match: u128,
-    drift_ticks_total_when_pc_mismatch: u128,
+    /// Distribution of "longest common suffix" length between
+    /// kperf's user backtrace and our FP-walked stack from the
+    /// suspended state. Index N = "exactly N frames matched
+    /// counting from the deepest frame inward". Tells us how much
+    /// of the *parent* call chain survives the drift even when the
+    /// leaf PC has moved.
+    common_suffix_len_hist: [u64; 33],
+    /// Number of probes where the FP walk yielded zero frames
+    /// (target memory unreadable, FP=0, PAC-stripped FP misaligned).
+    fp_walk_failed: u64,
+    /// Number of side-by-side comparison rows we've already logged.
+    /// Capped (see `MAX_COMPARISON_ROWS`) so a long session doesn't
+    /// flood oslog with full-stack dumps.
+    comparison_rows_emitted: u64,
 }
+
+impl Default for ProbeStats {
+    fn default() -> Self {
+        Self {
+            probes_attempted: 0,
+            probes_ok: 0,
+            pc_match: 0,
+            lr_match: 0,
+            samples_kstack: 0,
+            samples_no_kstack: 0,
+            common_suffix_len_hist: [0; 33],
+            fp_walk_failed: 0,
+            comparison_rows_emitted: 0,
+        }
+    }
+}
+
+/// Cap on per-session full-stack comparison rows. Aggregates still
+/// cover every sample; this only limits the verbose side-by-side
+/// dump to oslog.
+const MAX_COMPARISON_ROWS: u64 = 32;
+/// Cap on FP-walk depth. kperf's MAX_CALLSTACK_FRAMES is similar.
+const MAX_WALK_FRAMES: usize = 32;
 
 #[derive(Copy, Clone, Default)]
 struct TimebaseInfo {
@@ -253,7 +279,7 @@ impl ProbeWorker {
         let port = match self.tid_cache.get(&req.tid).copied() {
             Some(p) => p,
             None => {
-                self.write_row(&req, ProbeOutcome::CacheMiss);
+                self.write_row(&req, ProbeOutcome::CacheMiss, &[]);
                 return;
             }
         };
@@ -261,9 +287,8 @@ impl ProbeWorker {
         // SAFETY: port came from task_threads; valid until task exit.
         let kr_susp = unsafe { thread_suspend(port) };
         if kr_susp != KERN_SUCCESS {
-            // Stale port — evict and try again next time.
             self.tid_cache.remove(&req.tid);
-            self.write_row(&req, ProbeOutcome::SuspendFailed { kr: kr_susp });
+            self.write_row(&req, ProbeOutcome::SuspendFailed { kr: kr_susp }, &[]);
             return;
         }
 
@@ -280,24 +305,62 @@ impl ProbeWorker {
             )
         };
 
-        // Capture probe completion time *before* the resume — the
-        // drift number we care about is "from kperf_ts to the
-        // moment we have the registers in hand", not after we let
-        // the thread go again.
+        // Walk the FP chain *before* resume, while the thread is
+        // still frozen — guarantees a consistent stack image. The
+        // walk reads target memory with mach_vm_read_overwrite, so
+        // the thread doesn't need to be running for it to work.
+        let mach_walked: Vec<u64> = if kr_get == KERN_SUCCESS {
+            fp_walk(self.task, state.__fp, MAX_WALK_FRAMES)
+        } else {
+            Vec::new()
+        };
+
         let probe_done_mach = mach_now();
 
         // SAFETY: paired resume.
         let _ = unsafe { thread_resume(port) };
 
         if kr_get != KERN_SUCCESS {
-            self.write_row(&req, ProbeOutcome::GetStateFailed { kr: kr_get });
+            self.write_row(&req, ProbeOutcome::GetStateFailed { kr: kr_get }, &[]);
             return;
         }
 
+        if mach_walked.is_empty() && state.__fp != 0 {
+            self.stats.fp_walk_failed += 1;
+        }
+
+        // Compare against the FP-walked portion of kperf's user
+        // backtrace. The kperf record is structured as
+        // [leaf_pc, walked_ret0, walked_ret1, ..., appended_lr].
+        // Strip leaf and appended-LR before comparing.
+        let kperf_walked: Vec<u64> = match req.kperf_user_backtrace.len() {
+            0 | 1 => Vec::new(),
+            n => req.kperf_user_backtrace[1..n - 1]
+                .iter()
+                .copied()
+                .map(pac_strip)
+                .collect(),
+        };
+        // mach_walked already PAC-stripped inside fp_walk.
+
+        let common_suffix = longest_common_suffix(&kperf_walked, &mach_walked);
+        let bucket = common_suffix.min(self.stats.common_suffix_len_hist.len() - 1);
+        self.stats.common_suffix_len_hist[bucket] += 1;
+
         let mach_pc = pac_strip(state.__pc);
         let mach_lr = pac_strip(state.__lr);
-        let kperf_pc = pac_strip(req.kperf_leaf_pc);
-        let kperf_lr = pac_strip(req.kperf_appended_lr);
+        let kperf_pc = req
+            .kperf_user_backtrace
+            .first()
+            .copied()
+            .map(pac_strip)
+            .unwrap_or(0);
+        let kperf_lr = req
+            .kperf_user_backtrace
+            .last()
+            .copied()
+            .map(pac_strip)
+            .unwrap_or(0);
 
         let pc_match = mach_pc == kperf_pc;
         let lr_match = mach_lr == kperf_lr;
@@ -309,15 +372,19 @@ impl ProbeWorker {
         if lr_match {
             self.stats.lr_match += 1;
         }
-        if pc_match && lr_match {
-            self.stats.pc_and_lr_match += 1;
-        }
 
-        let drift = (probe_done_mach as i128) - (req.kperf_ts_mach as i128);
-        if pc_match {
-            self.stats.drift_ticks_total_when_pc_match += drift.unsigned_abs();
-        } else {
-            self.stats.drift_ticks_total_when_pc_mismatch += drift.unsigned_abs();
+        // First N samples per session: emit a verbose side-by-side
+        // dump so a human can eyeball what's actually happening.
+        if self.stats.comparison_rows_emitted < MAX_COMPARISON_ROWS {
+            self.stats.comparison_rows_emitted += 1;
+            self.emit_comparison_row(
+                &req,
+                mach_pc,
+                mach_lr,
+                state.__fp,
+                &mach_walked,
+                common_suffix,
+            );
         }
 
         self.write_row(
@@ -326,15 +393,46 @@ impl ProbeWorker {
                 probe_done_mach,
                 mach_pc,
                 mach_lr,
-                mach_sp: state.__sp,
-                mach_fp: state.__fp,
                 pc_match,
                 lr_match,
+                common_suffix,
+                mach_walked_depth: mach_walked.len() as u32,
             },
+            &mach_walked,
         );
     }
 
-    fn write_row(&mut self, req: &ProbeRequest, out: ProbeOutcome) {
+    /// Verbose dump of one probe: kperf's full user_backtrace and
+    /// our FP-walked stack from the suspended thread, side by
+    /// side. Capped per session by `MAX_COMPARISON_ROWS`.
+    fn emit_comparison_row(
+        &self,
+        req: &ProbeRequest,
+        mach_pc: u64,
+        mach_lr: u64,
+        mach_fp: u64,
+        mach_walked: &[u64],
+        common_suffix: usize,
+    ) {
+        let kperf_str = stack_to_hex(&req.kperf_user_backtrace, true);
+        let mach_walked_str = stack_to_hex(mach_walked, false);
+        tracing::info!(
+            target: "staxd::probe",
+            tid = req.tid,
+            kperf_ts_mach = req.kperf_ts_mach,
+            kperf_stack = %kperf_str,
+            mach_pc = format!("{mach_pc:#x}"),
+            mach_fp = format!("{mach_fp:#x}"),
+            mach_lr = format!("{mach_lr:#x}"),
+            mach_walked = %mach_walked_str,
+            common_suffix,
+            kperf_walked_depth = req.kperf_user_backtrace.len().saturating_sub(2),
+            mach_walked_depth = mach_walked.len(),
+            "probe: stack comparison"
+        );
+    }
+
+    fn write_row(&mut self, req: &ProbeRequest, out: ProbeOutcome, _mach_walked: &[u64]) {
         let drained_drift_ticks = (req.drained_at_mach as i128) - (req.kperf_ts_mach as i128);
         let drained_drift_ns = self.timebase.ticks_to_ns(drained_drift_ticks) as i64;
         let probe_drift_ns: i64 = match out {
@@ -345,45 +443,43 @@ impl ProbeWorker {
             _ => 0,
         };
 
-        let (kind, mach_pc, mach_lr, mach_sp, mach_fp, pc_match, lr_match, kr) = match out {
-            ProbeOutcome::Ok {
-                mach_pc: pc,
-                mach_lr: lr,
-                mach_sp: sp,
-                mach_fp: fp,
-                pc_match: pcm,
-                lr_match: lrm,
-                ..
-            } => ("ok", pc, lr, sp, fp, pcm, lrm, 0),
-            ProbeOutcome::CacheMiss => ("cache_miss", 0, 0, 0, 0, false, false, 0),
-            ProbeOutcome::SuspendFailed { kr } => {
-                ("suspend_failed", 0, 0, 0, 0, false, false, kr)
-            }
-            ProbeOutcome::GetStateFailed { kr } => {
-                ("get_state_failed", 0, 0, 0, 0, false, false, kr)
-            }
-        };
+        let (kind, mach_pc, mach_lr, pc_match, lr_match, common_suffix, mach_walked_depth, kr) =
+            match out {
+                ProbeOutcome::Ok {
+                    mach_pc: pc,
+                    mach_lr: lr,
+                    pc_match: pcm,
+                    lr_match: lrm,
+                    common_suffix: cs,
+                    mach_walked_depth: mwd,
+                    ..
+                } => ("ok", pc, lr, pcm, lrm, cs, mwd, 0),
+                ProbeOutcome::CacheMiss => ("cache_miss", 0, 0, false, false, 0, 0, 0),
+                ProbeOutcome::SuspendFailed { kr } => {
+                    ("suspend_failed", 0, 0, false, false, 0, 0, kr)
+                }
+                ProbeOutcome::GetStateFailed { kr } => {
+                    ("get_state_failed", 0, 0, false, false, 0, 0, kr)
+                }
+            };
 
-        // One structured event per probe. `kperf_ts_mach` is the
-        // raw mach-tick stamp from the kdebug record so an
-        // analyser can post-correlate against the recorded
-        // KdBufWire stream by timestamp.
+        let kperf_walked_depth = req.kperf_user_backtrace.len().saturating_sub(2) as u32;
+
         tracing::info!(
             target: "staxd::probe",
             tid = req.tid,
             kperf_ts_mach = req.kperf_ts_mach,
             drained_drift_ns,
             probe_drift_ns,
-            kperf_pc = pac_strip(req.kperf_leaf_pc),
-            kperf_lr = pac_strip(req.kperf_appended_lr),
             mach_pc,
             mach_lr,
-            mach_sp,
-            mach_fp,
             pc_match,
             lr_match,
+            common_suffix,
+            kperf_walked_depth,
+            mach_walked_depth,
             kstack_depth = req.kperf_kstack_depth,
-            ustack_depth = req.kperf_ustack_depth,
+            ustack_depth = req.kperf_user_backtrace.len() as u32,
             kind,
             kr,
         );
@@ -394,21 +490,17 @@ impl ProbeWorker {
         let ok = self.stats.probes_ok;
         let pc = self.stats.pc_match;
         let lr = self.stats.lr_match;
-        let both = self.stats.pc_and_lr_match;
-        let avg_drift_match_ticks = if pc > 0 {
-            self.stats.drift_ticks_total_when_pc_match / (pc as u128)
-        } else {
-            0
-        };
-        let avg_drift_mismatch_ticks = if (ok - pc) > 0 {
-            self.stats.drift_ticks_total_when_pc_mismatch / ((ok - pc) as u128)
-        } else {
-            0
-        };
-        let avg_drift_match_ns = self.timebase.ticks_to_ns(avg_drift_match_ticks as i128);
-        let avg_drift_mismatch_ns = self
-            .timebase
-            .ticks_to_ns(avg_drift_mismatch_ticks as i128);
+
+        // Render the common-suffix histogram as one comma-separated
+        // string ("0:1234,1:567,2:111,...") so the analyzer can
+        // pick it apart with awk.
+        let mut hist_parts = Vec::new();
+        for (i, n) in self.stats.common_suffix_len_hist.iter().enumerate() {
+            if *n > 0 {
+                hist_parts.push(format!("{i}:{n}"));
+            }
+        }
+        let hist = hist_parts.join(",");
 
         info!(
             target_pid = self.target_pid,
@@ -418,12 +510,10 @@ impl ProbeWorker {
             pc_match = pc,
             pc_match_rate_pct = (pc * 100) / total,
             lr_match = lr,
-            both_match = both,
-            both_match_rate_pct = (both * 100) / total,
             samples_kstack = self.stats.samples_kstack,
             samples_no_kstack = self.stats.samples_no_kstack,
-            avg_drift_match_ns = avg_drift_match_ns as i64,
-            avg_drift_mismatch_ns = avg_drift_mismatch_ns as i64,
+            fp_walk_failed = self.stats.fp_walk_failed,
+            common_suffix_hist = hist,
             "probe: race-against-return summary"
         );
     }
@@ -434,14 +524,100 @@ enum ProbeOutcome {
         probe_done_mach: u64,
         mach_pc: u64,
         mach_lr: u64,
-        mach_sp: u64,
-        mach_fp: u64,
         pc_match: bool,
         lr_match: bool,
+        common_suffix: usize,
+        mach_walked_depth: u32,
     },
     CacheMiss,
     SuspendFailed { kr: i32 },
     GetStateFailed { kr: i32 },
+}
+
+/// Walk the FP chain in the target task starting at `fp` and
+/// return up to `max` PAC-stripped return addresses. Mirrors what
+/// kperf does in xnu's backtrace_user (osfmk/kern/backtrace.c) but
+/// reads memory via `mach_vm_read_overwrite` instead of in-kernel
+/// pmap_copyin. Each frame is 16 bytes on arm64: { prev_fp,
+/// ret_addr }. Stops on FP=0, misalignment (caught loop), or read
+/// failure.
+fn fp_walk(task: mach_port_t, fp_in: u64, max: usize) -> Vec<u64> {
+    use mach2::vm::mach_vm_read_overwrite;
+    use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
+
+    const SWIFT_ASYNC_FP_BIT: u64 = 1 << 60;
+
+    let mut frames: Vec<u64> = Vec::with_capacity(max);
+    let mut fp = fp_in & !SWIFT_ASYNC_FP_BIT;
+
+    while fp != 0 && frames.len() < max {
+        if (fp & 0x3) != 0 {
+            break;
+        }
+        let mut buf = [0u8; 16];
+        let mut out_size: mach_vm_size_t = 0;
+        // SAFETY: out buffer lives for the duration of the call.
+        let kr = unsafe {
+            mach_vm_read_overwrite(
+                task,
+                fp as mach_vm_address_t,
+                16,
+                buf.as_mut_ptr() as mach_vm_address_t,
+                &mut out_size,
+            )
+        };
+        if kr != KERN_SUCCESS || out_size != 16 {
+            break;
+        }
+        let prev_fp = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let ret = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        frames.push(pac_strip(ret));
+        let next_fp = prev_fp & !SWIFT_ASYNC_FP_BIT;
+        if next_fp <= fp {
+            // Frame pointer must climb upward in arm64 ABI; if it
+            // doesn't we're in malformed memory (likely JIT or a
+            // smashed stack). Stop the walk to avoid looping.
+            break;
+        }
+        fp = next_fp;
+    }
+    frames
+}
+
+/// How many frames at the deepest end of the two stacks match
+/// after PAC stripping. "Deepest" = highest index. A common suffix
+/// of length k means "the k oldest frames are identical." When
+/// both stacks share their root frames (typical case for threads
+/// in the same dispatch worker pool, etc.) but diverged at the
+/// leaf, that k captures exactly how much of the parent context
+/// is recoverable.
+fn longest_common_suffix(a: &[u64], b: &[u64]) -> usize {
+    let mut k = 0;
+    let max_k = a.len().min(b.len());
+    while k < max_k {
+        if a[a.len() - 1 - k] != b[b.len() - 1 - k] {
+            break;
+        }
+        k += 1;
+    }
+    k
+}
+
+/// Render a stack of u64 addresses as `[0x123,0x456,...]`. Pre-PAC
+/// when `raw=true` (so the caller sees what kperf actually emitted).
+fn stack_to_hex(frames: &[u64], raw: bool) -> String {
+    let mut s = String::with_capacity(frames.len() * 14 + 2);
+    s.push('[');
+    for (i, f) in frames.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let v = if raw { *f } else { pac_strip(*f) };
+        use std::fmt::Write;
+        let _ = write!(s, "{v:#x}");
+    }
+    s.push(']');
+    s
 }
 
 /// Resolve a Mach thread port to the kernel tid the kdebug stream

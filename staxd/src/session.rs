@@ -280,16 +280,12 @@ impl SampleBoundaryParser {
                 if ip.ustack.is_empty() {
                     return None;
                 }
-                let leaf = *ip.ustack.first().unwrap();
-                let lr = *ip.ustack.last().unwrap();
                 Some(ProbeRequest {
                     tid: ip.tid,
                     kperf_ts_mach: ip.timestamp_mach,
                     drained_at_mach,
-                    kperf_leaf_pc: leaf,
-                    kperf_appended_lr: lr,
+                    kperf_user_backtrace: ip.ustack,
                     kperf_kstack_depth: ip.kstack_expected,
-                    kperf_ustack_depth: ip.ustack_expected,
                 })
             }
             (perf::sc::CALLSTACK, perf::cs::UHDR, _) => {
