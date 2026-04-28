@@ -79,16 +79,22 @@ fn install() -> Result<(), Box<dyn Error>> {
         fs::copy(&src, &dst)?;
 
         #[cfg(target_os = "macos")]
-        if bin == SHADE_BIN {
-            // stax-shade is the only binary that runs from
-            // ~/.cargo/bin and needs cs.debugger. staxd also needs
-            // cs.debugger (race-against-return probe in session.rs)
-            // but it's signed at its install destination by
-            // `stax setup` — codesigning here and then fs::copy'ing
-            // to /usr/local/bin/staxd invalidates the signature.
-            codesign_with_debugger(&dst)?;
+        {
+            // rustc ad-hoc-signs each binary it produces on Apple
+            // Silicon. fs::copy preserves the embedded signature
+            // *bytes* but the cdhash now matches a file at a
+            // different path/inode, and AMFI rejects it on launch
+            // (process gets SIGKILL'd before any code runs).
+            // Re-sign every binary at the destination. stax-shade
+            // gets the entitled flavor (cs.debugger). staxd is
+            // re-signed *again* by `stax setup` at its final
+            // /usr/local/bin install path.
+            if bin == SHADE_BIN {
+                codesign_with_debugger(&dst)?;
+            } else {
+                codesign_adhoc(&dst)?;
+            }
         }
-        // BIN_NAME, DAEMON_BIN, SERVER_BIN: no codesign needed here.
     }
 
     #[cfg(target_os = "macos")]
@@ -193,6 +199,21 @@ fn wait_until_unloaded(label_target: &str) -> Result<(), Box<dyn Error>> {
 #[cfg(target_os = "macos")]
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var_os("HOME").expect("HOME is not set"))
+}
+
+#[cfg(target_os = "macos")]
+fn codesign_adhoc(binary: &Path) -> Result<(), Box<dyn Error>> {
+    println!(":: Re-signing {} (ad-hoc)...", binary.display());
+    let status = Command::new("codesign")
+        .arg("--force")
+        .arg("--sign")
+        .arg("-")
+        .arg(binary)
+        .status()?;
+    if !status.success() {
+        return Err(format!("codesign exited with {status}").into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
