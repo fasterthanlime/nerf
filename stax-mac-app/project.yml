@@ -16,6 +16,10 @@ settings:
     SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
     SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY: YES
 
+packages:
+  vox:
+    path: ../../vox
+
 targets:
   stax:
     type: application
@@ -28,6 +32,9 @@ targets:
       - path: stax/Fonts
         type: folder
         buildPhase: resources
+    dependencies:
+      - package: vox
+        product: VoxRuntime
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: eu.bearcove.stax

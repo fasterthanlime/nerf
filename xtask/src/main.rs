@@ -227,7 +227,10 @@ fn codesign_adhoc(binary: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "macos")]
-fn codesign_adhoc_with_entitlements(binary: &Path, entitlements: &Path) -> Result<(), Box<dyn Error>> {
+fn codesign_adhoc_with_entitlements(
+    binary: &Path,
+    entitlements: &Path,
+) -> Result<(), Box<dyn Error>> {
     println!(
         ":: Re-signing {} (ad-hoc, entitlements={})...",
         binary.display(),
