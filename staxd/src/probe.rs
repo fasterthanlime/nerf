@@ -26,7 +26,8 @@
 //! side-instrumentation.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::mach_types::thread_act_array_t;
@@ -38,17 +39,20 @@ use mach2::thread_act::{thread_get_state, thread_resume, thread_suspend};
 use mach2::thread_status::ARM_THREAD_STATE64;
 use mach2::traps::{mach_task_self, task_for_pid};
 use staxd_proto::ProbeResultWire;
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::unwind::{self, TargetUnwinder};
 
 /// Handles for the probe back-channel. The drain loop pushes
-/// `ProbeRequest`s onto `requests` and drains accumulated
-/// `ProbeResultWire`s from `results` for inclusion in the next
-/// `KdBufBatch`.
+/// `ProbeRequest`s onto `requests` (try_send / drop on full) and
+/// drains accumulated `ProbeResultWire`s from `results`
+/// (try_recv) for inclusion in the next `KdBufBatch`.
+///
+/// Both channels are sync (`std::sync::mpsc::sync_channel`)
+/// because the worker runs on `tokio::task::spawn_blocking`'s
+/// blocking pool, not on the async workers — see `spawn()`.
 pub struct ProbeChannel {
-    pub requests: mpsc::Sender<ProbeRequest>,
+    pub requests: mpsc::SyncSender<ProbeRequest>,
     pub results: mpsc::Receiver<ProbeResultWire>,
 }
 
@@ -64,8 +68,12 @@ pub struct ProbeRequest {
     pub kperf_ts_mach: u64,
 }
 
-/// Probe-side bookkeeping. Lives on a dedicated tokio task so the
-/// `read_trace` loop never blocks on a Mach call.
+/// Probe-side bookkeeping. Lives on a `spawn_blocking` task so
+/// the synchronous Mach RPCs (thread_suspend / thread_get_state /
+/// framehop walk reading target memory / thread_resume) can't
+/// block the tokio runtime's async workers — kperf keepalive,
+/// vox session tasks, and the drain loop all need those workers
+/// to stay responsive while a probe is in flight.
 struct ProbeWorker {
     target_pid: u32,
     task: mach_port_t,
@@ -80,7 +88,7 @@ struct ProbeWorker {
     /// Send results back to the drain loop for inclusion in the
     /// next `KdBufBatch`. `try_send`; if the channel is full the
     /// drain loop is slow, count the drop and move on.
-    results_tx: mpsc::Sender<ProbeResultWire>,
+    results_tx: mpsc::SyncSender<ProbeResultWire>,
     stats: ProbeStats,
 }
 
@@ -110,10 +118,16 @@ struct ProbeStats {
 /// size but covers any legitimate stack.
 const MAX_WALK_FRAMES: usize = 64;
 
-/// Spawn a probe worker bound to `target_pid`. Returns the request
-/// sender + result receiver. Channel is bounded so a stuck worker
-/// or a stuck drain loop doesn't unbound-grow memory; both sides
-/// `try_send` and count drops.
+/// Spawn a probe worker bound to `target_pid`. Worker runs on
+/// `tokio::task::spawn_blocking`'s pool — its body is all
+/// synchronous Mach RPCs (suspend / get_state / framehop walk /
+/// resume) that would otherwise wedge tokio's async workers
+/// (only 2 of them in staxd's runtime), starving keepalive and
+/// the drain loop.
+///
+/// Channels are bounded sync mpsc; both sides use try_send /
+/// try_recv and count drops, so neither a stuck worker nor a
+/// stuck drain loop unbound-grows memory.
 pub fn spawn(target_pid: u32) -> Option<ProbeChannel> {
     let task = match task_for_pid_root(target_pid) {
         Ok(t) => t,
@@ -142,8 +156,8 @@ pub fn spawn(target_pid: u32) -> Option<ProbeChannel> {
 
     info!(target_pid, "probe: race-against-return capture started; results streamed back to drain loop");
 
-    let (req_tx, mut req_rx) = mpsc::channel::<ProbeRequest>(4096);
-    let (res_tx, res_rx) = mpsc::channel::<ProbeResultWire>(4096);
+    let (req_tx, req_rx) = mpsc::sync_channel::<ProbeRequest>(4096);
+    let (res_tx, res_rx) = mpsc::sync_channel::<ProbeResultWire>(4096);
 
     let mut worker = ProbeWorker {
         target_pid,
@@ -154,22 +168,26 @@ pub fn spawn(target_pid: u32) -> Option<ProbeChannel> {
         stats: ProbeStats::default(),
     };
 
-    tokio::spawn(async move {
-        // Refresh the tid cache periodically — threads come and
-        // go in any non-trivial app. Cheap, takes microseconds.
-        let mut refresh = tokio::time::interval(Duration::from_secs(1));
-        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+    tokio::task::spawn_blocking(move || {
+        // Drive periodic tid_cache refresh ourselves — we're a
+        // sync loop, no `tokio::time::interval`. Refresh every
+        // 1s of wall time; if requests are flowing we still hit
+        // the timeout because recv_timeout returns Timeout when
+        // nothing arrived in the window, but the request
+        // processing path doesn't reset the timer.
+        const TID_REFRESH: Duration = Duration::from_secs(1);
+        let mut last_refresh = Instant::now();
         loop {
-            tokio::select! {
-                req = req_rx.recv() => match req {
-                    Some(r) => worker.probe_one(r),
-                    None => break,
-                },
-                _ = refresh.tick() => worker.refresh_tid_cache(),
+            match req_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(req) => worker.probe_one(req),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if last_refresh.elapsed() >= TID_REFRESH {
+                worker.refresh_tid_cache();
+                last_refresh = Instant::now();
             }
         }
-
         worker.flush_and_log_summary();
     });
 
