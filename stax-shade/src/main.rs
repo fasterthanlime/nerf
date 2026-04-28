@@ -261,10 +261,7 @@ async fn run_recording(
     } else {
         probe::RaceKperfSink::disabled(sink)
     };
-
-    if let Some(pre_resume) = pre_resume {
-        pre_resume.resume()?;
-    }
+    let race_probe_trigger = sink.trigger();
 
     let opts = staxd_client::RemoteOptions {
         daemon_socket: cli.daemon_socket,
@@ -307,28 +304,54 @@ async fn run_recording(
         pid,
         "shade starting staxd recording pipeline"
     );
+    let pre_resume = Arc::new(Mutex::new(pre_resume));
+    let pre_resume_for_recording_start = pre_resume.clone();
     let child_exit = Arc::new(Mutex::new(None));
     let child_exit_for_stop = child_exit.clone();
-    let result = staxd_client::drive_session(opts, sink, move || {
-        if server_stop_requested.load(Ordering::Relaxed) {
-            return true;
-        }
-        if stop_via_sink() {
-            return true;
-        }
-        if let Some(pid) = launched_pid
-            && child_exit_for_stop
+    let result = staxd_client::drive_session_with_hooks(
+        opts,
+        sink,
+        move || {
+            if server_stop_requested.load(Ordering::Relaxed) {
+                return true;
+            }
+            if stop_via_sink() {
+                return true;
+            }
+            if let Some(pid) = launched_pid
+                && child_exit_for_stop
+                    .lock()
+                    .expect("child_exit poisoned")
+                    .is_none()
+                && let Some(exit) = launched_child_exited(pid)
+            {
+                *child_exit_for_stop.lock().expect("child_exit poisoned") = Some(exit);
+                return true;
+            }
+            false
+        },
+        move || {
+            if let Some(pre_resume) = pre_resume_for_recording_start
                 .lock()
-                .expect("child_exit poisoned")
-                .is_none()
-            && let Some(exit) = launched_child_exited(pid)
-        {
-            *child_exit_for_stop.lock().expect("child_exit poisoned") = Some(exit);
-            return true;
-        }
-        false
-    })
+                .expect("pre_resume poisoned")
+                .take()
+            {
+                if let Err(err) = pre_resume.resume() {
+                    tracing::warn!("failed to resume target after recording started: {err}");
+                }
+            }
+        },
+        move |tid, timestamp| {
+            if let Some(trigger) = race_probe_trigger.as_ref() {
+                trigger.enqueue(tid, timestamp);
+            }
+        },
+    )
     .await;
+
+    if let Some(pre_resume) = pre_resume.lock().expect("pre_resume poisoned").take() {
+        pre_resume.resume()?;
+    }
 
     if let Some(pid) = launched_pid {
         if child_exit.lock().expect("child_exit poisoned").is_none()
@@ -849,7 +872,7 @@ async fn register_with_server(
                 reason.unwrap_or_else(|| "(no reason)".to_owned())
             )
         }
-        Err(vox::VoxError::User(msg)) => eyre::bail!("server returned error: {msg}"),
+        Err(vox::VoxError::User(err)) => eyre::bail!("server returned error: {err:?}"),
         Err(e) => eyre::bail!("vox register_shade failed: {e:?}"),
     }
 }

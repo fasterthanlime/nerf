@@ -335,8 +335,8 @@ impl SampleSink for LiveOnlySink {
         };
         block_sink(sink.on_probe_result(&crate::live_sink::ProbeResultEvent {
             tid: ev.tid,
-            kperf_ts: ev.kperf_ts_ns,
-            probe_done_ns: ev.probe_done_ns,
+            timing: ev.timing.into(),
+            queue: ev.queue.into(),
             mach_pc: ev.mach_pc,
             mach_lr: ev.mach_lr,
             mach_fp: ev.mach_fp,
@@ -352,6 +352,29 @@ impl SampleSink for LiveOnlySink {
     ) {
         if let Some(sink) = self.live_sink.as_ref() {
             block_sink(sink.on_macho_byte_source(source));
+        }
+    }
+}
+
+impl From<stax_mac_capture::ProbeTiming> for crate::live_sink::ProbeTiming {
+    fn from(t: stax_mac_capture::ProbeTiming) -> Self {
+        Self {
+            kperf_ts: t.kperf_ts,
+            enqueued: t.enqueued,
+            worker_started: t.worker_started,
+            thread_lookup_done: t.thread_lookup_done,
+            state_done: t.state_done,
+            resume_done: t.resume_done,
+            walk_done: t.walk_done,
+        }
+    }
+}
+
+impl From<stax_mac_capture::ProbeQueueStats> for crate::live_sink::ProbeQueueStats {
+    fn from(q: stax_mac_capture::ProbeQueueStats) -> Self {
+        Self {
+            coalesced_requests: q.coalesced_requests,
+            worker_batch_len: q.worker_batch_len,
         }
     }
 }

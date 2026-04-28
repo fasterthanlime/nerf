@@ -60,18 +60,41 @@ pub trait SampleSink {
     /// thread shortly after kperf's PMI lands, walks via framehop,
     /// and ships the result alongside the kperf records. Pair
     /// against a `SampleEvent` by matching `(tid, timestamp_ns ==
-    /// kperf_ts_ns)`. Default no-op so archive-only sinks ignore.
+    /// timing.kperf_ts)`. Default no-op so archive-only sinks ignore.
     #[allow(unused_variables)]
     fn on_probe_result(&mut self, ev: ProbeResultEvent<'_>) {}
 }
 
 /// Race-against-return probe output for one kperf sample.
-/// `kperf_ts_ns` matches the corresponding `SampleEvent`'s
+/// `ProbeTiming::kperf_ts` matches the corresponding `SampleEvent`'s
 /// `timestamp_ns`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeTiming {
+    pub kperf_ts: u64,
+    /// mach_absolute_time when the parser enqueued this probe.
+    pub enqueued: u64,
+    /// mach_absolute_time when a probe worker started this request.
+    pub worker_started: u64,
+    /// mach_absolute_time after thread-port lookup/cache refresh.
+    pub thread_lookup_done: u64,
+    /// mach_absolute_time after thread_get_state completed.
+    pub state_done: u64,
+    /// mach_absolute_time after thread_resume returned.
+    pub resume_done: u64,
+    /// mach_absolute_time after the remote FP walk completed.
+    pub walk_done: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeQueueStats {
+    pub coalesced_requests: u64,
+    pub worker_batch_len: u32,
+}
+
 pub struct ProbeResultEvent<'a> {
     pub tid: u32,
-    pub kperf_ts_ns: u64,
-    pub probe_done_ns: u64,
+    pub timing: ProbeTiming,
+    pub queue: ProbeQueueStats,
     pub mach_pc: u64,
     pub mach_lr: u64,
     pub mach_fp: u64,

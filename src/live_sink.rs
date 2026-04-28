@@ -135,14 +135,31 @@ pub struct WakeupEvent<'a> {
 /// samples.
 pub struct ProbeResultEvent<'a> {
     pub tid: u32,
-    pub kperf_ts: u64,
-    pub probe_done_ns: u64,
+    pub timing: ProbeTiming,
+    pub queue: ProbeQueueStats,
     pub mach_pc: u64,
     pub mach_lr: u64,
     pub mach_fp: u64,
     pub mach_sp: u64,
     pub mach_walked: &'a [u64],
     pub used_framehop: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeTiming {
+    pub kperf_ts: u64,
+    pub enqueued: u64,
+    pub worker_started: u64,
+    pub thread_lookup_done: u64,
+    pub state_done: u64,
+    pub resume_done: u64,
+    pub walk_done: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeQueueStats {
+    pub coalesced_requests: u64,
+    pub worker_batch_len: u32,
 }
 
 /// Recording-side observer. Methods are async so consumers can do

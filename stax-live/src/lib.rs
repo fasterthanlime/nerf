@@ -11,9 +11,9 @@ use parking_lot::RwLock;
 use stax_live_proto::{
     AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, IntervalEntry, IntervalListUpdate,
     LiveFilter, NeighborsUpdate, PetSampleEntry, PetSampleListUpdate, ProbeDiffBucket,
-    ProbeDiffDepthCell, ProbeDiffEntry, ProbeDiffThread, ProbeDiffUpdate, Profiler, ResolvedFrame,
-    STITCH_MIN_SUFFIX, ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate, TopEntry,
-    TopSort, TopUpdate, ViewParams,
+    ProbeDiffDepthCell, ProbeDiffEntry, ProbeDiffThread, ProbeDiffUpdate, ProbeTimingBreakdown,
+    ProbeTimingSummary, Profiler, ResolvedFrame, STITCH_MIN_SUFFIX, ThreadInfo, ThreadsUpdate,
+    TimelineBucket, TimelineUpdate, TopEntry, TopSort, TopUpdate, ViewParams,
 };
 
 use crate::aggregator::{Aggregation, EventCtx, OffCpuBreakdown, PmcAccum, StackNode};
@@ -26,8 +26,40 @@ mod disassemble;
 mod highlight;
 pub mod source;
 
-pub use aggregator::{Aggregator, ProbeResultRecord};
+pub use aggregator::{Aggregator, ProbeQueueStats, ProbeResultRecord, ProbeTiming};
 pub use binaries::{BinaryRegistry, LiveSymbolOwned, LoadedBinary};
+
+impl From<stax_live_proto::ProbeTiming> for ProbeTiming {
+    fn from(t: stax_live_proto::ProbeTiming) -> Self {
+        Self {
+            kperf_ts: t.kperf_ts,
+            enqueued: t.enqueued,
+            worker_started: t.worker_started,
+            thread_lookup_done: t.thread_lookup_done,
+            state_done: t.state_done,
+            resume_done: t.resume_done,
+            walk_done: t.walk_done,
+        }
+    }
+}
+
+impl From<stax_live_proto::ProbeQueueStats> for ProbeQueueStats {
+    fn from(q: stax_live_proto::ProbeQueueStats) -> Self {
+        Self {
+            coalesced_requests: q.coalesced_requests,
+            worker_batch_len: q.worker_batch_len,
+        }
+    }
+}
+
+impl From<ProbeQueueStats> for stax_live_proto::ProbeQueueStats {
+    fn from(q: ProbeQueueStats) -> Self {
+        Self {
+            coalesced_requests: q.coalesced_requests,
+            worker_batch_len: q.worker_batch_len,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct LiveServer {
@@ -672,6 +704,105 @@ fn ticks_to_ns(ticks: i128) -> i128 {
     }
 }
 
+fn elapsed_ticks_to_ns(later: u64, earlier: u64) -> u64 {
+    if later < earlier {
+        return 0;
+    }
+    ticks_to_ns((later - earlier) as i128)
+        .max(0)
+        .min(u64::MAX as i128) as u64
+}
+
+fn probe_timing_breakdown(probe: &ProbeResultRecord) -> ProbeTimingBreakdown {
+    ProbeTimingBreakdown {
+        kperf_to_enqueue_ns: elapsed_ticks_to_ns(probe.timing.enqueued, probe.timing.kperf_ts),
+        queue_wait_ns: elapsed_ticks_to_ns(probe.timing.worker_started, probe.timing.enqueued),
+        lookup_ns: elapsed_ticks_to_ns(
+            probe.timing.thread_lookup_done,
+            probe.timing.worker_started,
+        ),
+        suspend_state_ns: elapsed_ticks_to_ns(
+            probe.timing.state_done,
+            probe.timing.thread_lookup_done,
+        ),
+        resume_ns: elapsed_ticks_to_ns(probe.timing.resume_done, probe.timing.state_done),
+        walk_ns: elapsed_ticks_to_ns(probe.timing.walk_done, probe.timing.resume_done),
+        probe_total_ns: elapsed_ticks_to_ns(probe.timing.walk_done, probe.timing.worker_started),
+    }
+}
+
+#[derive(Default)]
+struct ProbeTimingAccum {
+    samples: u64,
+    sum_kperf_to_enqueue_ns: u128,
+    max_kperf_to_enqueue_ns: u64,
+    sum_queue_wait_ns: u128,
+    max_queue_wait_ns: u64,
+    sum_lookup_ns: u128,
+    max_lookup_ns: u64,
+    sum_suspend_state_ns: u128,
+    max_suspend_state_ns: u64,
+    sum_resume_ns: u128,
+    max_resume_ns: u64,
+    sum_walk_ns: u128,
+    max_walk_ns: u64,
+    sum_probe_total_ns: u128,
+    max_probe_total_ns: u64,
+    coalesced_requests: u64,
+    max_worker_batch_len: u32,
+}
+
+impl ProbeTimingAccum {
+    fn add(&mut self, t: ProbeTimingBreakdown, q: ProbeQueueStats) {
+        self.samples = self.samples.saturating_add(1);
+        self.sum_kperf_to_enqueue_ns += t.kperf_to_enqueue_ns as u128;
+        self.max_kperf_to_enqueue_ns = self.max_kperf_to_enqueue_ns.max(t.kperf_to_enqueue_ns);
+        self.sum_queue_wait_ns += t.queue_wait_ns as u128;
+        self.max_queue_wait_ns = self.max_queue_wait_ns.max(t.queue_wait_ns);
+        self.sum_lookup_ns += t.lookup_ns as u128;
+        self.max_lookup_ns = self.max_lookup_ns.max(t.lookup_ns);
+        self.sum_suspend_state_ns += t.suspend_state_ns as u128;
+        self.max_suspend_state_ns = self.max_suspend_state_ns.max(t.suspend_state_ns);
+        self.sum_resume_ns += t.resume_ns as u128;
+        self.max_resume_ns = self.max_resume_ns.max(t.resume_ns);
+        self.sum_walk_ns += t.walk_ns as u128;
+        self.max_walk_ns = self.max_walk_ns.max(t.walk_ns);
+        self.sum_probe_total_ns += t.probe_total_ns as u128;
+        self.max_probe_total_ns = self.max_probe_total_ns.max(t.probe_total_ns);
+        self.coalesced_requests = self.coalesced_requests.saturating_add(q.coalesced_requests);
+        self.max_worker_batch_len = self.max_worker_batch_len.max(q.worker_batch_len);
+    }
+
+    fn finish(self) -> ProbeTimingSummary {
+        let avg = |sum: u128| -> u64 {
+            if self.samples == 0 {
+                0
+            } else {
+                (sum / self.samples as u128).min(u64::MAX as u128) as u64
+            }
+        };
+        ProbeTimingSummary {
+            samples: self.samples,
+            avg_kperf_to_enqueue_ns: avg(self.sum_kperf_to_enqueue_ns),
+            max_kperf_to_enqueue_ns: self.max_kperf_to_enqueue_ns,
+            avg_queue_wait_ns: avg(self.sum_queue_wait_ns),
+            max_queue_wait_ns: self.max_queue_wait_ns,
+            avg_lookup_ns: avg(self.sum_lookup_ns),
+            max_lookup_ns: self.max_lookup_ns,
+            avg_suspend_state_ns: avg(self.sum_suspend_state_ns),
+            max_suspend_state_ns: self.max_suspend_state_ns,
+            avg_resume_ns: avg(self.sum_resume_ns),
+            max_resume_ns: self.max_resume_ns,
+            avg_walk_ns: avg(self.sum_walk_ns),
+            max_walk_ns: self.max_walk_ns,
+            avg_probe_total_ns: avg(self.sum_probe_total_ns),
+            max_probe_total_ns: self.max_probe_total_ns,
+            coalesced_requests: self.coalesced_requests,
+            max_worker_batch_len: self.max_worker_batch_len,
+        }
+    }
+}
+
 /// Pair each kperf PET sample with its matching race-against-return
 /// probe result by `(tid, timestamp_ns == kperf_ts)`. Walks both
 /// per-thread queues with a two-pointer merge: both queues are
@@ -710,6 +841,7 @@ fn build_probe_diff_update(
     let mut stitchable_n: u64 = 0;
     let mut framehop_n: u64 = 0;
     let mut fp_walk_n: u64 = 0;
+    let mut timing = ProbeTimingAccum::default();
 
     let mut threads_summary: Vec<ProbeDiffThread> = Vec::new();
 
@@ -753,12 +885,12 @@ fn build_probe_diff_update(
                     probe_only += 1;
                 }
                 (Some(pet), Some(probe)) => {
-                    if pet.timestamp_ns < probe.kperf_ts {
+                    if pet.timestamp_ns < probe.timing.kperf_ts {
                         pet_iter.next();
                         kperf_only += 1;
                         continue;
                     }
-                    if pet.timestamp_ns > probe.kperf_ts {
+                    if pet.timestamp_ns > probe.timing.kperf_ts {
                         probe_iter.next();
                         probe_only += 1;
                         continue;
@@ -809,8 +941,11 @@ fn build_probe_diff_update(
                         probe_deeper += 1;
                     }
 
-                    let drift_ns_signed =
-                        ticks_to_ns((probe.probe_done_ns as i128) - (probe.kperf_ts as i128));
+                    let drift_ns_signed = ticks_to_ns(
+                        (probe.timing.state_done as i128) - (probe.timing.kperf_ts as i128),
+                    );
+                    let timing_breakdown = probe_timing_breakdown(probe);
+                    timing.add(timing_breakdown, probe.queue);
                     let drift_abs_ns = drift_ns_signed.unsigned_abs() as u64;
                     let bucket_idx = PROBE_DRIFT_BUCKETS_NS
                         .iter()
@@ -840,6 +975,8 @@ fn build_probe_diff_update(
                     ring.push_back(RawEntry {
                         timestamp_ns: pet.timestamp_ns.saturating_sub(session_start),
                         drift_ns: drift_ns_signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+                        timing: timing_breakdown,
+                        queue: probe.queue,
                         common_suffix: common as u32,
                         pc_match,
                         stitchable,
@@ -898,6 +1035,8 @@ fn build_probe_diff_update(
                         tid: focus_tid_for_recent.unwrap_or(0),
                         timestamp_ns: raw.timestamp_ns,
                         drift_ns: raw.drift_ns,
+                        timing: raw.timing,
+                        queue: raw.queue.into(),
                         kperf_stack: raw
                             .kperf_stack
                             .iter()
@@ -958,6 +1097,7 @@ fn build_probe_diff_update(
         common_suffix_hist: hist,
         depth_match: depth_cells,
         drift_buckets,
+        timing: timing.finish(),
         pc_match: pc_match_n,
         stitchable: stitchable_n,
         framehop_used: framehop_n,
@@ -973,6 +1113,8 @@ fn build_probe_diff_update(
 struct RawEntry {
     timestamp_ns: u64,
     drift_ns: i64,
+    timing: ProbeTimingBreakdown,
+    queue: ProbeQueueStats,
     common_suffix: u32,
     pc_match: bool,
     stitchable: bool,

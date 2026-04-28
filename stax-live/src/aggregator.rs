@@ -155,12 +155,8 @@ pub struct PetSample {
 /// right shape. staxd must not produce these.
 pub struct ProbeResultRecord {
     pub tid: u32,
-    /// Mach-tick timestamp of the matching kperf sample (matches
-    /// the `PetSample::timestamp_ns` field on the same tid).
-    pub kperf_ts: u64,
-    /// Mach-tick timestamp at which the probe finished
-    /// `thread_get_state`. Drift = kperf_ts → probe_done_ns.
-    pub probe_done_ns: u64,
+    pub timing: ProbeTiming,
+    pub queue: ProbeQueueStats,
     pub mach_pc: u64,
     pub mach_lr: u64,
     pub mach_fp: u64,
@@ -171,6 +167,27 @@ pub struct ProbeResultRecord {
     /// `true` if framehop produced the walk, `false` for FP-walk
     /// fallback.
     pub used_framehop: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeTiming {
+    /// Mach-tick timestamp of the matching kperf sample (matches
+    /// the `PetSample::timestamp_ns` field on the same tid).
+    pub kperf_ts: u64,
+    pub enqueued: u64,
+    pub worker_started: u64,
+    pub thread_lookup_done: u64,
+    /// Mach-tick timestamp at which `thread_get_state` completed.
+    /// Drift = kperf_ts → state_done.
+    pub state_done: u64,
+    pub resume_done: u64,
+    pub walk_done: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeQueueStats {
+    pub coalesced_requests: u64,
+    pub worker_batch_len: u32,
 }
 
 /// One on-CPU or off-CPU interval, as reported by SCHED-record
@@ -315,7 +332,7 @@ impl Aggregator {
     /// kperf `PetSample` that has the same `(tid, kperf_ts)` —
     /// queries can correlate at read time.
     pub fn record_probe_result(&mut self, result: ProbeResultRecord) {
-        self.note_timestamp(result.kperf_ts);
+        self.note_timestamp(result.timing.kperf_ts);
         let stats = self.threads.entry(result.tid).or_default();
         if stats.probe_results.len() >= MAX_EVENTS_PER_THREAD {
             stats.probe_results.pop_front();

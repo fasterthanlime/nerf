@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::mach_port::mach_port_deallocate;
@@ -16,93 +18,73 @@ use mach2::vm::mach_vm_read_overwrite;
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
 use stax_mac_capture::sample_sink::CpuIntervalEvent;
 use stax_mac_capture::{
-    BinaryLoadedEvent, BinaryUnloadedEvent, JitdumpEvent, MachOByteSource, ProbeResultEvent,
-    SampleEvent, SampleSink, ThreadNameEvent, WakeupEvent,
+    BinaryLoadedEvent, BinaryUnloadedEvent, JitdumpEvent, MachOByteSource, ProbeQueueStats,
+    ProbeResultEvent, ProbeTiming, SampleEvent, SampleSink, ThreadNameEvent, WakeupEvent,
 };
 
 const MAX_FP_FRAMES: usize = 64;
 const MAX_FP_DELTA: u64 = 8 * 1024 * 1024;
-const PROBE_REQ_QUEUE: usize = 64;
-const PROBE_RES_QUEUE: usize = 256;
-
 pub struct RaceKperfSink<S> {
     inner: S,
     probe: Option<RaceProbeWorker>,
-    dropped_probe_requests: u64,
 }
 
 impl<S> RaceKperfSink<S> {
     pub fn disabled(inner: S) -> Self {
-        Self {
-            inner,
-            probe: None,
-            dropped_probe_requests: 0,
-        }
+        Self { inner, probe: None }
     }
 
     pub fn enabled(task: mach_port_t, inner: S) -> Self {
         Self {
             inner,
             probe: Some(RaceProbeWorker::new(task)),
-            dropped_probe_requests: 0,
         }
+    }
+
+    pub fn trigger(&self) -> Option<RaceProbeTrigger> {
+        self.probe.as_ref().map(RaceProbeWorker::trigger)
     }
 }
 
 impl<S: SampleSink> SampleSink for RaceKperfSink<S> {
     fn on_sample(&mut self, sample: SampleEvent<'_>) {
-        if let Some(probe) = self.probe.as_mut() {
-            for result in probe.drain_results() {
-                self.inner.on_probe_result(ProbeResultEvent {
-                    tid: result.tid,
-                    kperf_ts_ns: result.kperf_ts,
-                    probe_done_ns: result.done_ticks,
-                    mach_pc: result.pc,
-                    mach_lr: result.lr,
-                    mach_fp: result.fp,
-                    mach_sp: result.sp,
-                    mach_walked: &result.walked,
-                    used_framehop: false,
-                });
-            }
-            if !probe.enqueue(sample.tid, sample.timestamp_ns) {
-                self.dropped_probe_requests = self.dropped_probe_requests.saturating_add(1);
-                if self.dropped_probe_requests.is_multiple_of(1024) {
-                    tracing::warn!(
-                        dropped = self.dropped_probe_requests,
-                        "race-kperf probe queue saturated; dropping probe requests"
-                    );
-                }
-            }
-        }
+        self.drain_probe_results();
         self.inner.on_sample(sample);
     }
 
     fn on_binary_loaded(&mut self, ev: BinaryLoadedEvent<'_>) {
+        self.drain_probe_results();
         self.inner.on_binary_loaded(ev);
     }
 
     fn on_binary_unloaded(&mut self, ev: BinaryUnloadedEvent<'_>) {
+        self.drain_probe_results();
         self.inner.on_binary_unloaded(ev);
     }
 
     fn on_thread_name(&mut self, ev: ThreadNameEvent<'_>) {
+        self.drain_probe_results();
         self.inner.on_thread_name(ev);
     }
 
     fn on_jitdump(&mut self, ev: JitdumpEvent<'_>) {
+        self.drain_probe_results();
         self.inner.on_jitdump(ev);
     }
 
     fn on_kallsyms(&mut self, data: &[u8]) {
+        self.drain_probe_results();
         self.inner.on_kallsyms(data);
+        self.drain_probe_results();
     }
 
     fn on_wakeup(&mut self, event: WakeupEvent<'_>) {
+        self.drain_probe_results();
         self.inner.on_wakeup(event);
     }
 
     fn on_cpu_interval(&mut self, event: CpuIntervalEvent<'_>) {
+        self.drain_probe_results();
         self.inner.on_cpu_interval(event);
     }
 
@@ -115,45 +97,83 @@ impl<S: SampleSink> SampleSink for RaceKperfSink<S> {
     }
 }
 
+impl<S: SampleSink> RaceKperfSink<S> {
+    fn drain_probe_results(&mut self) {
+        let Some(probe) = self.probe.as_mut() else {
+            return;
+        };
+        for result in probe.drain_results() {
+            self.inner.on_probe_result(ProbeResultEvent {
+                tid: result.tid,
+                timing: result.timing,
+                queue: result.queue,
+                mach_pc: result.pc,
+                mach_lr: result.lr,
+                mach_fp: result.fp,
+                mach_sp: result.sp,
+                mach_walked: &result.walked,
+                used_framehop: false,
+            });
+        }
+    }
+}
+
 struct RaceProbeWorker {
-    req_tx: SyncSender<ProbeRequest>,
+    trigger: RaceProbeTrigger,
     res_rx: Receiver<ProbeSnapshotWithKey>,
 }
 
 impl RaceProbeWorker {
     fn new(task: mach_port_t) -> Self {
-        let (req_tx, req_rx) = mpsc::sync_channel::<ProbeRequest>(PROBE_REQ_QUEUE);
-        let (res_tx, res_rx) = mpsc::sync_channel::<ProbeSnapshotWithKey>(PROBE_RES_QUEUE);
+        let requests = Arc::new(LatestProbeRequests::default());
+        let worker_requests = requests.clone();
+        let (res_tx, res_rx) = mpsc::channel::<ProbeSnapshotWithKey>();
         std::thread::Builder::new()
             .name("stax-race-probe".to_owned())
             .spawn(move || {
                 let mut probe = RaceProbe::new(task);
-                while let Ok(req) = req_rx.recv() {
-                    if let Some(snapshot) = probe.probe_sample(req.tid, req.kperf_ts) {
-                        let out = ProbeSnapshotWithKey {
-                            tid: req.tid,
+                while let Some(batch) = worker_requests.take_all() {
+                    let worker_batch_len = batch.len() as u32;
+                    for req in batch {
+                        let timing = ProbeTiming {
                             kperf_ts: req.kperf_ts,
-                            done_ticks: snapshot.done_ticks,
-                            pc: snapshot.pc,
-                            lr: snapshot.lr,
-                            fp: snapshot.fp,
-                            sp: snapshot.sp,
-                            walked: snapshot.walked,
+                            enqueued: req.enqueued_ticks,
+                            worker_started: unsafe { mach_absolute_time() },
+                            ..ProbeTiming::default()
                         };
-                        let _ = res_tx.try_send(out);
+                        if let Some(snapshot) = probe.probe_sample(req.tid, timing) {
+                            let out = ProbeSnapshotWithKey {
+                                tid: req.tid,
+                                timing: snapshot.timing,
+                                queue: ProbeQueueStats {
+                                    coalesced_requests: req.coalesced_requests,
+                                    worker_batch_len,
+                                },
+                                pc: snapshot.pc,
+                                lr: snapshot.lr,
+                                fp: snapshot.fp,
+                                sp: snapshot.sp,
+                                walked: snapshot.walked,
+                            };
+                            if res_tx.send(out).is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             })
             .expect("spawn race probe worker");
-        Self { req_tx, res_rx }
+        Self {
+            trigger: RaceProbeTrigger {
+                requests,
+                coalesced_probe_requests: Arc::new(AtomicU64::new(0)),
+            },
+            res_rx,
+        }
     }
 
-    fn enqueue(&self, tid: u32, kperf_ts: u64) -> bool {
-        match self.req_tx.try_send(ProbeRequest { tid, kperf_ts }) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => false,
-            Err(TrySendError::Disconnected(_)) => false,
-        }
+    fn trigger(&self) -> RaceProbeTrigger {
+        self.trigger.clone()
     }
 
     fn drain_results(&self) -> Vec<ProbeSnapshotWithKey> {
@@ -162,6 +182,98 @@ impl RaceProbeWorker {
             out.push(snapshot);
         }
         out
+    }
+}
+
+impl Drop for RaceProbeWorker {
+    fn drop(&mut self) {
+        self.trigger.close();
+    }
+}
+
+#[derive(Clone)]
+pub struct RaceProbeTrigger {
+    requests: Arc<LatestProbeRequests>,
+    coalesced_probe_requests: Arc<AtomicU64>,
+}
+
+impl RaceProbeTrigger {
+    /// Enqueue immediately when the raw kdebug stream shows a kperf
+    /// sample start. Returns true when this replaced an older pending
+    /// request for the same tid; that is intentional because
+    /// race-kperf wants fresh observations, not FIFO delivery.
+    pub fn enqueue(&self, tid: u32, kperf_ts: u64) -> bool {
+        let replaced = self.requests.push(ProbeRequest {
+            tid,
+            kperf_ts,
+            enqueued_ticks: unsafe { mach_absolute_time() },
+            coalesced_requests: 0,
+        });
+        if replaced {
+            let coalesced = self
+                .coalesced_probe_requests
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if coalesced.is_multiple_of(1024) {
+                tracing::warn!(
+                    coalesced,
+                    "race-kperf probe worker lagging; replacing stale pending requests"
+                );
+            }
+        }
+        replaced
+    }
+
+    fn close(&self) {
+        self.requests.close();
+    }
+}
+
+#[derive(Default)]
+struct LatestProbeRequests {
+    state: Mutex<LatestProbeState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct LatestProbeState {
+    pending: HashMap<u32, ProbeRequest>,
+    closed: bool,
+}
+
+impl LatestProbeRequests {
+    fn push(&self, request: ProbeRequest) -> bool {
+        let mut state = self.state.lock().expect("race probe request lock poisoned");
+        let mut request = request;
+        let replaced = if let Some(previous) = state.pending.remove(&request.tid) {
+            request.coalesced_requests = previous.coalesced_requests.saturating_add(1);
+            true
+        } else {
+            false
+        };
+        state.pending.insert(request.tid, request);
+        self.ready.notify_one();
+        replaced
+    }
+
+    fn take_all(&self) -> Option<Vec<ProbeRequest>> {
+        let mut state = self.state.lock().expect("race probe request lock poisoned");
+        while state.pending.is_empty() && !state.closed {
+            state = self
+                .ready
+                .wait(state)
+                .expect("race probe request lock poisoned");
+        }
+        if state.pending.is_empty() && state.closed {
+            return None;
+        }
+        Some(state.pending.drain().map(|(_, request)| request).collect())
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().expect("race probe request lock poisoned");
+        state.closed = true;
+        self.ready.notify_all();
     }
 }
 
@@ -178,9 +290,10 @@ impl RaceProbe {
         }
     }
 
-    fn probe_sample(&mut self, tid: u32, _kperf_ts: u64) -> Option<ProbeSnapshot> {
+    fn probe_sample(&mut self, tid: u32, mut timing: ProbeTiming) -> Option<ProbeSnapshot> {
         let thread = self.threads.get(tid)?;
-        match self.probe_thread(thread) {
+        timing.thread_lookup_done = unsafe { mach_absolute_time() };
+        match self.probe_thread(thread, timing) {
             Ok(snapshot) => Some(snapshot),
             Err(ProbeError::Kernel { op, kr }) => {
                 tracing::debug!(tid, op, kr, "race-kperf probe failed");
@@ -190,7 +303,11 @@ impl RaceProbe {
         }
     }
 
-    fn probe_thread(&self, thread: thread_act_t) -> Result<ProbeSnapshot, ProbeError> {
+    fn probe_thread(
+        &self,
+        thread: thread_act_t,
+        mut timing: ProbeTiming,
+    ) -> Result<ProbeSnapshot, ProbeError> {
         let kr = unsafe { thread_suspend(thread) };
         if kr != KERN_SUCCESS {
             return Err(ProbeError::Kernel {
@@ -206,8 +323,9 @@ impl RaceProbe {
                 return Err(err);
             }
         };
-        let done_ticks = unsafe { mach_absolute_time() };
+        timing.state_done = unsafe { mach_absolute_time() };
         let resume_kr = unsafe { thread_resume(thread) };
+        timing.resume_done = unsafe { mach_absolute_time() };
         if resume_kr != KERN_SUCCESS {
             return Err(ProbeError::Kernel {
                 op: "thread_resume",
@@ -216,8 +334,9 @@ impl RaceProbe {
         }
 
         let walked = fp_walk(self.task, state.fp);
+        timing.walk_done = unsafe { mach_absolute_time() };
         Ok(ProbeSnapshot {
-            done_ticks,
+            timing,
             pc: strip_ptr(state.pc),
             lr: strip_ptr(state.lr),
             fp: strip_ptr(state.fp),
@@ -228,7 +347,7 @@ impl RaceProbe {
 }
 
 struct ProbeSnapshot {
-    done_ticks: u64,
+    timing: ProbeTiming,
     pc: u64,
     lr: u64,
     fp: u64,
@@ -239,12 +358,14 @@ struct ProbeSnapshot {
 struct ProbeRequest {
     tid: u32,
     kperf_ts: u64,
+    enqueued_ticks: u64,
+    coalesced_requests: u64,
 }
 
 struct ProbeSnapshotWithKey {
     tid: u32,
-    kperf_ts: u64,
-    done_ticks: u64,
+    timing: ProbeTiming,
+    queue: ProbeQueueStats,
     pc: u64,
     lr: u64,
     fp: u64,
