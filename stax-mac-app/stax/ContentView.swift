@@ -3,7 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var model = AppModel()
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {

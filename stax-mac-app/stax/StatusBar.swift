@@ -24,8 +24,10 @@ struct StatusBar: View {
 }
 
 func formatDuration(_ seconds: TimeInterval) -> String {
-    if seconds < 1 {
-        return String(format: "%.1fms", seconds * 1000)
-    }
+    let abs = Swift.abs(seconds)
+    if abs == 0 { return "0" }
+    if abs < 1e-6 { return String(format: "%.0fns", seconds * 1_000_000_000) }
+    if abs < 1e-3 { return String(format: "%.1f\u{00B5}s", seconds * 1_000_000) }
+    if abs < 1    { return String(format: "%.1fms", seconds * 1_000) }
     return String(format: "%.2fs", seconds)
 }
