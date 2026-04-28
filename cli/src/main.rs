@@ -336,6 +336,9 @@ impl RawMode {
         let mut raw = original;
         unsafe {
             libc::cfmakeraw(&mut raw);
+            // Keep Ctrl-C/Ctrl-\ signal generation enabled so the
+            // CLI can still be interrupted while in terminal relay mode.
+            raw.c_lflag |= libc::ISIG;
         }
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(std::io::Error::last_os_error());
