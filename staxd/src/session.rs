@@ -43,9 +43,22 @@ pub async fn run(
     let _ = kdebug::reset();
 
     setup_kperf(&fw, &config)?;
+
+    // Spawn the probe BEFORE enabling kdebug. probe::spawn does
+    // the (slow) framehop unwinder build — image enumeration +
+    // Mach-O parsing — which can take 100ms+ on a target with
+    // many dylibs. If we let kdebug start emitting records during
+    // that window, they sit in the ringbuffer with their original
+    // kperf_ts and the probe worker chews through them serially
+    // afterwards, producing drift readings of 100ms+ on the
+    // *first* samples of every recording (warmup artefact, not
+    // steady state). Spawning first means kperf samples only
+    // start flowing when the probe is already consuming.
+    let probe_chan = probe::spawn(config.target_pid);
+
     setup_kdebug(&config)?;
 
-    let result = drain(&fw, &config, records).await;
+    let result = drain(&fw, &config, records, probe_chan).await;
 
     teardown(&fw);
     result
@@ -132,6 +145,7 @@ async fn drain(
     _fw: &Frameworks,
     config: &SessionConfig,
     records: vox::Tx<KdBufBatch>,
+    mut probe_chan: Option<probe::ProbeChannel>,
 ) -> Result<RecordSummary, RecordError> {
     let session_start = Instant::now();
     // Match recorder.rs:377: drain at 2x the sample period so the
@@ -143,14 +157,11 @@ async fn drain(
     let mut buf: Vec<KdBuf> = vec![empty_kdbuf(); config.buf_records as usize];
     let mut total_drained: u64 = 0;
 
-    // Race-against-return measurement probe. The probe walks the
-    // suspended thread's stack via framehop and ships the result
-    // back over a channel for inclusion in the next KdBufBatch —
-    // client-side pipeline correlates with the kperf sample by
-    // (tid, kperf_ts_mach) and runs the existing symbolicator.
-    // If spawn returns None (task_for_pid denied), recording
-    // proceeds without probe results.
-    let mut probe_chan = probe::spawn(config.target_pid);
+    // Race-against-return measurement probe ships its results
+    // back through `probe_chan.results`, which we drain into each
+    // KdBufBatch. Spawning happened in run() *before* setup_kdebug
+    // so the probe worker is already up by the time kperf starts
+    // emitting records.
     let mut sample_parser = SampleBoundaryParser::default();
     let mut probe_request_drops: u64 = 0;
     let mut probe_results_buf: Vec<staxd_proto::ProbeResultWire> = Vec::new();
