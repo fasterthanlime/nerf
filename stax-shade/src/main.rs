@@ -56,6 +56,8 @@
 
 #![cfg(target_os = "macos")]
 
+mod walker;
+
 use std::process::ExitCode;
 
 use facet::Facet;
