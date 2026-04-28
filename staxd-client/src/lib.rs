@@ -268,12 +268,10 @@ where
     // next send fails with Transport, its drain loop breaks, kperf
     // teardown runs, record() returns with a RecordSummary or error.
     drop(rx);
-    // The stream is lossy sample data. Do not let a stale local
-    // parser backlog keep the authoritative run lifecycle open after
-    // the daemon has stopped and the target has exited.
-    abort_worker_backlog.store(true, Ordering::Release);
-    // Tell the worker we're done so it can finish and drop the sink,
-    // which closes the ingest channel on the server.
+    // Tell the worker we're done so it can flush queued records and
+    // drop the sink, which closes the ingest channel on the server.
+    // If the parser backlog is pathological, bound shutdown latency
+    // and then ask the worker to skip whatever remains.
     drop(worker_tx);
 
     let rpc_result = record_fut
@@ -287,24 +285,42 @@ where
         ),
         Err(vox::VoxError::User(e)) => {
             warn!("staxd-client: daemon returned error: {e:?}");
-            // Still join the worker so it can flush+finish.
-            let _ = tokio::task::spawn_blocking(move || worker_handle.join()).await;
+            let _ = join_worker_with_deadline(worker_handle, abort_worker_backlog).await;
             return Err(Error::Rpc(e));
         }
         Err(e) => {
-            let _ = tokio::task::spawn_blocking(move || worker_handle.join()).await;
+            let _ = join_worker_with_deadline(worker_handle, abort_worker_backlog).await;
             return Err(Error::VoxCall(format!("record rpc: {e:?}")));
         }
     }
 
-    // Wait for the worker to flush remaining batches and call
-    // pipeline.finish(sink). join() is sync — defer to spawn_blocking
-    // so we don't park a tokio worker.
-    let _ = tokio::task::spawn_blocking(move || worker_handle.join())
+    join_worker_with_deadline(worker_handle, abort_worker_backlog)
         .await
         .map_err(|e| Error::VoxCall(format!("join worker: {e:?}")))?;
 
     info!("staxd-client: locally drained {total_drained} records");
+    Ok(())
+}
+
+async fn join_worker_with_deadline<S>(
+    worker_handle: std::thread::JoinHandle<S>,
+    abort_worker_backlog: Arc<AtomicBool>,
+) -> Result<(), tokio::task::JoinError> {
+    const WORKER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
+    let mut join = tokio::task::spawn_blocking(move || worker_handle.join());
+    match tokio::time::timeout(WORKER_SHUTDOWN_BUDGET, &mut join).await {
+        Ok(result) => {
+            let _ = result?;
+        }
+        Err(_) => {
+            warn!(
+                "staxd-client-worker: shutdown exceeded {:?}; dropping remaining queued batches",
+                WORKER_SHUTDOWN_BUDGET
+            );
+            abort_worker_backlog.store(true, Ordering::Release);
+            let _ = join.await?;
+        }
+    }
     Ok(())
 }
 
