@@ -143,13 +143,17 @@ async fn drain(
     let mut buf: Vec<KdBuf> = vec![empty_kdbuf(); config.buf_records as usize];
     let mut total_drained: u64 = 0;
 
-    // Race-against-return measurement probe. Side-channel only —
-    // never blocks the drain loop. If spawn returns None (e.g.
-    // task_for_pid failed) we just don't probe; everything else
-    // proceeds as before.
-    let probe_tx = probe::spawn(config.target_pid);
+    // Race-against-return measurement probe. The probe walks the
+    // suspended thread's stack via framehop and ships the result
+    // back over a channel for inclusion in the next KdBufBatch —
+    // client-side pipeline correlates with the kperf sample by
+    // (tid, kperf_ts_mach) and runs the existing symbolicator.
+    // If spawn returns None (task_for_pid denied), recording
+    // proceeds without probe results.
+    let mut probe_chan = probe::spawn(config.target_pid);
     let mut sample_parser = SampleBoundaryParser::default();
-    let mut probe_drops: u64 = 0;
+    let mut probe_request_drops: u64 = 0;
+    let mut probe_results_buf: Vec<staxd_proto::ProbeResultWire> = Vec::new();
 
     loop {
         tokio::time::sleep(drain_period).await;
@@ -163,18 +167,21 @@ async fn drain(
         };
         total_drained += n as u64;
 
-        // Side-instrumentation: scan the batch for completed
-        // samples and fire one probe per. Cost is a tight match
-        // on debugid + a try_send per closed sample (capacity 4096
-        // — typical drain returns ~2k records covering ~50 samples).
-        if let Some(tx) = probe_tx.as_ref() {
-            let drained_at_mach = probe::mach_now();
+        // Probe path: queue a request per completed sample, then
+        // drain whatever results have come back since last cycle.
+        // Costs in the drain loop are bounded — try_send per closed
+        // sample, try_recv to drain the back-channel.
+        if let Some(chan) = probe_chan.as_mut() {
             for rec in &buf[..n] {
-                if let Some(req) = sample_parser.feed(rec, drained_at_mach) {
-                    if tx.try_send(req).is_err() {
-                        probe_drops += 1;
+                if let Some(req) = sample_parser.feed(rec) {
+                    if chan.requests.try_send(req).is_err() {
+                        probe_request_drops += 1;
                     }
                 }
+            }
+            probe_results_buf.clear();
+            while let Ok(result) = chan.results.try_recv() {
+                probe_results_buf.push(result);
             }
         }
 
@@ -182,24 +189,10 @@ async fn drain(
         // as our detection of "client went away" — without it, the
         // drain loop spins forever holding ktrace ownership long
         // after the client disconnected.
-        //
-        // When the probe is enabled we still call `send`, but with
-        // an empty record list: that keeps the disconnect path
-        // working without paying serialization or moving bytes the
-        // client would just drop, so vox credit doesn't stall and
-        // probe drift stays low. (Probe was on for the latency
-        // measurement experiment; the diagnostic skip-send variant
-        // hung sessions because client-disconnect was never noticed.)
-        let batch = if probe_tx.is_some() {
-            KdBufBatch {
-                records: Vec::new(),
-                drained_at_unix_ns: unix_ns_now(),
-            }
-        } else {
-            KdBufBatch {
-                records: buf[..n].iter().map(kdbuf_to_wire).collect(),
-                drained_at_unix_ns: unix_ns_now(),
-            }
+        let batch = KdBufBatch {
+            records: buf[..n].iter().map(kdbuf_to_wire).collect(),
+            drained_at_unix_ns: unix_ns_now(),
+            probe_results: std::mem::take(&mut probe_results_buf),
         };
         if let Err(e) = records.send(batch).await {
             info!(?e, "client closed records channel; ending session");
@@ -207,13 +200,13 @@ async fn drain(
         }
     }
 
-    if probe_tx.is_some() {
+    if probe_chan.is_some() {
         info!(
-            probe_drops,
-            "probe: drained loop ended (drops = times the probe channel was full)"
+            probe_request_drops,
+            "probe: drain loop ended (request_drops = times the probe-request channel was full)"
         );
     }
-    drop(probe_tx);
+    drop(probe_chan);
 
     Ok(RecordSummary {
         records_drained: total_drained,
@@ -254,7 +247,7 @@ struct InProgress {
 }
 
 impl SampleBoundaryParser {
-    fn feed(&mut self, rec: &KdBuf, drained_at_mach: u64) -> Option<ProbeRequest> {
+    fn feed(&mut self, rec: &KdBuf) -> Option<ProbeRequest> {
         if kdbg_class(rec.debugid) != DBG_PERF {
             return None;
         }
@@ -283,9 +276,6 @@ impl SampleBoundaryParser {
                 Some(ProbeRequest {
                     tid: ip.tid,
                     kperf_ts_mach: ip.timestamp_mach,
-                    drained_at_mach,
-                    kperf_user_backtrace: ip.ustack,
-                    kperf_kstack_depth: ip.kstack_expected,
                 })
             }
             (perf::sc::CALLSTACK, perf::cs::UHDR, _) => {

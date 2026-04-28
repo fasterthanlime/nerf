@@ -14,10 +14,6 @@ path = "src/main.rs"
 staxd-proto = { path = "../staxd-proto" }
 stax-mac-kperf-sys = { version = "0.1", path = "../stax-mac-kperf-sys" }
 stax-target-images = { path = "../stax-target-images" }
-stax-mac-shared-cache = { path = "../stax-mac-shared-cache" }
-stax-mac-capture = { path = "../stax-mac-capture" }
-stax-demangle = { path = "../stax-demangle" }
-object = { version = "0.39", default-features = false, features = ["std", "read_core", "macho", "unaligned"] }
 framehop = "0.16"
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }

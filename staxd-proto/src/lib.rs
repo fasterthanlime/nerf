@@ -84,6 +84,44 @@ pub struct KdBufBatch {
     /// only for diagnostics / latency tracking; sample timestamps
     /// inside `records` are kernel mach-time, not this clock.
     pub drained_at_unix_ns: u64,
+    /// Race-against-return probe results correlated with samples in
+    /// `records` by `(tid, kperf_ts_mach)`. Empty when the probe is
+    /// disabled or `task_for_pid` failed at session start.
+    /// Symbolication happens client-side via the same path that
+    /// resolves kperf-walked stacks (one resolver, one demangler).
+    pub probe_results: Vec<ProbeResultWire>,
+}
+
+/// Per-sample race-against-return probe output: registers and
+/// stack from the suspended thread captured shortly after kperf's
+/// PMI sample landed. Pair against the kperf user_backtrace by
+/// matching `(tid, kperf_ts_mach)`.
+#[derive(Clone, Debug, Facet)]
+pub struct ProbeResultWire {
+    pub tid: u32,
+    /// Mach-tick timestamp of the kdebug record that closed the
+    /// matching kperf sample (`PERF_GEN_EVENT|FUNC_END`).
+    pub kperf_ts_mach: u64,
+    /// Mach ticks at which the probe finished
+    /// `thread_get_state` — drift from `kperf_ts_mach` is the
+    /// kernel→userspace+probe latency.
+    pub probe_done_mach: u64,
+    /// User-mode PC at suspend (PAC-stripped).
+    pub mach_pc: u64,
+    /// Link register at suspend (PAC-stripped).
+    pub mach_lr: u64,
+    /// Frame pointer at suspend.
+    pub mach_fp: u64,
+    /// Stack pointer at suspend.
+    pub mach_sp: u64,
+    /// Frames produced by walking the suspended thread (framehop
+    /// preferred; FP-walk fallback). PAC-stripped, return addresses
+    /// only — does *not* include the leaf PC.
+    pub mach_walked: Vec<u64>,
+    /// `true` if we walked via framehop (DWARF / compact unwind),
+    /// `false` if we fell back to FP-walk because the framehop
+    /// unwinder couldn't be built at session start.
+    pub used_framehop: bool,
 }
 
 /// Returned from a successfully-completed `record` call. The client
