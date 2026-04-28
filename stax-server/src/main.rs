@@ -41,7 +41,7 @@ async fn main() -> eyre::Result<()> {
         std::fs::remove_file(&socket)?;
     }
 
-    let server = ServerState::new();
+    let server = ServerState::new(socket.clone());
     server.attach_local_shared_cache();
 
     let local_listener = vox::transport::local::LocalLinkAcceptor::bind(
@@ -228,6 +228,9 @@ struct ServerState {
     paused: Arc<AtomicBool>,
     started_at_unix_ns: u64,
     next_run_id: Arc<AtomicU64>,
+    /// Local-socket path the server is listening on. Used to tell
+    /// auto-spawned stax-shade processes how to dial back in.
+    socket_path: Arc<PathBuf>,
 }
 
 struct Inner {
@@ -241,16 +244,24 @@ struct Inner {
     /// when stax-shade dials in; cleared when its session closes.
     /// One active run = at most one shade.
     active_shade: Option<ShadeInfo>,
+    /// Process handle for the auto-spawned stax-shade child. Set
+    /// when `apply_event` sees `TargetAttached` and there's no
+    /// shade yet; reaped + cleared by `stop_active` /
+    /// `finalize_run` (or when the child exits on its own and the
+    /// session-close cleanup fires). One active run = at most one
+    /// child.
+    shade_child: Option<std::process::Child>,
     history: Vec<RunSummary>,
 }
 
 impl ServerState {
-    fn new() -> Self {
+    fn new(socket_path: PathBuf) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 active: None,
                 cancel: None,
                 active_shade: None,
+                shade_child: None,
                 history: Vec::new(),
             })),
             aggregator: Arc::new(RwLock::new(Aggregator::default())),
@@ -259,6 +270,7 @@ impl ServerState {
             paused: Arc::new(AtomicBool::new(false)),
             started_at_unix_ns: now_unix_ns(),
             next_run_id: Arc::new(AtomicU64::new(1)),
+            socket_path: Arc::new(socket_path),
         }
     }
 
@@ -365,6 +377,103 @@ impl ServerState {
         }
     }
 
+    /// Spawn a `stax-shade` child process to attach to `pid`.
+    /// Stores the `Child` handle on `Inner::shade_child` so we
+    /// can reap on cleanup. Best-effort: if the binary isn't
+    /// found or `Command::spawn` fails we log and move on —
+    /// kperf-side recording keeps working, just without
+    /// framehop-accurate user stacks. The shade will dial back
+    /// in on its own and call `register_shade`, at which point
+    /// `active_shade` gets populated.
+    fn spawn_shade(&self, run_id: RunId, pid: u32) {
+        let bin = match resolve_shade_path() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "stax-shade binary not found in any of the candidate \
+                     locations; user stacks will use kperf's FP walker. \
+                     `cargo xtask install` should land it in ~/.cargo/bin/."
+                );
+                return;
+            }
+        };
+        let socket = self.socket_path.to_string_lossy().into_owned();
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg("--attach")
+            .arg(pid.to_string())
+            .arg("--server-socket")
+            .arg(&socket)
+            .arg("--run-id")
+            .arg(run_id.0.to_string())
+            // Don't inherit our stdin/out/err — the shade logs via
+            // os_log on its own subsystem; nothing useful would
+            // come out of the inherited fds. Stdin null also stops
+            // the legacy stdin-EOF park-loop from racing the vox
+            // session-close path.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(child) => {
+                tracing::info!(
+                    run_id = run_id.0,
+                    pid,
+                    shade_pid = child.id(),
+                    bin = %bin.display(),
+                    "spawned stax-shade"
+                );
+                self.inner.lock().shade_child = Some(child);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to spawn {}: {e}; user stacks will fall back to kperf's FP walker",
+                    bin.display()
+                );
+            }
+        }
+    }
+
+    /// Reap the shade child (if any), preferring a clean exit but
+    /// killing if it's still running after a brief grace period.
+    /// Called from `stop_active` and `finalize_run`. The shade is
+    /// supposed to notice its vox session close on its own; this
+    /// is the belt-and-suspenders.
+    fn reap_shade_child(&self) {
+        let mut child = match self.inner.lock().shade_child.take() {
+            Some(c) => c,
+            None => return,
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::info!(?status, "stax-shade child already exited");
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("try_wait on stax-shade child: {e}");
+                return;
+            }
+        }
+        // Give it a moment to notice the session close on its
+        // own. The shade's session is closed by the accept loop
+        // when our end of the vox connection drops — that should
+        // happen as soon as `active_shade` clears and we drop our
+        // refs. But polling here is simpler than orchestrating
+        // shutdown signals.
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+        }
+        tracing::warn!(
+            shade_pid = child.id(),
+            "stax-shade didn't exit within 1s of run end; sending SIGTERM"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// Belt-and-suspenders for the case where vox's session
     /// keepalive fails to surface a dead shade in a timely way:
     /// every few seconds, if there's an `active_shade`, check
@@ -397,6 +506,34 @@ impl ServerState {
             }
         });
     }
+}
+
+/// Find the stax-shade binary. Checks (in order):
+///   1. `STAX_SHADE_BIN` env override (used by tests + tarballs)
+///   2. `~/.cargo/bin/stax-shade` (where `cargo xtask install`
+///      drops it)
+///   3. `/usr/local/bin/stax-shade` (manual / packaged install)
+fn resolve_shade_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("STAX_SHADE_BIN") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(home)
+            .join(".cargo")
+            .join("bin")
+            .join("stax-shade");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let p = PathBuf::from("/usr/local/bin/stax-shade");
+    if p.exists() {
+        return Some(p);
+    }
+    None
 }
 
 /// Liveness check via `kill(pid, 0)`. Returns true while the
@@ -545,6 +682,11 @@ impl RunControl for ServerState {
         if let Some(cancel) = cancel {
             cancel.notify_waiters();
         }
+        // Reap the auto-spawned shade (if any). Has to happen
+        // outside the inner lock — reap_shade_child takes it
+        // again and may sleep up to 1s waiting for the child to
+        // exit on its own.
+        self.reap_shade_child();
         Ok(snapshot)
     }
 }
@@ -644,7 +786,11 @@ impl ServerState {
     /// Translate one ingest event into aggregator / binary-registry
     /// updates. Mirrors the in-process drainer in `stax-live::start`.
     fn apply_event(&self, run_id: RunId, event: IngestEvent) {
-        // Update run summary counters first (under run-lock).
+        // Update run summary counters first (under run-lock). If
+        // this is a TargetAttached we may also need to spawn the
+        // shade — defer that to *after* the lock so the spawn
+        // syscall (fork+exec) doesn't block other lock takers.
+        let mut spawn_shade_for_pid: Option<u32> = None;
         {
             let mut inner = self.inner.lock();
             let Some(active) = inner.active.as_mut() else {
@@ -658,9 +804,15 @@ impl ServerState {
                 IngestEvent::OffCpuInterval(_) => active.off_cpu_intervals += 1,
                 IngestEvent::TargetAttached { pid, .. } => {
                     active.target_pid = Some(*pid);
+                    if inner.shade_child.is_none() && inner.active_shade.is_none() {
+                        spawn_shade_for_pid = Some(*pid);
+                    }
                 }
                 _ => {}
             }
+        }
+        if let Some(pid) = spawn_shade_for_pid {
+            self.spawn_shade(run_id, pid);
         }
         match event {
             IngestEvent::Sample(s) => {
@@ -756,8 +908,6 @@ impl ServerState {
         }
         inner.cancel = None;
         // Run is over → the shade slot is no longer claimable.
-        // Same caveat as `stop_active`: the shade process itself
-        // is left to its own session-close cleanup.
         inner.active_shade = None;
         tracing::info!(
             "stax-server: run {} stopped after {} samples / {} intervals",
@@ -766,5 +916,7 @@ impl ServerState {
             summary.off_cpu_intervals
         );
         inner.history.push(summary);
+        drop(inner); // release before reaping
+        self.reap_shade_child();
     }
 }
