@@ -2233,6 +2233,7 @@ dependencies = [
  "log",
  "mach2",
  "stax-shade-proto",
+ "stax-target-images",
  "tokio",
  "tracing",
  "tracing-oslog",
@@ -2246,6 +2247,17 @@ version = "0.1.0"
 dependencies = [
  "facet",
  "vox",
+]
+
+[[package]]
+name = "stax-target-images"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "mach2",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

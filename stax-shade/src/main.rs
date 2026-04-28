@@ -146,7 +146,13 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         AttachMode::Launch(argv) => launch_suspended(argv)?,
     };
     let pid = attached.pid;
-    let _task = attached.task;
+    let task = attached.task;
+
+    // Walk the target's loaded images once to confirm the
+    // dyld-walking path works end-to-end. Subsequent commits
+    // turn this into a periodic refresh and feed each image's
+    // unwind sections to framehop.
+    log_loaded_images(task);
 
     // If a server socket was provided, dial in and register so the
     // server knows we're up and which run we belong to. When
@@ -205,6 +211,37 @@ impl PreResume {
         }
         tracing::info!("target resumed");
         Ok(())
+    }
+}
+
+/// Snapshot the target's loaded images and log a summary. Just
+/// validates the dyld walker plumbs through correctly; the real
+/// consumer (framehop unwinder seeding) lands when we wire the
+/// periodic walker loop. Errors are logged and swallowed —
+/// dyld-walk failure shouldn't kill the shade, kperf-side
+/// recording is independent.
+fn log_loaded_images(task: mach2::port::mach_port_t) {
+    let walker = stax_target_images::TargetImageWalker::new(task);
+    match walker.enumerate() {
+        Ok(images) => {
+            tracing::info!(
+                count = images.len(),
+                "dyld walk: enumerated loaded images"
+            );
+            for img in images.iter().take(8) {
+                tracing::debug!(
+                    load_address = format!("{:#x}", img.load_address),
+                    path = %img.path,
+                    "  image"
+                );
+            }
+            if images.len() > 8 {
+                tracing::debug!("  …and {} more", images.len() - 8);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("dyld walk failed: {e}");
+        }
     }
 }
 

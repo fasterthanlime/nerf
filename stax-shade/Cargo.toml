@@ -24,3 +24,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 stax-shade-proto = { path = "../stax-shade-proto" }
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
 framehop = "0.16"
+stax-target-images = { path = "../stax-target-images" }
