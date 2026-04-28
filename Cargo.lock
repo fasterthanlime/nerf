@@ -2195,6 +2195,7 @@ dependencies = [
  "mach2",
  "stax-core",
  "stax-live-proto",
+ "stax-mac-capture",
  "stax-shade-proto",
  "staxd-client",
  "tokio",

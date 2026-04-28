@@ -65,12 +65,25 @@ pub struct ShadeAck {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Facet)]
+#[repr(u8)]
+pub enum ShadeCommand {
+    /// Stop the active recording cleanly. The shade owns the
+    /// target-side recorder session, so it is responsible for asking
+    /// staxd to tear down kperf/kdebug before exiting.
+    Stop,
+}
+
 /// Server-side handshake plane. The shade dials in, calls
 /// `register_shade` once, then keeps the session open to accept
 /// reverse calls into the `Shade` service.
 #[vox::service]
 pub trait ShadeRegistry {
-    async fn register_shade(&self, info: ShadeInfo) -> Result<ShadeAck, String>;
+    async fn register_shade(
+        &self,
+        info: ShadeInfo,
+        commands: vox::Tx<ShadeCommand>,
+    ) -> Result<ShadeAck, String>;
 }
 
 /// Shade-side primitives. Stubs in this commit; implementations

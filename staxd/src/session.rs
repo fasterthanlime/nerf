@@ -8,6 +8,8 @@
 //! drained records: instead of running them through a parser and
 //! emitting `Sample`s, we ship them as-is.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
@@ -19,6 +21,7 @@ use staxd_proto::{KdBufBatch, KdBufWire, RecordError, RecordSummary, SessionConf
 pub async fn run(
     config: SessionConfig,
     records: vox::Tx<KdBufBatch>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<RecordSummary, RecordError> {
     let fw = bindings::load().map_err(map_kperf_err)?;
 
@@ -44,7 +47,7 @@ pub async fn run(
 
     setup_kdebug(&config)?;
 
-    let result = drain(&fw, &config, records).await;
+    let result = drain(&fw, &config, records, cancel).await;
 
     teardown(&fw);
     result
@@ -134,6 +137,7 @@ async fn drain(
     _fw: &Frameworks,
     config: &SessionConfig,
     records: vox::Tx<KdBufBatch>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<RecordSummary, RecordError> {
     let session_start = Instant::now();
     // Match recorder.rs:377: drain at 2x the sample period so the
@@ -145,7 +149,17 @@ async fn drain(
     let mut total_drained: u64 = 0;
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            info!("stop requested; ending kdebug drain");
+            break;
+        }
+
         tokio::time::sleep(drain_period).await;
+
+        if cancel.load(Ordering::Relaxed) {
+            info!("stop requested; ending kdebug drain");
+            break;
+        }
 
         let n = match kdebug::read_trace(&mut buf) {
             Ok(n) => n,

@@ -173,5 +173,10 @@ pub trait Staxd {
         records: vox::Tx<KdBufBatch>,
     ) -> Result<RecordSummary, RecordError>;
 
+    /// Ask the active daemon-side kperf/kdebug session to stop and
+    /// tear down. Idempotent: returns `false` when there was no active
+    /// session to cancel.
+    async fn stop_recording(&self) -> bool;
+
     async fn status(&self) -> DaemonStatus;
 }

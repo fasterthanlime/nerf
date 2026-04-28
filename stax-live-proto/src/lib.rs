@@ -960,6 +960,10 @@ pub struct RunConfig {
     /// PET sampling frequency the recorder requested, Hz. Surfaced in
     /// `RunSummary` so the UI can label samples.
     pub frequency_hz: u32,
+    /// Evaluation mode: shade probes each parsed kperf PET sample by
+    /// suspending the sampled thread and emitting a paired
+    /// `ProbeResult`. Off by default because it perturbs the target.
+    pub race_kperf: bool,
 }
 
 #[derive(Clone, Debug, Facet)]

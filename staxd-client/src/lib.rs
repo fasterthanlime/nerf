@@ -178,12 +178,14 @@ pub async fn drive_session<S: SampleSink + Send + 'static>(
     loop {
         if should_stop() {
             info!("staxd-client: stop requested");
+            let _ = client.stop_recording().await;
             break;
         }
         if let Some(d) = opts.duration
             && session_start.elapsed() >= d
         {
             info!("staxd-client: duration elapsed");
+            let _ = client.stop_recording().await;
             break;
         }
 

@@ -23,6 +23,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use eyre::{Context, Result};
@@ -159,6 +160,7 @@ struct StaxdServer {
 struct SessionInfo {
     target_pid: u32,
     started_at_unix_ns: u64,
+    cancel: Arc<AtomicBool>,
 }
 
 impl StaxdServer {
@@ -204,9 +206,11 @@ impl Staxd for StaxdServer {
             });
         }
         let started_at_unix_ns = unix_ns_now();
+        let cancel = Arc::new(AtomicBool::new(false));
         *guard = Some(SessionInfo {
             target_pid: config.target_pid,
             started_at_unix_ns,
+            cancel: cancel.clone(),
         });
         drop(guard);
 
@@ -215,7 +219,7 @@ impl Staxd for StaxdServer {
             config.target_pid, config.frequency_hz, config.buf_records
         );
 
-        let result = session::run(config, records).await;
+        let result = session::run(config, records, cancel).await;
 
         // Always release the slot. The session driver tore down kperf+
         // kdebug on its own when it returned; here we just release the
@@ -227,6 +231,18 @@ impl Staxd for StaxdServer {
             result.as_ref().map(|s| s.records_drained)
         );
         result
+    }
+
+    async fn stop_recording(&self) -> bool {
+        let Some(session) = self.session.lock().await.as_ref().cloned() else {
+            return false;
+        };
+        session.cancel.store(true, Ordering::Relaxed);
+        info!(
+            pid = session.target_pid,
+            "stop_recording requested; cancelling active kperf session"
+        );
+        true
     }
 }
 

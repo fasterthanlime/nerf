@@ -25,7 +25,7 @@ use stax_live_proto::{
     ServerStatus, StopReason, TerminalBroker, TerminalBrokerDispatcher, TerminalInput,
     TerminalOutput, WaitCondition, WaitOutcome, WireBinaryLoaded, WireBinaryUnloaded,
 };
-use stax_shade_proto::{ShadeAck, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher};
+use stax_shade_proto::{ShadeAck, ShadeCommand, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher};
 use vox::VoxListener;
 
 const DEFAULT_SOCK_NAME: &str = "stax-server.sock";
@@ -228,6 +228,7 @@ struct ServerState {
     inner: Arc<Mutex<Inner>>,
     aggregator: Arc<RwLock<Aggregator>>,
     binaries: Arc<RwLock<BinaryRegistry>>,
+    revision: Arc<AtomicU64>,
     source: Arc<Mutex<SourceResolver>>,
     paused: Arc<AtomicBool>,
     started_at_unix_ns: u64,
@@ -249,6 +250,10 @@ struct Inner {
     /// when stax-shade dials in; cleared when its session closes.
     /// One active run = at most one shade.
     active_shade: Option<ShadeInfo>,
+    /// Server->shade control channel for the active run. This is
+    /// the clean stop path: server owns run lifecycle, shade owns
+    /// target/staxd teardown.
+    active_shade_commands: Option<vox::Tx<ShadeCommand>>,
     ingest_attached: bool,
     /// Process handle for the server-spawned stax-shade child.
     /// Set by RunControl start calls; reaped + cleared by
@@ -286,12 +291,14 @@ impl ServerState {
                 active: None,
                 cancel: None,
                 active_shade: None,
+                active_shade_commands: None,
                 ingest_attached: false,
                 shade_child: None,
                 history: Vec::new(),
             })),
             aggregator: Arc::new(RwLock::new(Aggregator::default())),
             binaries: Arc::new(RwLock::new(BinaryRegistry::new())),
+            revision: Arc::new(AtomicU64::new(1)),
             source: Arc::new(Mutex::new(SourceResolver::new())),
             paused: Arc::new(AtomicBool::new(false)),
             started_at_unix_ns: now_unix_ns(),
@@ -341,6 +348,7 @@ impl ServerState {
         LiveServer {
             aggregator: self.aggregator.clone(),
             binaries: self.binaries.clone(),
+            revision: self.revision.clone(),
             source: self.source.clone(),
             paused: self.paused.clone(),
         }
@@ -350,7 +358,7 @@ impl ServerState {
     /// `ShadeRegistryImpl` (per-session wrapper) so the per-session
     /// `ShadeSlot` can be populated atomically with the
     /// server-side `active_shade`.
-    fn try_register_shade(&self, info: ShadeInfo) -> ShadeAck {
+    fn try_register_shade(&self, info: ShadeInfo, commands: vox::Tx<ShadeCommand>) -> ShadeAck {
         let mut inner = self.inner.lock();
         let Some(active) = inner.active.as_ref() else {
             return ShadeAck {
@@ -380,6 +388,7 @@ impl ServerState {
             "shade registered"
         );
         inner.active_shade = Some(info);
+        inner.active_shade_commands = Some(commands);
         ShadeAck {
             accepted: true,
             reason: None,
@@ -398,6 +407,7 @@ impl ServerState {
         {
             tracing::info!(shade_pid, "shade session closed; clearing active_shade");
             inner.active_shade = None;
+            inner.active_shade_commands = None;
         }
     }
 
@@ -413,6 +423,7 @@ impl ServerState {
         run_id: RunId,
         target: ShadeTarget,
         frequency_hz: u32,
+        race_kperf: bool,
         daemon_socket: String,
         time_limit_secs: Option<u64>,
     ) -> Result<(), String> {
@@ -469,6 +480,9 @@ impl ServerState {
             .arg(daemon_socket)
             .arg("--frequency")
             .arg(frequency_hz.to_string());
+        if race_kperf {
+            cmd.arg("--race-kperf");
+        }
         if let Some(limit) = time_limit_secs {
             cmd.arg("--time-limit").arg(limit.to_string());
         }
@@ -587,6 +601,7 @@ impl ServerState {
         summary.stopped_at_unix_ns = Some(now_unix_ns());
         inner.cancel = None;
         inner.active_shade = None;
+        inner.active_shade_commands = None;
         inner.ingest_attached = false;
         inner.history.push(summary);
         self.terminal.lock().pending.remove(&run_id.0);
@@ -619,6 +634,7 @@ impl ServerState {
                             "shade pid no longer alive; clearing active_shade"
                         );
                         inner.active_shade = None;
+                        inner.active_shade_commands = None;
                     }
                 }
             }
@@ -640,6 +656,7 @@ impl ServerState {
                     }
                     inner.cancel = None;
                     inner.active_shade = None;
+                    inner.active_shade_commands = None;
                     inner.ingest_attached = false;
                     inner.shade_child.take()
                 }
@@ -677,6 +694,7 @@ impl ServerState {
 
         *self.aggregator.write() = Aggregator::default();
         *self.binaries.write() = BinaryRegistry::new();
+        self.bump_revision();
         self.attach_local_shared_cache();
 
         tracing::info!(
@@ -730,6 +748,10 @@ impl ServerState {
             drop(events);
             state.finalize_run(id, StopReason::TargetExited);
         });
+    }
+
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::Release);
     }
 
     fn attach_terminal_channels(
@@ -827,6 +849,7 @@ impl ServerState {
         summary.stopped_at_unix_ns = Some(now_unix_ns());
         inner.cancel = None;
         inner.active_shade = None;
+        inner.active_shade_commands = None;
         inner.ingest_attached = false;
         inner.shade_child = None;
         inner.history.push(summary);
@@ -974,11 +997,13 @@ impl RunControl for ServerState {
         time_limit_secs: Option<u64>,
     ) -> Result<RunId, String> {
         let frequency_hz = config.frequency_hz;
+        let race_kperf = config.race_kperf;
         let (run_id, _) = self.begin_run(config)?;
         if let Err(e) = self.spawn_shade(
             run_id,
             ShadeTarget::Attach(pid),
             frequency_hz,
+            race_kperf,
             daemon_socket,
             time_limit_secs,
         ) {
@@ -998,6 +1023,7 @@ impl RunControl for ServerState {
             return Err("launch command is empty".to_owned());
         }
         let frequency_hz = request.config.frequency_hz;
+        let race_kperf = request.config.race_kperf;
         let daemon_socket = request.daemon_socket.clone();
         let time_limit_secs = request.time_limit_secs;
         let (run_id, _) = self.begin_run(request.config.clone())?;
@@ -1012,6 +1038,7 @@ impl RunControl for ServerState {
             run_id,
             ShadeTarget::Launch(request),
             frequency_hz,
+            race_kperf,
             daemon_socket,
             time_limit_secs,
         ) {
@@ -1069,7 +1096,7 @@ impl RunControl for ServerState {
         // from `active` to `history` once its Rx is closed; we
         // return the snapshot we just produced so the caller has
         // something to print without waiting on the recorder.
-        let (snapshot, cancel) = {
+        let (snapshot, cancel, shade_commands) = {
             let mut inner = self.inner.lock();
             let snapshot = match inner.active.as_mut() {
                 Some(summary) => {
@@ -1088,9 +1115,15 @@ impl RunControl for ServerState {
             // tidier to actively detach via the Shade trait once
             // we have a shutdown method on it; for now best-effort.
             inner.active_shade = None;
+            let shade_commands = inner.active_shade_commands.take();
             inner.ingest_attached = false;
-            (snapshot, inner.cancel.take())
+            (snapshot, inner.cancel.take(), shade_commands)
         };
+        if let Some(commands) = shade_commands
+            && let Err(e) = commands.send(ShadeCommand::Stop).await
+        {
+            tracing::warn!("failed to send stop command to shade: {e:?}");
+        }
         if let Some(cancel) = cancel {
             cancel.notify_waiters();
         }
@@ -1114,8 +1147,12 @@ struct ShadeRegistryImpl {
 }
 
 impl ShadeRegistry for ShadeRegistryImpl {
-    async fn register_shade(&self, info: ShadeInfo) -> Result<ShadeAck, String> {
-        let ack = self.server.try_register_shade(info.clone());
+    async fn register_shade(
+        &self,
+        info: ShadeInfo,
+        commands: vox::Tx<ShadeCommand>,
+    ) -> Result<ShadeAck, String> {
+        let ack = self.server.try_register_shade(info.clone(), commands);
         if ack.accepted {
             *self.shade_slot.lock() = Some(info.shade_pid);
         }
@@ -1179,7 +1216,7 @@ impl RunIngest for ServerState {
         binaries: Vec<WireBinaryUnloaded>,
     ) -> Result<(), String> {
         for binary in binaries {
-            self.apply_binary_unloaded(run_id, binary)?;
+            self.apply_binary_unloaded(run_id, binary.base_avma)?;
         }
         Ok(())
     }
@@ -1215,6 +1252,7 @@ impl ServerState {
             active.target_pid = Some(pid);
         }
         self.binaries.write().set_target(pid, task_port);
+        self.bump_revision();
         Ok(())
     }
 
@@ -1261,16 +1299,17 @@ impl ServerState {
                 "stax-server: registered binary"
             );
         }
+        self.bump_revision();
         Ok(())
     }
 
-    fn apply_binary_unloaded(&self, run_id: RunId, b: WireBinaryUnloaded) -> Result<(), String> {
+    fn apply_binary_unloaded(&self, run_id: RunId, base_avma: u64) -> Result<(), String> {
         self.ensure_active_run(run_id)?;
         tracing::debug!(
-            path = %b.path,
-            base_avma = format_args!("{:#x}", b.base_avma),
+            base_avma = format_args!("{base_avma:#x}"),
             "retaining unloaded binary mapping for historical samples"
         );
+        self.bump_revision();
         Ok(())
     }
 
@@ -1309,6 +1348,7 @@ impl ServerState {
                         branch_mispreds: s.branch_mispreds,
                     },
                 );
+                self.bump_revision();
             }
             IngestEvent::OnCpuInterval(i) => {
                 self.aggregator.write().record_interval(
@@ -1317,6 +1357,7 @@ impl ServerState {
                     i.end_ns,
                     IntervalKind::OnCpu,
                 );
+                self.bump_revision();
             }
             IngestEvent::OffCpuInterval(i) => {
                 let stack = i.stack.into_boxed_slice();
@@ -1331,6 +1372,7 @@ impl ServerState {
                         waker_user_stack,
                     },
                 );
+                self.bump_revision();
             }
             IngestEvent::Wakeup(w) => {
                 self.aggregator.write().record_wakeup(
@@ -1340,9 +1382,11 @@ impl ServerState {
                     w.waker_user_stack,
                     w.waker_kernel_stack,
                 );
+                self.bump_revision();
             }
             IngestEvent::ThreadName { tid, name, .. } => {
                 self.aggregator.write().set_thread_name(tid, name);
+                self.bump_revision();
             }
             IngestEvent::BinaryLoaded(b) => {
                 if let Err(e) = self.apply_binary_loaded(run_id, b) {
@@ -1350,7 +1394,7 @@ impl ServerState {
                 }
             }
             IngestEvent::BinaryUnloaded(b) => {
-                if let Err(e) = self.apply_binary_unloaded(run_id, b) {
+                if let Err(e) = self.apply_binary_unloaded(run_id, b.base_avma) {
                     tracing::warn!("channel BinaryUnloaded ignored: {e}");
                 }
             }
@@ -1373,6 +1417,7 @@ impl ServerState {
                         mach_walked: p.mach_walked.into_boxed_slice(),
                         used_framehop: p.used_framehop,
                     });
+                self.bump_revision();
             }
         }
     }
@@ -1398,6 +1443,7 @@ impl ServerState {
         inner.cancel = None;
         // Run is over → the shade slot is no longer claimable.
         inner.active_shade = None;
+        inner.active_shade_commands = None;
         inner.ingest_attached = false;
         tracing::info!(
             "stax-server: run {} stopped after {} samples / {} intervals",

@@ -23,6 +23,7 @@ figue = { version = "2.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 stax-shade-proto = { path = "../stax-shade-proto" }
 stax-core = { path = "..", default-features = false }
+stax-mac-capture = { path = "../stax-mac-capture" }
 stax-live-proto = { path = "../stax-live-proto" }
 staxd-client = { path = "../staxd-client" }
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }

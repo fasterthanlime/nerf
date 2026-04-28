@@ -109,6 +109,7 @@ async fn run_record_async(args: RecordArgs) -> Result<(), Box<dyn Error>> {
     let config = stax_live_proto::RunConfig {
         label,
         frequency_hz: args.frequency,
+        race_kperf: args.race_kperf,
     };
 
     let mut terminal_relay = None;

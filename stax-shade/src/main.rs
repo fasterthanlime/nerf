@@ -55,8 +55,11 @@
 
 #![cfg(target_os = "macos")]
 
+mod probe;
+
 use std::os::fd::RawFd;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -65,7 +68,7 @@ use facet::Facet;
 use figue as args;
 use stax_core::cmd_record_mac::LiveOnlySink;
 use stax_live_proto::{TerminalBrokerClient, TerminalInput, TerminalOutput, TerminalSize};
-use stax_shade_proto::{ShadeAck, ShadeCapabilities, ShadeInfo, ShadeRegistryClient};
+use stax_shade_proto::{ShadeAck, ShadeCapabilities, ShadeCommand, ShadeInfo, ShadeRegistryClient};
 
 #[derive(Facet, Debug)]
 struct Cli {
@@ -95,6 +98,11 @@ struct Cli {
     /// Stop sampling after this many seconds. Unlimited by default.
     #[facet(args::named, default)]
     time_limit: Option<u64>,
+
+    /// Evaluation mode: for each parsed kperf sample, suspend that
+    /// exact Mach thread and emit a paired probe result.
+    #[facet(args::named, default)]
+    race_kperf: bool,
 
     /// Working directory to use when launching a target.
     #[facet(args::named, default)]
@@ -202,6 +210,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
                 socket,
                 stax_live_proto::RunId(run_id),
                 pid,
+                task,
                 attached.pre_resume,
                 terminal,
                 launched_pid,
@@ -230,11 +239,12 @@ async fn run_recording(
     server_socket: &str,
     run_id: stax_live_proto::RunId,
     pid: u32,
+    task: mach2::port::mach_port_t,
     pre_resume: Option<PreResume>,
     terminal: Option<Pty>,
     launched_pid: Option<u32>,
 ) -> eyre::Result<()> {
-    let _server_client = register_with_server(server_socket, run_id.0, pid).await?;
+    let (_server_client, mut commands) = register_with_server(server_socket, run_id.0, pid).await?;
     let (ingest_sink, forwarder) =
         stax_core::ingest_sink::connect_to_existing_run(server_socket, run_id).await?;
     let terminal_pump = match terminal {
@@ -245,6 +255,12 @@ async fn run_recording(
     let sink = LiveOnlySink::new(Some(Box::new(ingest_sink)));
     sink.notify_target_attached(pid);
     let stop_via_sink = sink.live_sink_stop_flag();
+    let sink = if cli.race_kperf {
+        tracing::info!("race-kperf probe enabled");
+        probe::RaceKperfSink::enabled(task, sink)
+    } else {
+        probe::RaceKperfSink::disabled(sink)
+    };
 
     if let Some(pre_resume) = pre_resume {
         pre_resume.resume()?;
@@ -258,6 +274,34 @@ async fn run_recording(
         ..Default::default()
     };
 
+    let server_stop_requested = Arc::new(AtomicBool::new(false));
+    let server_stop_for_task = server_stop_requested.clone();
+    tokio::spawn(async move {
+        match commands.recv().await {
+            Ok(Some(command_sref)) => {
+                let mut command = None;
+                let _ = command_sref.map(|value| {
+                    command = Some(value);
+                });
+                match command {
+                    Some(ShadeCommand::Stop) => {
+                        tracing::info!("stop requested by stax-server");
+                        server_stop_for_task.store(true, Ordering::Relaxed);
+                    }
+                    None => {}
+                }
+            }
+            Ok(None) => {
+                tracing::info!("shade command channel closed");
+                server_stop_for_task.store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!("shade command channel failed: {e:?}");
+                server_stop_for_task.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+
     tracing::info!(
         run_id = run_id.0,
         pid,
@@ -266,6 +310,9 @@ async fn run_recording(
     let child_exit = Arc::new(Mutex::new(None));
     let child_exit_for_stop = child_exit.clone();
     let result = staxd_client::drive_session(opts, sink, move || {
+        if server_stop_requested.load(Ordering::Relaxed) {
+            return true;
+        }
         if stop_via_sink() {
             return true;
         }
@@ -771,9 +818,10 @@ async fn register_with_server(
     socket: &str,
     run_id: u64,
     target_pid: u32,
-) -> eyre::Result<ShadeRegistryClient> {
+) -> eyre::Result<(ShadeRegistryClient, vox::Rx<ShadeCommand>)> {
     let url = format!("local://{socket}");
     let client: ShadeRegistryClient = vox::connect(&url).await?;
+    let (commands_to_shade, commands_from_server) = vox::channel::<ShadeCommand>();
     let info = ShadeInfo {
         run_id,
         target_pid,
@@ -787,10 +835,10 @@ async fn register_with_server(
             breakpoint_step: false,
         },
     };
-    match client.register_shade(info).await {
+    match client.register_shade(info, commands_to_shade).await {
         Ok(ShadeAck { accepted: true, .. }) => {
             tracing::info!(run_id, "registered with stax-server");
-            Ok(client)
+            Ok((client, commands_from_server))
         }
         Ok(ShadeAck {
             accepted: false,

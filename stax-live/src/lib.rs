@@ -4,6 +4,7 @@
 //! here too; that's been deleted.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -32,6 +33,11 @@ pub use binaries::{BinaryRegistry, LiveSymbolOwned, LoadedBinary};
 pub struct LiveServer {
     pub aggregator: Arc<RwLock<Aggregator>>,
     pub binaries: Arc<RwLock<BinaryRegistry>>,
+    /// Monotonic data version bumped by stax-server when the
+    /// aggregator or binary registry changes. Subscription tasks use
+    /// this to avoid rebuilding expensive views while the browser is
+    /// open but no new samples have landed.
+    pub revision: Arc<AtomicU64>,
     /// One source resolver per server. addr2line `Context` isn't `Sync`
     /// (interior `LazyCell`s), so we use a `Mutex` rather than `RwLock`.
     /// Be careful not to hold this guard across `.await`.
@@ -39,7 +45,18 @@ pub struct LiveServer {
     /// Shared with the LiveSinkImpl on the recorder side -- when set,
     /// new samples and wakeup edges get dropped before they reach
     /// the aggregator. Drives the "Pause" button in the live UI.
-    pub paused: Arc<std::sync::atomic::AtomicBool>,
+    pub paused: Arc<AtomicBool>,
+}
+
+fn should_publish_revision(revision: &AtomicU64, last_seen: &mut Option<u64>) -> bool {
+    let current = revision.load(Ordering::Acquire);
+    match *last_seen {
+        Some(last) if last == current => false,
+        _ => {
+            *last_seen = Some(current);
+            true
+        }
+    }
 }
 
 impl Profiler for LiveServer {
@@ -61,10 +78,15 @@ impl Profiler for LiveServer {
         tracing::info!(?sort, ?tid, limit, "subscribe_top: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let snapshot = {
                     let agg = aggregator.read();
                     let bins = binaries.read();
@@ -105,10 +127,15 @@ impl Profiler for LiveServer {
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
         let source = self.source.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 // Snapshot per-address stats under the lock, drop, then build.
                 let by_address = {
                     let agg = aggregator.read();
@@ -138,10 +165,15 @@ impl Profiler for LiveServer {
         tracing::info!(?tid, "subscribe_flamegraph: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let update = {
                     let agg = aggregator.read();
                     let bins = binaries.read();
@@ -170,10 +202,15 @@ impl Profiler for LiveServer {
         );
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let update = {
                     let agg = aggregator.read();
                     let bins = binaries.read();
@@ -195,10 +232,15 @@ impl Profiler for LiveServer {
     async fn subscribe_timeline(&self, tid: Option<u32>, output: vox::Tx<TimelineUpdate>) {
         tracing::info!(?tid, "subscribe_timeline: starting stream");
         let aggregator = self.aggregator.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let update = build_timeline_update(&aggregator, tid);
                 if let Err(e) = output.send(update).await {
                     tracing::info!(?tid, "subscribe_timeline: stream ended: {e:?}");
@@ -216,10 +258,15 @@ impl Profiler for LiveServer {
         tracing::info!(?wakee_tid, "subscribe_wakers: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let update = build_wakers_update(&aggregator, &binaries, wakee_tid);
                 if let Err(e) = output.send(update).await {
                     tracing::info!(?wakee_tid, "subscribe_wakers: stream ended: {e:?}");
@@ -244,10 +291,15 @@ impl Profiler for LiveServer {
         tracing::info!(?tid, %flame_key, "subscribe_intervals: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let update = {
                     let agg = aggregator.read();
                     let bins = binaries.read();
@@ -271,10 +323,15 @@ impl Profiler for LiveServer {
         let ViewParams { tid, filter } = params;
         tracing::info!(?tid, %flame_key, "subscribe_pet_samples: starting stream");
         let aggregator = self.aggregator.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let update = {
                     let agg = aggregator.read();
                     build_pet_samples_update(&agg, tid, &filter)
@@ -301,10 +358,15 @@ impl Profiler for LiveServer {
         tracing::info!(?tid, "subscribe_probe_diff: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let update = {
                     let agg = aggregator.read();
                     let bins = binaries.read();
@@ -322,10 +384,15 @@ impl Profiler for LiveServer {
         tracing::info!("subscribe_threads: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
+        let revision = self.revision.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut last_seen = None;
             loop {
                 interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
                 let update = {
                     let agg = aggregator.read();
                     let bins = binaries.read();

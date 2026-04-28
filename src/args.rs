@@ -166,6 +166,13 @@ pub struct RecordArgs {
     #[facet(args::named, args::short = 'l', default)]
     pub time_limit: Option<u64>,
 
+    /// For each parsed PET sample, have stax-shade suspend that
+    /// sampled thread and emit a paired user-stack probe. This is an
+    /// evaluation mode for kperf/probe stitching latency, not the
+    /// default profiler path.
+    #[facet(args::named, default)]
+    pub race_kperf: bool,
+
     /// Profile an existing process by PID instead of launching one.
     #[facet(args::named, args::short = 'p', default)]
     pub pid: Option<u32>,

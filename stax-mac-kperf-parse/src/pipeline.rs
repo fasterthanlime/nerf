@@ -329,6 +329,9 @@ impl Pipeline {
             });
         }
         for interval in self.offcpu.drain_pending() {
+            if !self.seen_tids.contains(&interval.tid) {
+                continue;
+            }
             match interval.kind {
                 PendingKind::OnCpu => {
                     sink.on_cpu_interval(CpuIntervalEvent {
