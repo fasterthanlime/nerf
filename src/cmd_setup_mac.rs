@@ -146,6 +146,8 @@ Press Enter to continue, or Ctrl-C to cancel."#,
     })?;
     fs::set_permissions(BINARY_INSTALL_PATH, fs::Permissions::from_mode(0o755))?;
 
+    codesign_staxd(BINARY_INSTALL_PATH)?;
+
     println!(":: writing LaunchDaemon plist -> {}", PLIST_PATH);
     fs::write(PLIST_PATH, NPERFD_LAUNCHD_PLIST).map_err(|err| {
         format!("writing {}: {err}", PLIST_PATH)
@@ -212,6 +214,55 @@ fn locate_staged_daemon() -> Result<PathBuf, Box<dyn Error>> {
             .join("\n"),
     )
     .into())
+}
+
+/// Ad-hoc codesign `staxd` at its final install path with the
+/// cs.debugger entitlement. Required so the race-against-return
+/// probe (probe.rs) can call task_for_pid on hardened-runtime
+/// targets even when running as root. Mirrors the entitlement set
+/// xtask applies to stax-shade.
+///
+/// Why here and not in `cargo xtask install`: signing the binary
+/// at one path and then `fs::copy`'ing it to another invalidates
+/// the embedded signature on macOS. Sign in place at the final
+/// destination.
+fn codesign_staxd(path: &str) -> Result<(), Box<dyn Error>> {
+    const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.debugger</key>
+	<true/>
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+</dict>
+</plist>
+"#;
+    let mut ent_path = env::temp_dir();
+    ent_path.push(format!("stax-setup-staxd-ent-{}.xml", std::process::id()));
+    fs::write(&ent_path, ENTITLEMENTS)?;
+
+    println!(":: codesigning {path} with com.apple.security.cs.debugger");
+    let status = Command::new("codesign")
+        .arg("--sign")
+        .arg("-")
+        .arg("--force")
+        .arg("--options=runtime")
+        .arg("--entitlements")
+        .arg(&ent_path)
+        .arg(path)
+        .status()?;
+
+    let _ = fs::remove_file(&ent_path);
+
+    if !status.success() {
+        return Err(format!("codesign exited with {status}").into());
+    }
+    Ok(())
 }
 
 /// When invoked via `sudo`, $SUDO_USER carries the original username.

@@ -79,16 +79,16 @@ fn install() -> Result<(), Box<dyn Error>> {
         fs::copy(&src, &dst)?;
 
         #[cfg(target_os = "macos")]
-        if bin == SHADE_BIN || bin == DAEMON_BIN {
-            // stax-shade and staxd both end up calling task_for_pid
-            // / thread_get_state on the target. shade always has —
-            // it's why this entitlement exists. staxd needs it for
-            // the race-against-return probe in session.rs: even
-            // running as root, hardened-runtime targets reject
-            // task_for_pid without cs.debugger.
+        if bin == SHADE_BIN {
+            // stax-shade is the only binary that runs from
+            // ~/.cargo/bin and needs cs.debugger. staxd also needs
+            // cs.debugger (race-against-return probe in session.rs)
+            // but it's signed at its install destination by
+            // `stax setup` — codesigning here and then fs::copy'ing
+            // to /usr/local/bin/staxd invalidates the signature.
             codesign_with_debugger(&dst)?;
         }
-        // BIN_NAME, SERVER_BIN: no codesign needed.
+        // BIN_NAME, DAEMON_BIN, SERVER_BIN: no codesign needed here.
     }
 
     #[cfg(target_os = "macos")]
