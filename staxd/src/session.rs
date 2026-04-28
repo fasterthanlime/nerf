@@ -178,19 +178,30 @@ async fn drain(
             }
         }
 
-        // Always send, even when n == 0. The empty batch is a
-        // heartbeat: it doubles as our detection of "client went
-        // away" — without it, an idle target where read_trace
-        // returns 0 records leaves us spinning in the sleep+read
-        // loop forever, holding ktrace ownership long after the
-        // client disconnected. (Empty batches are cheap on the wire
-        // and the client's process_batch is a no-op on them.)
-        let batch = KdBufBatch {
-            records: buf[..n].iter().map(kdbuf_to_wire).collect(),
-            drained_at_unix_ns: unix_ns_now(),
+        // Always send a batch, even when n == 0. The send doubles
+        // as our detection of "client went away" — without it, the
+        // drain loop spins forever holding ktrace ownership long
+        // after the client disconnected.
+        //
+        // When the probe is enabled we still call `send`, but with
+        // an empty record list: that keeps the disconnect path
+        // working without paying serialization or moving bytes the
+        // client would just drop, so vox credit doesn't stall and
+        // probe drift stays low. (Probe was on for the latency
+        // measurement experiment; the diagnostic skip-send variant
+        // hung sessions because client-disconnect was never noticed.)
+        let batch = if probe_tx.is_some() {
+            KdBufBatch {
+                records: Vec::new(),
+                drained_at_unix_ns: unix_ns_now(),
+            }
+        } else {
+            KdBufBatch {
+                records: buf[..n].iter().map(kdbuf_to_wire).collect(),
+                drained_at_unix_ns: unix_ns_now(),
+            }
         };
         if let Err(e) = records.send(batch).await {
-            // Client closed the channel — clean stop.
             info!(?e, "client closed records channel; ending session");
             break;
         }
