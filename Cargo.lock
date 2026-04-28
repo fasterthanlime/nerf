@@ -2175,6 +2175,7 @@ dependencies = [
  "stax-live-proto",
  "stax-mac-capture",
  "stax-mac-shared-cache",
+ "stax-shade-proto",
  "tokio",
  "tracing",
  "tracing-oslog",
@@ -2192,9 +2193,20 @@ dependencies = [
  "libc",
  "log",
  "mach2",
+ "stax-shade-proto",
+ "tokio",
  "tracing",
  "tracing-oslog",
  "tracing-subscriber",
+ "vox",
+]
+
+[[package]]
+name = "stax-shade-proto"
+version = "0.1.0"
+dependencies = [
+ "facet",
+ "vox",
 ]
 
 [[package]]

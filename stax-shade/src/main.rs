@@ -60,6 +60,7 @@ use std::process::ExitCode;
 
 use facet::Facet;
 use figue as args;
+use stax_shade_proto::{ShadeAck, ShadeCapabilities, ShadeInfo, ShadeRegistryClient};
 
 #[derive(Facet, Debug)]
 struct Cli {
@@ -91,7 +92,8 @@ struct Cli {
     command: Vec<String>,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     init_logging();
 
     let cli: Cli = args::Driver::new(
@@ -107,20 +109,25 @@ fn main() -> ExitCode {
     .run()
     .unwrap();
 
-    if let Err(e) = run(cli) {
+    if let Err(e) = run(cli).await {
         tracing::error!("stax-shade failed: {e:?}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-fn run(cli: Cli) -> eyre::Result<()> {
-    match (cli.attach, cli.launch, cli.command.first()) {
-        (Some(pid), false, _) => attach_running(pid),
+async fn run(cli: Cli) -> eyre::Result<()> {
+    let pid = match (cli.attach, cli.launch, cli.command.first()) {
+        (Some(pid), false, _) => pid,
         (None, true, Some(_)) => {
-            let mut iter = cli.command.into_iter();
-            let program = iter.next().expect("checked above");
-            attach_launched(program, iter.collect())
+            // Stage B doesn't implement the launch path yet — left
+            // as a hard error so we never silently fall through.
+            // Implementation sketch:
+            // posix_spawnattr_setflags(POSIX_SPAWN_START_SUSPENDED),
+            // posix_spawn, task_for_pid on the freshly-spawned pid,
+            // set up exception ports if branch-stepping is enabled,
+            // then task_resume.
+            eyre::bail!("--launch path is unimplemented (stages A/B)")
         }
         (Some(_), true, _) => {
             eyre::bail!("--attach and --launch are mutually exclusive")
@@ -131,27 +138,60 @@ fn run(cli: Cli) -> eyre::Result<()> {
         (None, false, _) => {
             eyre::bail!("specify --attach <pid> or --launch -- <argv…>")
         }
-    }
-}
+    };
 
-/// Acquire the Mach task port for an existing PID. Verifies the
-/// entitlement is wired correctly; the actual peek/poke/walk
-/// operations land in the follow-up commit.
-fn attach_running(pid: u32) -> eyre::Result<()> {
     let task = task_for_pid(pid)?;
     tracing::info!(pid, task_port = task, "attached to existing process");
-    park_until_signal();
+
+    // If a server socket was provided, dial in and register so the
+    // server knows we're up and which run we belong to. When
+    // there's no socket (manual smoke-test invocation) we just
+    // park, same as stage A.
+    if let (Some(socket), Some(run_id)) = (cli.server_socket.as_deref(), cli.run_id) {
+        register_with_server(socket, run_id, pid).await?;
+    } else {
+        tracing::warn!(
+            "no --server-socket / --run-id; running standalone — \
+             stax-server will not learn about this attachment"
+        );
+    }
+
+    park_until_signal().await;
     Ok(())
 }
 
-fn attach_launched(_program: String, _argv: Vec<String>) -> eyre::Result<()> {
-    // Stage A doesn't implement the launch path yet — left as a
-    // hard error so we never silently fall through. Implementation
-    // sketch: posix_spawnattr_setflags(POSIX_SPAWN_START_SUSPENDED),
-    // posix_spawn, task_for_pid on the freshly-spawned pid, set up
-    // exception ports if branch-stepping is enabled, then
-    // task_resume.
-    eyre::bail!("--launch path is unimplemented (stage A scaffolding)")
+async fn register_with_server(socket: &str, run_id: u64, target_pid: u32) -> eyre::Result<()> {
+    let url = format!("local://{socket}");
+    let client: ShadeRegistryClient = vox::connect(&url).await?;
+    let info = ShadeInfo {
+        run_id,
+        target_pid,
+        shade_pid: std::process::id(),
+        capabilities: ShadeCapabilities {
+            // Truthful for stage B: we have neither walker nor
+            // peek/poke wired yet, just the registration handshake.
+            // Each capability flips to true in the commit that
+            // implements its server-callable surface.
+            peek: false,
+            poke: false,
+            framehop_walker: false,
+            breakpoint_step: false,
+        },
+    };
+    match client.register_shade(info).await {
+        Ok(ShadeAck { accepted: true, .. }) => {
+            tracing::info!(run_id, "registered with stax-server");
+            Ok(())
+        }
+        Ok(ShadeAck { accepted: false, reason }) => {
+            eyre::bail!(
+                "stax-server rejected registration: {}",
+                reason.unwrap_or_else(|| "(no reason)".to_owned())
+            )
+        }
+        Err(vox::VoxError::User(msg)) => eyre::bail!("server returned error: {msg}"),
+        Err(e) => eyre::bail!("vox register_shade failed: {e:?}"),
+    }
 }
 
 fn task_for_pid(pid: u32) -> eyre::Result<mach2::port::mach_port_t> {
@@ -173,15 +213,20 @@ fn task_for_pid(pid: u32) -> eyre::Result<mach2::port::mach_port_t> {
     Ok(task)
 }
 
-/// Idle the shade until the parent (`stax-server`) closes our
-/// stdin or sends SIGTERM. In stage B this becomes a vox event
-/// loop; for now it just blocks so the process doesn't exit
-/// immediately and `cargo xtask install` can verify the binary +
-/// entitlement combo end-to-end.
-fn park_until_signal() {
-    use std::io::Read;
-    let mut sink = [0u8; 1];
-    let _ = std::io::stdin().read(&mut sink);
+/// Idle until SIGINT/SIGTERM (or stdin closes). Stage C will
+/// replace this with awaiting on the vox session's `closed()`
+/// future once the server can actually call into `Shade` and
+/// drive a real teardown.
+async fn park_until_signal() {
+    let stdin_close = tokio::task::spawn_blocking(|| {
+        use std::io::Read;
+        let mut sink = [0u8; 1];
+        let _ = std::io::stdin().read(&mut sink);
+    });
+    tokio::select! {
+        _ = stdin_close => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 fn init_logging() {

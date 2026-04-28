@@ -24,6 +24,9 @@ use stax_live_proto::{
     RunIngest, RunIngestDispatcher, RunState, RunSummary, ServerStatus, StopReason,
     WaitCondition, WaitOutcome,
 };
+use stax_shade_proto::{
+    ShadeAck, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher,
+};
 
 const DEFAULT_SOCK_NAME: &str = "stax-server.sock";
 const DEFAULT_WS_BIND: &str = "127.0.0.1:8080";
@@ -106,6 +109,10 @@ fn factory(server: ServerState) -> impl vox::ConnectionAcceptor + 'static {
                 connection.handle_with(ProfilerDispatcher::new(server.profiler()));
                 Ok(())
             }
+            "ShadeRegistry" => {
+                connection.handle_with(ShadeRegistryDispatcher::new(server.clone()));
+                Ok(())
+            }
             other => {
                 tracing::warn!("stax-server: rejecting unknown service {other:?}");
                 Err(vec![])
@@ -171,6 +178,10 @@ struct Inner {
     /// `stop_active` (which then notifies, and by the drainer
     /// itself when its Rx closes naturally).
     cancel: Option<Arc<tokio::sync::Notify>>,
+    /// Currently-attached shade, if any. Set by `register_shade`
+    /// when stax-shade dials in; cleared when its session closes.
+    /// One active run = at most one shade.
+    active_shade: Option<ShadeInfo>,
     history: Vec<RunSummary>,
 }
 
@@ -180,6 +191,7 @@ impl ServerState {
             inner: Arc::new(Mutex::new(Inner {
                 active: None,
                 cancel: None,
+                active_shade: None,
                 history: Vec::new(),
             })),
             aggregator: Arc::new(RwLock::new(Aggregator::default())),
@@ -358,6 +370,47 @@ impl RunControl for ServerState {
             cancel.notify_waiters();
         }
         Ok(snapshot)
+    }
+}
+
+impl ShadeRegistry for ServerState {
+    async fn register_shade(&self, info: ShadeInfo) -> Result<ShadeAck, String> {
+        let mut inner = self.inner.lock();
+        let active = match inner.active.as_ref() {
+            Some(a) => a,
+            None => {
+                return Ok(ShadeAck {
+                    accepted: false,
+                    reason: Some("no active run".to_owned()),
+                });
+            }
+        };
+        if active.id.0 != info.run_id {
+            return Ok(ShadeAck {
+                accepted: false,
+                reason: Some(format!(
+                    "run id mismatch: shade for {}, server's active run is {}",
+                    info.run_id, active.id.0
+                )),
+            });
+        }
+        if inner.active_shade.is_some() {
+            return Ok(ShadeAck {
+                accepted: false,
+                reason: Some("a shade is already registered for this run".to_owned()),
+            });
+        }
+        tracing::info!(
+            run_id = info.run_id,
+            target_pid = info.target_pid,
+            shade_pid = info.shade_pid,
+            "shade registered"
+        );
+        inner.active_shade = Some(info);
+        Ok(ShadeAck {
+            accepted: true,
+            reason: None,
+        })
     }
 }
 

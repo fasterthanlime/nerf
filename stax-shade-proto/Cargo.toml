@@ -1,0 +1,11 @@
+[package]
+name = "stax-shade-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+description = "Wire schema for stax-shade ↔ stax-server. One service per direction: ShadeRegistry on stax-server (the shade dials in to identify itself), Shade on stax-shade (stax-server calls peek / poke / start_walking once registered)."
+
+[dependencies]
+facet = { version = "0.46", features = ["camino", "reflect"] }
+vox = { path = "/Users/amos/bearcove/vox/rust/vox", default-features = false, features = ["runtime"] }

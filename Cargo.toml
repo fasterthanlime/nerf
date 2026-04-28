@@ -51,6 +51,7 @@ members = [
   "stax-live-proto",
   "stax-server",
   "stax-shade",
+  "stax-shade-proto",
   "stax-demangle",
   "staxd-proto",
   "staxd",
