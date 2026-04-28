@@ -490,22 +490,33 @@ pub struct ProbeDiffEntry {
     /// Recording-relative ns of the kperf sample.
     pub timestamp_ns: u64,
     /// Drift between kperf sample timestamp and probe completion,
-    /// in mach ticks (raw — UI converts via the host's timebase
-    /// or just uses it as a relative ordering).
-    pub drift_mach: i64,
+    /// in real nanoseconds (converted via mach_timebase_info on
+    /// the server side).
+    pub drift_ns: i64,
     /// kperf's user backtrace, leaf-most first.
     pub kperf_stack: Vec<ResolvedFrame>,
+    /// kperf's kernel backtrace at PMI, leaf-most first. Empty
+    /// when kperf interrupted user code (no kstack to walk) or
+    /// when the kernel walk failed.
+    pub kperf_kernel_stack: Vec<ResolvedFrame>,
     /// Suspended-thread leaf PC + walked return addresses,
     /// leaf-most first (probe_stack[0] = mach_pc).
     pub probe_stack: Vec<ResolvedFrame>,
+    /// Synthesised stack the runtime would ship if we adopted the
+    /// race-against-return technique for this sample. Currently
+    /// = `probe_stack` when `stitchable`, otherwise empty.
+    /// Populated server-side from the same address resolver as
+    /// the other stacks so the UI can render it directly.
+    pub stitched_stack: Vec<ResolvedFrame>,
     /// How many trailing frames of kperf and probe matched after
     /// PAC-strip, comparing only the FP-walked portions.
     pub common_suffix: u32,
     /// `true` if the PAC-stripped leaf PC matched between the
     /// two views.
     pub pc_match: bool,
-    /// `true` if the PAC-stripped LR matched.
-    pub lr_match: bool,
+    /// `true` if `pc_match && common_suffix >= STITCH_MIN_SUFFIX`.
+    /// When set, `stitched_stack` is populated.
+    pub stitchable: bool,
     /// `true` if the probe walked via framehop, `false` for the
     /// FP-walk fallback.
     pub used_framehop: bool,
@@ -513,34 +524,87 @@ pub struct ProbeDiffEntry {
 
 #[derive(Clone, Debug, Facet)]
 pub struct ProbeDiffBucket {
-    /// Inclusive upper bound of the bucket (mach ticks). Last
-    /// bucket has `u64::MAX` to mean "everything above".
-    pub upper_mach: u64,
+    /// Inclusive upper bound of the bucket in nanoseconds.
+    /// Last bucket has `u64::MAX` for "everything above".
+    pub upper_ns: u64,
     pub samples: u64,
     pub pc_match: u64,
+}
+
+/// Match rate at one frame depth counted from the leaf. Index 0
+/// is the leaf PC, 1 is the first walked return address, etc.
+#[derive(Clone, Debug, Facet)]
+pub struct ProbeDiffDepthCell {
+    pub depth: u32,
+    pub matched: u64,
+    /// Number of paired samples that had a frame at this depth
+    /// in *both* stacks (i.e., both kperf and probe walked at
+    /// least `depth + 1` frames).
+    pub total: u64,
+}
+
+/// Per-thread breakdown for the probe diff.
+#[derive(Clone, Debug, Facet)]
+pub struct ProbeDiffThread {
+    pub tid: u32,
+    pub paired: u64,
+    pub pc_match: u64,
+    pub stitchable: u64,
+    pub avg_common_suffix: f32,
+    pub thread_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Facet)]
 pub struct ProbeDiffUpdate {
     pub total_kperf_samples: u64,
     pub total_probes: u64,
-    /// Number of (tid, kperf_ts) pairs where both a kperf sample
-    /// and a probe result exist.
+    /// (tid, kperf_ts) pairs where both a kperf sample and a probe
+    /// result exist.
     pub paired: u64,
-    /// Distribution of common-suffix lengths across paired
-    /// samples. Index = exact suffix length (0..=32).
+    /// kperf samples observed without a matching probe result. A
+    /// run of `kperf_only > 0` while `total_probes == 0` means the
+    /// probe is disabled or task_for_pid failed; otherwise it's a
+    /// pairing race or a probe-side drop.
+    pub kperf_only: u64,
+    /// Probe results observed without a matching kperf sample —
+    /// indicates the probe fired but the matching kperf record
+    /// was lost (rare; usually a parser truncation).
+    pub probe_only: u64,
+    /// Paired samples where kperf walked 0 user frames (parked
+    /// thread, FP=0 at PMI) but probe successfully walked ≥1.
+    /// Pure value-add over kperf alone.
+    pub probe_augmented_kperf: u64,
+    /// Paired samples where probe walked strictly deeper than
+    /// kperf (probe.len > kperf.walked.len + 1, +1 for the leaf).
+    pub probe_walked_deeper: u64,
+    /// Distribution of common-suffix lengths. Index = exact
+    /// suffix length (0..=32).
     pub common_suffix_hist: Vec<u64>,
-    /// Drift histogram bucketed by mach-tick distance between
-    /// kperf_ts and probe_done.
+    /// Match rate at each frame depth counted from the leaf.
+    /// Index 0 = leaf PC. Bounded to 32 entries.
+    pub depth_match: Vec<ProbeDiffDepthCell>,
+    /// Drift histogram in real nanoseconds.
     pub drift_buckets: Vec<ProbeDiffBucket>,
     pub pc_match: u64,
-    pub lr_match: u64,
+    /// Paired samples where `pc_match && common_suffix >=
+    /// STITCH_MIN_SUFFIX`. The "deliverable" count: how many
+    /// samples a future race-against-return shipping mode would
+    /// produce a high-confidence stitched stack for.
+    pub stitchable: u64,
     pub framehop_used: u64,
     pub fp_walk_used: u64,
+    pub threads: Vec<ProbeDiffThread>,
     /// The N most recent paired entries for drill-down. Ordered
     /// oldest → newest.
     pub recent: Vec<ProbeDiffEntry>,
 }
+
+/// Minimum common-suffix length for a paired sample to be
+/// considered stitchable. Tuned to avoid over-counting trivial
+/// matches (the bottom-most pthread/dispatch root is shared by
+/// almost everything; 3 frames means we agree on at least the
+/// dispatch worker + its caller + a real work frame).
+pub const STITCH_MIN_SUFFIX: u32 = 3;
 
 #[derive(Clone, Debug, Facet)]
 pub struct AnnotatedView {

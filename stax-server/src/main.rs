@@ -870,6 +870,7 @@ impl ServerState {
                     s.tid,
                     s.timestamp_ns,
                     &s.user_backtrace,
+                    &s.kernel_backtrace,
                     PmuSample {
                         cycles: s.cycles,
                         instructions: s.instructions,

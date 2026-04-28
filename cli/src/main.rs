@@ -12,9 +12,9 @@ use stax_core::{
     cmd_record_mac, cmd_setup_mac,
 };
 use stax_live_proto::{
-    FlameNode, FlamegraphUpdate, LiveFilter, OffCpuBreakdown, ProbeDiffUpdate, ProfilerClient,
-    RunControlClient, RunSummary, ServerStatus, ThreadsUpdate, TopSort, ViewParams, WaitCondition,
-    WaitOutcome,
+    FlameNode, FlamegraphUpdate, LiveFilter, OffCpuBreakdown, ProbeDiffEntry, ProbeDiffUpdate,
+    ProfilerClient, RunControlClient, RunSummary, ServerStatus, ThreadsUpdate, TopSort,
+    ViewParams, WaitCondition, WaitOutcome,
 };
 
 fn main_impl() -> Result<(), Box<dyn Error>> {
@@ -245,7 +245,9 @@ async fn run_top(args: TopArgs) -> Result<(), Box<dyn Error>> {
     let sort = match args.sort.as_str() {
         "self" => TopSort::BySelf,
         "total" => TopSort::ByTotal,
-        other => return Err(format!("unknown --sort value {other:?} (use `self` or `total`)").into()),
+        other => {
+            return Err(format!("unknown --sort value {other:?} (use `self` or `total`)").into());
+        }
     };
     let client: ProfilerClient = vox::connect(&url).await?;
     let entries = client
@@ -355,7 +357,11 @@ fn print_threads(update: &ThreadsUpdate, limit: u32) {
         "{:>10} {:>10} {:>10} {:>9}  tid    name",
         "on-CPU ms", "off-CPU ms", "samples", "blocked",
     );
-    let take = if limit == 0 { threads.len() } else { limit as usize };
+    let take = if limit == 0 {
+        threads.len()
+    } else {
+        limit as usize
+    };
     for t in threads.iter().take(take) {
         let off_total = off_cpu_total_ns(&t.off_cpu);
         let dominant = dominant_off_cpu_reason(&t.off_cpu);
@@ -393,50 +399,73 @@ async fn run_probe_diff(args: ProbeDiffArgs) -> Result<(), Box<dyn Error>> {
 
 fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
     println!(
-        "kperf samples : {}\nprobe results : {}\npaired        : {}",
+        "kperf samples         : {}\nprobe results         : {}\npaired                : {}",
         update.total_kperf_samples, update.total_probes, update.paired,
+    );
+    println!(
+        "kperf-only (unpaired) : {}\nprobe-only (unpaired) : {}",
+        update.kperf_only, update.probe_only,
     );
     if update.paired == 0 {
         println!("(no paired samples yet — is staxd running with the probe enabled?)");
         return;
     }
-    let pct = |n: u64| (n as f64 * 100.0 / update.paired as f64);
+    let paired_total = update.paired as f64;
+    let pct = |n: u64| n as f64 * 100.0 / paired_total;
     println!(
-        "pc_match      : {:>6}  ({:>5.1}%)",
+        "pc_match              : {:>6}  ({:>5.1}%)",
         update.pc_match,
         pct(update.pc_match)
     );
     println!(
-        "lr_match      : {:>6}  ({:>5.1}%)",
-        update.lr_match,
-        pct(update.lr_match)
+        "stitchable (>= {} suff): {:>6}  ({:>5.1}%)",
+        stax_live_proto::STITCH_MIN_SUFFIX,
+        update.stitchable,
+        pct(update.stitchable)
     );
     println!(
-        "framehop      : {:>6}  ({:>5.1}%)",
-        update.framehop_used,
-        pct(update.framehop_used)
+        "probe augments kperf  : {:>6}  ({:>5.1}%)  (kperf walked 0, probe ≥1)",
+        update.probe_augmented_kperf,
+        pct(update.probe_augmented_kperf),
     );
     println!(
-        "fp-walk       : {:>6}  ({:>5.1}%)",
-        update.fp_walk_used,
-        pct(update.fp_walk_used)
+        "probe walked deeper   : {:>6}  ({:>5.1}%)",
+        update.probe_walked_deeper,
+        pct(update.probe_walked_deeper),
+    );
+    println!(
+        "framehop / fp-walk    : {} / {}",
+        update.framehop_used, update.fp_walk_used,
     );
 
-    println!("\ncommon_suffix histogram (parent frames that survived drift):");
-    let total = update.paired.max(1);
+    println!("\ncommon_suffix histogram (deepest matching frames per pair):");
     for (k, &n) in update.common_suffix_hist.iter().enumerate() {
         if n > 0 {
-            println!("  k={k:<3} {n:>6}  ({:>5.1}%)", n as f64 * 100.0 / total as f64);
+            println!("  k={k:<3} {n:>6}  ({:>5.1}%)", n as f64 * 100.0 / paired_total);
         }
     }
 
-    println!("\ndrift histogram (kperf_ts → probe_done, paired with pc_match rate):");
+    println!("\nmatch rate by frame depth (0 = leaf):");
+    for cell in &update.depth_match {
+        let rate = if cell.total == 0 {
+            0.0
+        } else {
+            cell.matched as f64 * 100.0 / cell.total as f64
+        };
+        let bar = bar_str(rate, 24);
+        println!(
+            "  d={:<2} {:>6}/{:<6}  {:>5.1}%  {bar}",
+            cell.depth, cell.matched, cell.total, rate
+        );
+    }
+
+    println!("\ndrift histogram (kperf_ts → probe_done, with pc_match rate):");
     let mut prev = 0u64;
     for b in &update.drift_buckets {
-        let label = if b.upper_mach == u64::MAX {
-            format!(">= {}ns", fmt_ns(prev))
+        let label = if b.upper_ns == u64::MAX {
+            format!(">= {}", fmt_ns(prev))
         } else {
-            format!("{}–{}ns", fmt_ns(prev), fmt_ns(b.upper_mach))
+            format!("{}–{}", fmt_ns(prev), fmt_ns(b.upper_ns))
         };
         let rate = if b.samples == 0 {
             0.0
@@ -444,10 +473,32 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
             b.pc_match as f64 * 100.0 / b.samples as f64
         };
         println!(
-            "  {label:<24} {:>6} samples   pc_match {:>3.0}%",
+            "  {label:<22} {:>6} samples   pc_match {:>3.0}%",
             b.samples, rate
         );
-        prev = b.upper_mach;
+        prev = b.upper_ns;
+    }
+
+    if !update.threads.is_empty() {
+        println!("\ntop threads by paired count:");
+        println!(
+            "  {:>10}  {:>7}  {:>11}  {:>13}  {:>9}  name",
+            "tid", "paired", "pc_match", "stitchable", "avg-suff",
+        );
+        for t in &update.threads {
+            let name = t.thread_name.as_deref().unwrap_or("(unnamed)");
+            let denom = t.paired.max(1) as f64;
+            println!(
+                "  {:>10}  {:>7}  {:>5} {:>3.0}%  {:>7} {:>3.0}%  {:>9.2}  {name}",
+                t.tid,
+                t.paired,
+                t.pc_match,
+                t.pc_match as f64 * 100.0 / denom,
+                t.stitchable,
+                t.stitchable as f64 * 100.0 / denom,
+                t.avg_common_suffix,
+            );
+        }
     }
 
     if recent_limit == 0 {
@@ -458,26 +509,58 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
         recent_limit.min(update.recent.len() as u32)
     );
     let take = recent_limit as usize;
-    for entry in update.recent.iter().rev().take(take).collect::<Vec<_>>().iter().rev() {
+    let entries: Vec<&ProbeDiffEntry> = update
+        .recent
+        .iter()
+        .rev()
+        .take(take)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    for entry in entries {
         println!(
-            "\n  tid={} t={}ms drift={:+}ns common_suffix={} pc_match={} lr_match={} framehop={}",
+            "\n  tid={} t={}ms drift={:+}ns common_suffix={} pc_match={} stitchable={} framehop={}",
             entry.tid,
             entry.timestamp_ns / 1_000_000,
-            entry.drift_mach,
+            entry.drift_ns,
             entry.common_suffix,
             entry.pc_match,
-            entry.lr_match,
+            entry.stitchable,
             entry.used_framehop,
         );
         println!("    kperf_stack:");
         for f in &entry.kperf_stack {
             println!("      {:#018x}  {}", f.address, f.display);
         }
+        if !entry.kperf_kernel_stack.is_empty() {
+            println!("    kperf_kernel_stack:");
+            for f in &entry.kperf_kernel_stack {
+                println!("      {:#018x}  {}", f.address, f.display);
+            }
+        }
         println!("    probe_stack:");
         for f in &entry.probe_stack {
             println!("      {:#018x}  {}", f.address, f.display);
         }
+        if !entry.stitched_stack.is_empty() {
+            println!("    stitched_stack (would-ship):");
+            for f in &entry.stitched_stack {
+                println!("      {:#018x}  {}", f.address, f.display);
+            }
+        }
     }
+}
+
+/// 0..100% rendered as a 24-char bar of unicode blocks.
+fn bar_str(pct: f64, width: usize) -> String {
+    let pct = pct.clamp(0.0, 100.0);
+    let filled = (pct / 100.0 * width as f64).round() as usize;
+    let mut s = String::with_capacity(width);
+    for i in 0..width {
+        s.push(if i < filled { '█' } else { '·' });
+    }
+    s
 }
 
 fn fmt_ns(ns: u64) -> String {
@@ -561,7 +644,14 @@ fn print_flame(update: &FlamegraphUpdate, max_depth: usize, threshold_pct: f64) 
     }
     println!();
     println!("```");
-    print_flame_node(&update.root, &update.strings, total, threshold_pct, 0, max_depth);
+    print_flame_node(
+        &update.root,
+        &update.strings,
+        total,
+        threshold_pct,
+        0,
+        max_depth,
+    );
     println!("```");
 }
 
@@ -631,7 +721,14 @@ fn print_flame_node(
     let mut children: Vec<&FlameNode> = node.children.iter().collect();
     children.sort_by(|a, b| b.on_cpu_ns.cmp(&a.on_cpu_ns));
     for child in children {
-        print_flame_node(child, strings, total_ns, threshold_pct, depth + 1, max_depth);
+        print_flame_node(
+            child,
+            strings,
+            total_ns,
+            threshold_pct,
+            depth + 1,
+            max_depth,
+        );
     }
 }
 
@@ -665,9 +762,7 @@ async fn resolve_target(
         .await
         .map_err(|e| format!("{e:?}"))?;
     if entries.is_empty() {
-        return Err(
-            "no samples on the server (run a recording first, then retry)".into(),
-        );
+        return Err("no samples on the server (run a recording first, then retry)".into());
     }
     let hit = entries.iter().find(|e| {
         e.function_name
@@ -743,11 +838,6 @@ fn print_run_one_line(run: &RunSummary) {
     };
     println!(
         "  run {}  [{state}]  {}  {} kperf / {} walker / {} intervals  ({})",
-        run.id.0,
-        pid,
-        run.pet_samples,
-        run.walker_samples,
-        run.off_cpu_intervals,
-        run.label
+        run.id.0, pid, run.pet_samples, run.walker_samples, run.off_cpu_intervals, run.label
     );
 }

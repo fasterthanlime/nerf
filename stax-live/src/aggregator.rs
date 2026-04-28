@@ -142,10 +142,13 @@ impl OffCpuBreakdown {
     }
 }
 
-/// One PET stack-walk hit. Stack is leaf-first.
+/// One PET stack-walk hit. Stacks are leaf-first.
 pub struct PetSample {
     pub timestamp_ns: u64,
     pub stack: Box<[u64]>,
+    /// Kernel stack at PMI, leaf-first. Empty if kperf interrupted
+    /// user code (no kstack walked) or if the walk failed.
+    pub kernel_stack: Box<[u64]>,
     pub pmc: PmuSample,
 }
 
@@ -359,6 +362,7 @@ impl Aggregator {
         tid: u32,
         timestamp_ns: u64,
         user_addrs: &[u64],
+        kernel_addrs: &[u64],
         pmc: PmuSample,
     ) {
         self.note_timestamp(timestamp_ns);
@@ -369,6 +373,7 @@ impl Aggregator {
         stats.pet_samples.push_back(PetSample {
             timestamp_ns,
             stack: user_addrs.to_vec().into_boxed_slice(),
+            kernel_stack: kernel_addrs.to_vec().into_boxed_slice(),
             pmc,
         });
     }
