@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use stax_mac_capture::{
         BinaryLoadedEvent, BinaryUnloadedEvent, SampleEvent, SampleSink, ThreadNameEvent,
     };
-    use staxd_client::{drive_session, RemoteOptions};
+    use staxd_client::{RemoteOptions, drive_session};
 
     tracing_subscriber::fmt()
         .with_env_filter(

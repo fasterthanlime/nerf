@@ -13,10 +13,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use stax_mac_capture::proc_maps::MachOSymbol;
-use stax_mac_capture::{BinaryLoadedEvent, BinaryUnloadedEvent, SampleSink};
 use object::read::macho::MachOFile64;
 use object::{Endianness, Object, ObjectKind, ObjectSegment, ObjectSymbol};
+use stax_mac_capture::proc_maps::MachOSymbol;
+use stax_mac_capture::{BinaryLoadedEvent, BinaryUnloadedEvent, SampleSink};
 
 use stax_mac_shared_cache::SharedCache;
 
@@ -57,7 +57,10 @@ impl ImageScanner {
 
     pub fn rescan<S: SampleSink>(&mut self, pid: u32, sink: &mut S) {
         let regions = libproc::enumerate_regions(pid);
-        let exec_count = regions.iter().filter(|r| r.is_executable && !r.path.is_empty()).count();
+        let exec_count = regions
+            .iter()
+            .filter(|r| r.is_executable && !r.path.is_empty())
+            .count();
         let first_scan = self.known.is_empty();
 
         // We used to seed the dyld shared cache here — emitting one
@@ -170,7 +173,6 @@ impl ImageScanner {
             );
         }
     }
-
 }
 
 /// Try the on-disk Mach-O at `path` first; fall back to the
@@ -252,8 +254,8 @@ fn parse_disk_macho(path: &str) -> Result<ParsedMachO, String> {
         return Err("not a regular file".into());
     }
     let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
-    let file = MachOFile64::<Endianness, _>::parse(&bytes[..])
-        .map_err(|e| format!("parse: {e}"))?;
+    let file =
+        MachOFile64::<Endianness, _>::parse(&bytes[..]).map_err(|e| format!("parse: {e}"))?;
 
     let text_segment = file
         .segments()

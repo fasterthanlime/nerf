@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn idle_paths() {
         assert_eq!(classify_offcpu(Some("__psynch_cvwait")), OffCpuReason::Idle);
-        assert_eq!(classify_offcpu(Some("__workq_kernreturn")), OffCpuReason::Idle);
+        assert_eq!(
+            classify_offcpu(Some("__workq_kernreturn")),
+            OffCpuReason::Idle
+        );
         assert_eq!(classify_offcpu(Some("__ulock_wait")), OffCpuReason::Idle);
     }
 
@@ -186,7 +189,10 @@ mod tests {
 
     #[test]
     fn ipc_and_readiness() {
-        assert_eq!(classify_offcpu(Some("mach_msg2_trap")), OffCpuReason::IpcWait);
+        assert_eq!(
+            classify_offcpu(Some("mach_msg2_trap")),
+            OffCpuReason::IpcWait
+        );
         assert_eq!(classify_offcpu(Some("kevent_id")), OffCpuReason::Readiness);
         assert_eq!(classify_offcpu(Some("poll")), OffCpuReason::Readiness);
     }
@@ -194,7 +200,10 @@ mod tests {
     #[test]
     fn io_split() {
         assert_eq!(classify_offcpu(Some("read")), OffCpuReason::IoRead);
-        assert_eq!(classify_offcpu(Some("__read_nocancel")), OffCpuReason::IoRead);
+        assert_eq!(
+            classify_offcpu(Some("__read_nocancel")),
+            OffCpuReason::IoRead
+        );
         assert_eq!(classify_offcpu(Some("write")), OffCpuReason::IoWrite);
     }
 
@@ -207,10 +216,7 @@ mod tests {
             classify_offcpu(Some("my_crate::Buffer::writer_loop")),
             OffCpuReason::Other
         );
-        assert_eq!(
-            classify_offcpu(Some("std::io::write")),
-            OffCpuReason::Other
-        );
+        assert_eq!(classify_offcpu(Some("std::io::write")), OffCpuReason::Other);
     }
 
     #[test]

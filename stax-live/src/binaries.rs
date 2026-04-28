@@ -181,10 +181,7 @@ impl BinaryRegistry {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn set_macho_byte_source(
-        &mut self,
-        source: Arc<dyn stax_mac_capture::MachOByteSource>,
-    ) {
+    pub fn set_macho_byte_source(&mut self, source: Arc<dyn stax_mac_capture::MachOByteSource>) {
         self.macho_byte_source = Some(source);
     }
 
@@ -239,7 +236,11 @@ impl BinaryRegistry {
             return None;
         }
         let (_, end, by_base_idx) = idx[pos - 1];
-        if address < end { Some(by_base_idx) } else { None }
+        if address < end {
+            Some(by_base_idx)
+        } else {
+            None
+        }
     }
 
     /// True when any loaded binary has a symbol whose raw name
@@ -330,7 +331,9 @@ impl BinaryRegistry {
         // runtime mapping shifts everything by `runtime_avma -
         // text_svma`. Translate the sampled AVMA back into that
         // SVMA space to match the symbols in the LC_SYMTAB.
-        let svma = address.wrapping_sub(img.runtime_avma).wrapping_add(img.text_svma);
+        let svma = address
+            .wrapping_sub(img.runtime_avma)
+            .wrapping_add(img.text_svma);
         // Symbols are NOT sorted on the cache side — we use
         // partition_point regardless because enumerate_runtime_images
         // emits them in nlist order which is close-to-sorted, but for
@@ -434,10 +437,7 @@ impl BinaryRegistry {
         //      avma. Lets system-library disassembly work on the
         //      kperf-launch path where there's no on-disk file
         //      and AMFI denies us a task port.
-        let bytes = match image
-            .as_ref()
-            .and_then(|img| img.fetch(fn_start_svma, len))
-        {
+        let bytes = match image.as_ref().and_then(|img| img.fetch(fn_start_svma, len)) {
             Some(b) => b.to_vec(),
             None => match self.read_target_memory(base_address, len) {
                 Some(b) => b,
@@ -571,8 +571,7 @@ impl BinaryRegistry {
         let bundle = self.dyld_bundle.as_ref()?.clone()?;
         let main: &[u8] = &bundle.main;
         let sub: Vec<&[u8]> = bundle.subcaches.iter().map(|m| &m[..]).collect();
-        let cache =
-            object::read::macho::DyldCache::<object::Endianness>::parse(main, &sub).ok()?;
+        let cache = object::read::macho::DyldCache::<object::Endianness>::parse(main, &sub).ok()?;
         for image in cache.images() {
             let img_path = match image.path() {
                 Ok(p) => p,
@@ -589,7 +588,9 @@ impl BinaryRegistry {
 }
 
 fn svma_for(binary: &LoadedBinary, address: u64) -> u64 {
-    address.wrapping_sub(binary.base_avma).wrapping_add(binary.text_svma)
+    address
+        .wrapping_sub(binary.base_avma)
+        .wrapping_add(binary.text_svma)
 }
 
 fn avma_for_svma(base_avma: u64, text_svma: u64, svma: u64) -> u64 {

@@ -13,8 +13,8 @@ use stax_core::{
 };
 use stax_live_proto::{
     FlameNode, FlamegraphUpdate, LiveFilter, OffCpuBreakdown, ProbeDiffEntry, ProbeDiffUpdate,
-    ProfilerClient, RunControlClient, RunSummary, ServerStatus, ThreadsUpdate, TopSort,
-    ViewParams, WaitCondition, WaitOutcome,
+    ProfilerClient, RunControlClient, RunSummary, ServerStatus, ThreadsUpdate, TopSort, ViewParams,
+    WaitCondition, WaitOutcome,
 };
 
 fn main_impl() -> Result<(), Box<dyn Error>> {
@@ -407,7 +407,7 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
         update.kperf_only, update.probe_only,
     );
     if update.paired == 0 {
-        println!("(no paired samples yet — is staxd running with the probe enabled?)");
+        println!("(no paired samples yet — no correlated shade probe results have landed)");
         return;
     }
     let paired_total = update.paired as f64;
@@ -441,7 +441,10 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
     println!("\ncommon_suffix histogram (deepest matching frames per pair):");
     for (k, &n) in update.common_suffix_hist.iter().enumerate() {
         if n > 0 {
-            println!("  k={k:<3} {n:>6}  ({:>5.1}%)", n as f64 * 100.0 / paired_total);
+            println!(
+                "  k={k:<3} {n:>6}  ({:>5.1}%)",
+                n as f64 * 100.0 / paired_total
+            );
         }
     }
 
@@ -837,7 +840,7 @@ fn print_run_one_line(run: &RunSummary) {
         stax_live_proto::RunState::Stopped => "stopped",
     };
     println!(
-        "  run {}  [{state}]  {}  {} kperf / {} walker / {} intervals  ({})",
-        run.id.0, pid, run.pet_samples, run.walker_samples, run.off_cpu_intervals, run.label
+        "  run {}  [{state}]  {}  {} kperf / {} intervals  ({})",
+        run.id.0, pid, run.pet_samples, run.off_cpu_intervals, run.label
     );
 }

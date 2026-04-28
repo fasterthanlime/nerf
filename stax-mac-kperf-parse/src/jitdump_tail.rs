@@ -128,9 +128,7 @@ impl JitdumpTailer {
                     out.push(rec);
                 }
             } else {
-                log::warn!(
-                    "jitdump_tail: skipping record id={id} size={total_size}"
-                );
+                log::warn!("jitdump_tail: skipping record id={id} size={total_size}");
             }
             cursor += total_size;
         }

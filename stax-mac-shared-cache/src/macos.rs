@@ -6,10 +6,10 @@ use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
 use memmap2::Mmap;
-use stax_mac_capture::proc_maps::MachOSymbol;
-use stax_mac_capture::MachOByteSource;
 use object::read::macho::DyldCache;
 use object::{Endianness, Object, ObjectSegment, ObjectSymbol};
+use stax_mac_capture::proc_maps::MachOSymbol;
+use stax_mac_capture::MachOByteSource;
 
 /// Per-image symbol set returned by `lookup`. `text_svma` is in
 /// dyld-cache address space (the same space `MachOSymbol::start_svma`
@@ -78,7 +78,9 @@ impl SharedCache {
                 }
             }
         }
-        log::warn!("no dyld_shared_cache found; libsystem/CoreFoundation symbols will be unresolved");
+        log::warn!(
+            "no dyld_shared_cache found; libsystem/CoreFoundation symbols will be unresolved"
+        );
         None
     }
 
@@ -120,7 +122,9 @@ impl SharedCache {
                     let mut local: Vec<CacheRuntimeImage> = Vec::with_capacity(chunk.len());
                     for image in chunk {
                         let Ok(path) = image.path() else { continue };
-                        let Ok(file) = image.parse_object() else { continue };
+                        let Ok(file) = image.parse_object() else {
+                            continue;
+                        };
                         let Some(text) = file
                             .segments()
                             .find(|s| matches!(s.name(), Ok(Some(n)) if n == "__TEXT"))
@@ -200,9 +204,7 @@ impl SharedCache {
             let file = match image.parse_object() {
                 Ok(f) => f,
                 Err(err) => {
-                    log::debug!(
-                        "shared_cache: parse_object failed for {install_name}: {err}"
-                    );
+                    log::debug!("shared_cache: parse_object failed for {install_name}: {err}");
                     return None;
                 }
             };
@@ -283,9 +285,7 @@ fn try_open(main_path: &str) -> Result<SharedCache, String> {
     let cache: &'static DyldCache<'static, Endianness> = Box::leak(Box::new(cache));
     let runtime_slide = compute_runtime_slide(cache);
     if runtime_slide.is_none() {
-        log::warn!(
-            "shared_cache: failed to anchor runtime slide; cache images won't be emitted"
-        );
+        log::warn!("shared_cache: failed to anchor runtime slide; cache images won't be emitted");
     }
     Ok(SharedCache {
         cache,
@@ -309,7 +309,9 @@ fn compute_runtime_slide(cache: &DyldCache<'static, Endianness>) -> Option<i64> 
     let mut by_name: HashMap<String, u64> = HashMap::with_capacity(4096);
     for image in cache.images() {
         let Ok(path) = image.path() else { continue };
-        let Ok(file) = image.parse_object() else { continue };
+        let Ok(file) = image.parse_object() else {
+            continue;
+        };
         if let Some(text) = file
             .segments()
             .find(|s| matches!(s.name(), Ok(Some(n)) if n == "__TEXT"))

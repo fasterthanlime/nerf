@@ -2,8 +2,7 @@
 //!
 //! Available subcommands:
 //!   - `install`        Build stax in release mode, copy to ~/.cargo/bin/,
-//!                      and (on macOS) ad-hoc codesign with the
-//!                      `com.apple.security.cs.debugger` entitlement.
+//!                      and (on macOS) ad-hoc codesign copied binaries.
 //!   - `build-daemon`   Build staxd in release mode and print the
 //!                      one-time `sudo cp` / `launchctl load` instructions
 //!                      for the LaunchDaemon plist.
@@ -78,7 +77,11 @@ fn install() -> Result<(), Box<dyn Error>> {
     for bin in [BIN_NAME, DAEMON_BIN, SERVER_BIN, SHADE_BIN] {
         let src = workspace_root.join("target").join("release").join(bin);
         if !src.exists() {
-            return Err(format!("expected built binary at {} but it wasn't there", src.display()).into());
+            return Err(format!(
+                "expected built binary at {} but it wasn't there",
+                src.display()
+            )
+            .into());
         }
         let dst = cargo_bin.join(bin);
         println!(":: Copying {} -> {}", src.display(), dst.display());
@@ -91,15 +94,10 @@ fn install() -> Result<(), Box<dyn Error>> {
             // *bytes* but the cdhash now matches a file at a
             // different path/inode, and AMFI rejects it on launch
             // (process gets SIGKILL'd before any code runs).
-            // Re-sign every binary at the destination. stax-shade
-            // gets the entitled flavor (cs.debugger). staxd is
+            // Re-sign every binary at the destination. staxd is
             // re-signed *again* by `stax setup` at its final
             // /usr/local/bin install path.
-            if bin == SHADE_BIN {
-                codesign_with_debugger(&dst)?;
-            } else {
-                codesign_adhoc(&dst)?;
-            }
+            codesign_adhoc(&dst)?;
         }
     }
 
@@ -116,9 +114,7 @@ fn install() -> Result<(), Box<dyn Error>> {
     println!(":: stax-server (the unprivileged daemon agents talk to)");
     println!(":: was just bootstrapped under your user via launchctl.");
     println!(":: Logs:");
-    println!(
-        "::   log stream --predicate 'subsystem == \"eu.bearcove.stax-server\"'"
-    );
+    println!("::   log stream --predicate 'subsystem == \"eu.bearcove.stax-server\"'");
     Ok(())
 }
 
@@ -222,51 +218,6 @@ fn codesign_adhoc(binary: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn codesign_with_debugger(binary: &Path) -> Result<(), Box<dyn Error>> {
-    const ENTITLEMENTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>com.apple.security.cs.debugger</key>
-	<true/>
-	<key>com.apple.security.get-task-allow</key>
-	<true/>
-	<key>com.apple.security.cs.allow-jit</key>
-	<true/>
-	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-	<true/>
-</dict>
-</plist>
-"#;
-
-    let mut entitlements_path = env::temp_dir();
-    entitlements_path.push(format!("stax-xtask-entitlements-{}.xml", std::process::id()));
-    fs::write(&entitlements_path, ENTITLEMENTS_XML)?;
-
-    println!(
-        ":: Codesigning {} with com.apple.security.cs.debugger entitlement...",
-        binary.display()
-    );
-    let status = Command::new("codesign")
-        .arg("--force")
-        .arg("--options")
-        .arg("runtime")
-        .arg("--sign")
-        .arg("-")
-        .arg("--entitlements")
-        .arg(&entitlements_path)
-        .arg(binary)
-        .status()?;
-
-    let _ = fs::remove_file(&entitlements_path);
-
-    if !status.success() {
-        return Err(format!("codesign exited with {status}").into());
-    }
-    Ok(())
-}
-
 fn build_daemon() -> Result<(), Box<dyn Error>> {
     let workspace_root = workspace_root();
 
@@ -276,7 +227,10 @@ fn build_daemon() -> Result<(), Box<dyn Error>> {
     println!(":: Building workspace (release)...");
     cargo_build_release_workspace(&workspace_root)?;
 
-    let binary = workspace_root.join("target").join("release").join(DAEMON_BIN);
+    let binary = workspace_root
+        .join("target")
+        .join("release")
+        .join(DAEMON_BIN);
     let plist = workspace_root
         .join(DAEMON_BIN)
         .join("launchd")

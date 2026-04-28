@@ -307,7 +307,11 @@ impl DebugInfoIndex {
         trace!(
             "try_auto_load({:?}): result = {}",
             path,
-            if result.is_some() { "loaded" } else { "no debug info found" }
+            if result.is_some() {
+                "loaded"
+            } else {
+                "no debug info found"
+            }
         );
         result
     }

@@ -358,7 +358,5 @@ Connect with:
   (very early in the lifecycle). Try `stax status` to confirm a run exists,
   or `stax wait --for-samples 100` to block until data is in.
 
-- **Hardened-runtime targets** still need root *or* a properly entitled
-  `staxd`. The unprivileged path works for normal user processes; system
-  apps and App Store binaries reject `task_for_pid` regardless of
-  entitlements on the caller side.
+- **Hardened-runtime targets** are out of scope. The attachment helper is
+  same-uid and intended for normal local developer processes.

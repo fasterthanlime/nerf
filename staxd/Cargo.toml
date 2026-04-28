@@ -13,13 +13,10 @@ path = "src/main.rs"
 [target.'cfg(target_os = "macos")'.dependencies]
 staxd-proto = { path = "../staxd-proto" }
 stax-mac-kperf-sys = { version = "0.1", path = "../stax-mac-kperf-sys" }
-stax-target-images = { path = "../stax-target-images" }
-framehop = "0.16"
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-oslog = "0.3"
 libc = "0.2"
-mach2 = "0.4"
 eyre = "0.6"

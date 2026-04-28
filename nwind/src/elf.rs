@@ -14,9 +14,7 @@
 use std::ops::Range;
 
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
-use object::elf::{
-    self, ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, SHT_STRTAB,
-};
+use object::elf::{self, ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, SHT_STRTAB};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Endian {
@@ -299,8 +297,16 @@ fn read_section_header(
         let sh_addralign = read_u64(&mut buf, endian)?;
         let sh_entsize = read_u64(&mut buf, endian)?;
         Some(SectionHeader {
-            sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
-            sh_link, sh_info, sh_addralign, sh_entsize,
+            sh_name,
+            sh_type,
+            sh_flags,
+            sh_addr,
+            sh_offset,
+            sh_size,
+            sh_link,
+            sh_info,
+            sh_addralign,
+            sh_entsize,
         })
     } else {
         let sh_name = read_u32(&mut buf, endian)? as usize;
@@ -314,8 +320,16 @@ fn read_section_header(
         let sh_addralign = read_u32(&mut buf, endian)? as u64;
         let sh_entsize = read_u32(&mut buf, endian)? as u64;
         Some(SectionHeader {
-            sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
-            sh_link, sh_info, sh_addralign, sh_entsize,
+            sh_name,
+            sh_type,
+            sh_flags,
+            sh_addr,
+            sh_offset,
+            sh_size,
+            sh_link,
+            sh_info,
+            sh_addralign,
+            sh_entsize,
         })
     }
 }
@@ -338,7 +352,14 @@ fn read_program_header(
         let p_memsz = read_u64(&mut buf, endian)?;
         let p_align = read_u64(&mut buf, endian)?;
         Some(ProgramHeader {
-            p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align,
+            p_type,
+            p_flags,
+            p_offset,
+            p_vaddr,
+            p_paddr,
+            p_filesz,
+            p_memsz,
+            p_align,
         })
     } else {
         // 32-bit Phdr: type, offset, vaddr, paddr, filesz, memsz, flags, align.
@@ -351,7 +372,14 @@ fn read_program_header(
         let p_flags = read_u32(&mut buf, endian)?;
         let p_align = read_u32(&mut buf, endian)? as u64;
         Some(ProgramHeader {
-            p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align,
+            p_type,
+            p_flags,
+            p_offset,
+            p_vaddr,
+            p_paddr,
+            p_filesz,
+            p_memsz,
+            p_align,
         })
     }
 }
@@ -411,7 +439,11 @@ pub struct SymIter<'a> {
 impl<'a> SymIter<'a> {
     #[inline]
     pub fn new(bytes: &'a [u8], endianness: Endian, is_64: bool) -> Self {
-        SymIter { bytes, endianness, is_64 }
+        SymIter {
+            bytes,
+            endianness,
+            is_64,
+        }
     }
 }
 
@@ -430,7 +462,14 @@ impl<'a> Iterator for SymIter<'a> {
             let st_value = read_u64(&mut buf, self.endianness)?;
             let st_size = read_u64(&mut buf, self.endianness)?;
             self.bytes = &self.bytes[24..];
-            Some(Sym { st_name, st_info, st_other, st_shndx, st_value, st_size })
+            Some(Sym {
+                st_name,
+                st_info,
+                st_other,
+                st_shndx,
+                st_value,
+                st_size,
+            })
         } else {
             if self.bytes.len() < 16 {
                 return None;
@@ -443,7 +482,14 @@ impl<'a> Iterator for SymIter<'a> {
             let st_other = read_u8(&mut buf)?;
             let st_shndx = read_u16(&mut buf, self.endianness)? as usize;
             self.bytes = &self.bytes[16..];
-            Some(Sym { st_name, st_info, st_other, st_shndx, st_value, st_size })
+            Some(Sym {
+                st_name,
+                st_info,
+                st_other,
+                st_shndx,
+                st_value,
+                st_size,
+            })
         }
     }
 }
@@ -495,9 +541,26 @@ pub fn parse(bytes: &[u8]) -> Result<Elf<'_>, &'static str> {
     let e_shstrndx = read_u16(&mut cursor, endianness).ok_or("e_shstrndx")?;
 
     let header = Header {
-        e_ident, e_type, e_machine, e_version, e_entry, e_phoff, e_shoff,
-        e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx,
+        e_ident,
+        e_type,
+        e_machine,
+        e_version,
+        e_entry,
+        e_phoff,
+        e_shoff,
+        e_flags,
+        e_ehsize,
+        e_phentsize,
+        e_phnum,
+        e_shentsize,
+        e_shnum,
+        e_shstrndx,
     };
 
-    Ok(Elf { bytes, header, endianness, is_64 })
+    Ok(Elf {
+        bytes,
+        header,
+        endianness,
+        is_64,
+    })
 }

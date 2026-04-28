@@ -11,15 +11,14 @@
 //!
 //! - **`Shade`** is exposed by `stax-shade`. Once registered, the
 //!   server calls into the shade for the active probing
-//!   primitives — peek, poke, walker control, breakpoint
-//!   management. This crate currently stubs peek + poke; the
-//!   walker channel and breakpoint surface land in follow-up
-//!   commits as they're implemented on the shade side.
+//!   primitives — peek, poke, correlated stack probes, breakpoint
+//!   management. This crate currently stubs peek + poke; probes
+//!   and breakpoint surfaces land in follow-up commits as they're
+//!   implemented on the shade side.
 //!
 //! The session is kept alive for the duration of the attachment.
 //! Server-side `closed()` cascades when the shade exits (clean
-//! detach) or crashes (the cs.debugger blast-radius rationale —
-//! see `stax-shade/src/main.rs`).
+//! detach) or crashes.
 
 use facet::Facet;
 
@@ -33,8 +32,9 @@ pub struct ShadeCapabilities {
     /// Shade can write raw bytes via `mach_vm_write` (function-call
     /// syping, breakpoint installation, etc).
     pub poke: bool,
-    /// Shade has a framehop unwinder ready and can stream
-    /// accurately-walked user backtraces.
+    /// Shade has a framehop unwinder ready for correlated
+    /// attachment-side stack probes. Currently false until that
+    /// implementation lands here.
     pub framehop_walker: bool,
     /// Shade can install breakpoints + drive single-step exception
     /// handling for branch-coverage inside hot functions.
@@ -65,50 +65,16 @@ pub struct ShadeAck {
     pub reason: Option<String>,
 }
 
-/// One framehop-walked user-stack sample. The shade collects
-/// these in batches and pushes them to the server via
-/// `publish_walker_samples`. PMU fields are absent — kperf is the
-/// authoritative source for those — so the server-side aggregator
-/// fills in zeroes when merging.
-#[derive(Clone, Debug, Facet)]
-pub struct WalkerSample {
-    /// Mach thread port number (the shade's view; same kernel
-    /// thread id reported by kperf).
-    pub tid: u32,
-    /// Wall-clock nanoseconds at sample capture time, taken on the
-    /// shade. Used by the aggregator to merge walker samples in
-    /// chronological order with kperf's stream.
-    pub timestamp_ns: u64,
-    /// Frame addresses, leaf-first (the leaf PC is `frames[0]`,
-    /// each subsequent entry is the return address of the frame
-    /// below). Same orientation kperf uses on the wire.
-    pub frames: Vec<u64>,
-}
-
-/// Server-side handshake + walker ingest plane. The shade dials
-/// in, calls `register_shade` once, then keeps the session open
-/// to (a) accept reverse calls into the `Shade` service and
-/// (b) push walker samples through `publish_walker_samples`.
+/// Server-side handshake plane. The shade dials in, calls
+/// `register_shade` once, then keeps the session open to accept
+/// reverse calls into the `Shade` service.
 #[vox::service]
 pub trait ShadeRegistry {
     async fn register_shade(&self, info: ShadeInfo) -> Result<ShadeAck, String>;
-
-    /// Hand a batch of framehop-walked samples to the server. The
-    /// server appends them to the active run's aggregator
-    /// alongside kperf samples; ordering is by `timestamp_ns`.
-    /// Returns Err when no run is active (shade should drop the
-    /// batch and try again on next tick) or when the run has
-    /// already been finalised (shade should detach + exit).
-    async fn publish_walker_samples(
-        &self,
-        run_id: u64,
-        samples: Vec<WalkerSample>,
-    ) -> Result<(), String>;
 }
 
 /// Shade-side primitives. Stubs in this commit; implementations
-/// land alongside their server-side callers (framehop walker
-/// first, then peek/poke, then branch-stepping).
+/// land alongside their server-side callers.
 #[vox::service]
 pub trait Shade {
     /// Read `len` bytes starting at `addr` (target AVMA) via
@@ -124,5 +90,8 @@ pub trait Shade {
 
 /// All service descriptors exposed by stax-shade-proto.
 pub fn all_services() -> Vec<&'static vox::session::ServiceDescriptor> {
-    vec![shade_registry_service_descriptor(), shade_service_descriptor()]
+    vec![
+        shade_registry_service_descriptor(),
+        shade_service_descriptor(),
+    ]
 }

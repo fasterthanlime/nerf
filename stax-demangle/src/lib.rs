@@ -115,12 +115,18 @@ fn classify(input: &str) -> Demangled {
     // Unambiguous prefixes first.
     if input.starts_with("_R") {
         if let Some(d) = try_lang(input, SymLanguage::Rust) {
-            return Demangled { name: d, language: Language::Rust };
+            return Demangled {
+                name: d,
+                language: Language::Rust,
+            };
         }
     }
     if input.starts_with("_$s") || input.starts_with("$s") {
         if let Some(d) = try_lang(input, SymLanguage::Swift) {
-            return Demangled { name: d, language: Language::Swift };
+            return Demangled {
+                name: d,
+                language: Language::Swift,
+            };
         }
     }
 
@@ -132,30 +138,51 @@ fn classify(input: &str) -> Demangled {
     if let Some(cpp_out) = try_lang(input, SymLanguage::Cpp) {
         if rust_hash_stem(&cpp_out).is_some() {
             if let Some(rust_out) = try_lang(input, SymLanguage::Rust) {
-                return Demangled { name: rust_out, language: Language::Rust };
+                return Demangled {
+                    name: rust_out,
+                    language: Language::Rust,
+                };
             }
             // Rust demangler refused — fall back to stripping the hash
             // off the C++ output so we still hide it from users.
             if let Some(stem) = rust_hash_stem(&cpp_out) {
-                return Demangled { name: stem.to_owned(), language: Language::Rust };
+                return Demangled {
+                    name: stem.to_owned(),
+                    language: Language::Rust,
+                };
             }
         }
-        return Demangled { name: cpp_out, language: Language::Cpp };
+        return Demangled {
+            name: cpp_out,
+            language: Language::Cpp,
+        };
     }
 
     // Some Rust v0 inputs aren't recognized by cpp_demangle; try Rust
     // as a second attempt. Same for Swift / ObjC for non-prefixed forms.
     if let Some(d) = try_lang(input, SymLanguage::Rust) {
-        return Demangled { name: d, language: Language::Rust };
+        return Demangled {
+            name: d,
+            language: Language::Rust,
+        };
     }
     if let Some(d) = try_lang(input, SymLanguage::Swift) {
-        return Demangled { name: d, language: Language::Swift };
+        return Demangled {
+            name: d,
+            language: Language::Swift,
+        };
     }
     if let Some(d) = try_lang(input, SymLanguage::ObjC) {
-        return Demangled { name: d, language: Language::ObjC };
+        return Demangled {
+            name: d,
+            language: Language::ObjC,
+        };
     }
 
-    Demangled { name: input.to_owned(), language: Language::Unknown }
+    Demangled {
+        name: input.to_owned(),
+        language: Language::Unknown,
+    }
 }
 
 /// Demangle one mangled symbol. Accepts bytes; non-UTF8 input is
@@ -232,7 +259,8 @@ mod tests {
         // `{{closure}}`. The C++ demangler leaves these literal; we
         // need to defer to the Rust demangler when the legacy hash
         // suffix is present.
-        let d = demangle_str("_ZN5alloc7raw_vec15RawVec$LT$T$GT$14from_raw_parts17h2c9379b27997b67cE");
+        let d =
+            demangle_str("_ZN5alloc7raw_vec15RawVec$LT$T$GT$14from_raw_parts17h2c9379b27997b67cE");
         assert_eq!(d.name, "alloc::raw_vec::RawVec<T>::from_raw_parts");
         assert_eq!(d.language, Language::Rust);
 
@@ -266,7 +294,8 @@ mod tests {
 
     #[test]
     fn swift_v5() {
-        let d = demangle_str("_$s7SwiftUI4ViewPAAE7overlay_9alignmentQrqd___AA9AlignmentVtAaBRd__lF");
+        let d =
+            demangle_str("_$s7SwiftUI4ViewPAAE7overlay_9alignmentQrqd___AA9AlignmentVtAaBRd__lF");
         assert_eq!(d.language, Language::Swift, "got: {d:?}");
         assert!(d.name.contains("View"), "got: {d:?}");
     }

@@ -70,14 +70,13 @@ impl KernelImage {
             }
         };
 
-        let header: &MachHeader64<LittleEndian> =
-            match MachHeader64::parse(bytes.as_slice(), 0) {
-                Ok(h) => h,
-                Err(err) => {
-                    log::warn!("MachHeader64::parse: {err}");
-                    return Ok(None);
-                }
-            };
+        let header: &MachHeader64<LittleEndian> = match MachHeader64::parse(bytes.as_slice(), 0) {
+            Ok(h) => h,
+            Err(err) => {
+                log::warn!("MachHeader64::parse: {err}");
+                return Ok(None);
+            }
+        };
         let endian = match header.endian() {
             Ok(e) => e,
             Err(err) => {
@@ -88,14 +87,13 @@ impl KernelImage {
 
         let mut exec_segments = Vec::new();
         let mut symtab_cmd = None;
-        let mut load_commands =
-            match header.load_commands(endian, bytes.as_slice(), 0) {
-                Ok(lc) => lc,
-                Err(err) => {
-                    log::warn!("load_commands: {err}");
-                    return Ok(None);
-                }
-            };
+        let mut load_commands = match header.load_commands(endian, bytes.as_slice(), 0) {
+            Ok(lc) => lc,
+            Err(err) => {
+                log::warn!("load_commands: {err}");
+                return Ok(None);
+            }
+        };
         while let Ok(Some(command)) = load_commands.next() {
             let variant = match command.variant() {
                 Ok(v) => v,
@@ -113,10 +111,7 @@ impl KernelImage {
                             log::debug!(
                                 "kernel exec segment {:?} {:#x}..{:#x}",
                                 std::str::from_utf8(
-                                    segname
-                                        .split(|&b| b == 0)
-                                        .next()
-                                        .unwrap_or(segname)
+                                    segname.split(|&b| b == 0).next().unwrap_or(segname)
                                 )
                                 .unwrap_or("?"),
                                 lo,
@@ -139,15 +134,14 @@ impl KernelImage {
                 return Ok(None);
             }
         };
-        let symbols_table = match symtab_cmd
-            .symbols::<MachHeader64<LittleEndian>, _>(endian, bytes.as_slice())
-        {
-            Ok(s) => s,
-            Err(err) => {
-                log::warn!("symtab parse failed: {err}");
-                return Ok(None);
-            }
-        };
+        let symbols_table =
+            match symtab_cmd.symbols::<MachHeader64<LittleEndian>, _>(endian, bytes.as_slice()) {
+                Ok(s) => s,
+                Err(err) => {
+                    log::warn!("symtab parse failed: {err}");
+                    return Ok(None);
+                }
+            };
         let strings = symbols_table.strings();
         let mut symbols = Vec::with_capacity(symbols_table.iter().len());
         for symbol in symbols_table.iter() {
@@ -228,11 +222,7 @@ impl SlideEstimator {
                 continue;
             }
             let slide_max = avma - seg_lo;
-            let slide_min = if avma >= seg_hi {
-                avma - seg_hi + 1
-            } else {
-                0
-            };
+            let slide_min = if avma >= seg_hi { avma - seg_hi + 1 } else { 0 };
             // Snap to 16KB alignment.
             let lo = (slide_min + (SLIDE_ALIGNMENT - 1)) & !(SLIDE_ALIGNMENT - 1);
             let hi = slide_max & !(SLIDE_ALIGNMENT - 1);

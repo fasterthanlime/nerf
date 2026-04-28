@@ -1,10 +1,10 @@
-use gimli::{RegisterRule, CfaRule, LittleEndian};
+use gimli::{CfaRule, LittleEndian, RegisterRule};
 
+use crate::address_space::{lookup_binary, Binary, MemoryReader};
 use crate::arch::{Architecture, Registers, UnwindStatus};
-use crate::address_space::{MemoryReader, Binary, lookup_binary};
-use crate::frame_descriptions::{ContextCache, UnwindInfoCache};
-use crate::types::{Endianness, Bitness};
 use crate::dwarf::dwarf_unwind;
+use crate::frame_descriptions::{ContextCache, UnwindInfoCache};
+use crate::types::{Bitness, Endianness};
 
 // Source: https://github.com/hjl-tools/x86-psABI/wiki/X86-psABI
 pub mod dwarf {
@@ -50,7 +50,7 @@ static REGS: &'static [u16] = &[
     dwarf::RETURN_ADDRESS,
     dwarf::FLAGS,
     dwarf::CS,
-    dwarf::SS
+    dwarf::SS,
 ];
 
 #[repr(C)]
@@ -79,55 +79,67 @@ pub struct Regs {
     cs: u64,
     ss: u64,
 
-    mask: u64
+    mask: u64,
 }
 
-unsafe_impl_registers!( Regs, REGS, u64 );
-impl_local_regs!( Regs, "x86_64", get_regs_amd64 );
-impl_regs_debug!( Regs, REGS, Arch );
+unsafe_impl_registers!(Regs, REGS, u64);
+impl_local_regs!(Regs, "x86_64", get_regs_amd64);
+impl_regs_debug!(Regs, REGS, Arch);
 
 #[allow(dead_code)]
 pub struct Arch {}
 
-fn guess_ebp< M: MemoryReader< Arch > >( nth_frame: usize, memory: &M, ctx_cache: &mut ContextCache< LittleEndian >, regs: &<Arch as Architecture>::Regs, binary: &Binary< Arch > ) -> Option< u64 > {
+fn guess_ebp<M: MemoryReader<Arch>>(
+    nth_frame: usize,
+    memory: &M,
+    ctx_cache: &mut ContextCache<LittleEndian>,
+    regs: &<Arch as Architecture>::Regs,
+    binary: &Binary<Arch>,
+) -> Option<u64> {
     // This is a hacky workaround for the fact that Linux's perf events tend to return us
     // invalid RBP values (all FFs) if the call chain goes through the kernel space -> user space
     // boundary, so we try to figure it out some other way.
 
-    debug!( "Trying to guess RBP for frame #{}...", nth_frame );
+    debug!("Trying to guess RBP for frame #{}...", nth_frame);
 
-    let rip = regs.get( dwarf::RETURN_ADDRESS )?;
-    let unwind_info = binary.lookup_unwind_row( ctx_cache, rip )?;
+    let rip = regs.get(dwarf::RETURN_ADDRESS)?;
+    let unwind_info = binary.lookup_unwind_row(ctx_cache, rip)?;
 
     let cfa_offset = match unwind_info.cfa() {
-        CfaRule::RegisterAndOffset { register: cfa_register, offset: cfa_offset } if cfa_register == gimli::X86_64::RBP => cfa_offset,
-        _ => return None
+        CfaRule::RegisterAndOffset {
+            register: cfa_register,
+            offset: cfa_offset,
+        } if cfa_register == gimli::X86_64::RBP => cfa_offset,
+        _ => return None,
     };
 
     // What this rule means is that:
     //   previous.RBP == *(current.RBP + rbp_offset)
-    let rbp_offset = match unwind_info.register( gimli::X86_64::RBP ) {
-        RegisterRule::Offset( offset ) => offset + cfa_offset,
-        _ => return None
+    let rbp_offset = match unwind_info.register(gimli::X86_64::RBP) {
+        RegisterRule::Offset(offset) => offset + cfa_offset,
+        _ => return None,
     };
 
-    let ra_offset = match unwind_info.register( gimli::X86_64::RA ) {
-        RegisterRule::Offset( offset ) => offset + cfa_offset,
-        _ => return None
+    let ra_offset = match unwind_info.register(gimli::X86_64::RA) {
+        RegisterRule::Offset(offset) => offset + cfa_offset,
+        _ => return None,
     };
 
-    let rsp = regs.get( dwarf::RSP )?;
+    let rsp = regs.get(dwarf::RSP)?;
 
     let mut rbp = rsp;
     for _ in 0..32 {
-        let candidate_ra = memory.get_pointer_at_address( (rbp as i64 + ra_offset) as u64 )?;
-        let candidate_rbp = memory.get_pointer_at_address( (rbp as i64 + rbp_offset) as u64 )?;
+        let candidate_ra = memory.get_pointer_at_address((rbp as i64 + ra_offset) as u64)?;
+        let candidate_rbp = memory.get_pointer_at_address((rbp as i64 + rbp_offset) as u64)?;
 
-        let valid_ra = memory.get_region_at_address( candidate_ra ).map( |region| region.is_executable() ).unwrap_or( false );
-        let valid_rbp = memory.is_stack_address( candidate_rbp );
+        let valid_ra = memory
+            .get_region_at_address(candidate_ra)
+            .map(|region| region.is_executable())
+            .unwrap_or(false);
+        let valid_rbp = memory.is_stack_address(candidate_rbp);
         if valid_rbp && valid_ra {
-            debug!( "Guessed RBP=0x{:016X} based on stack scanning", rbp );
-            return Some( rbp );
+            debug!("Guessed RBP=0x{:016X} based on stack scanning", rbp);
+            return Some(rbp);
         }
         rbp += 8;
     }
@@ -137,9 +149,9 @@ fn guess_ebp< M: MemoryReader< Arch > >( nth_frame: usize, memory: &M, ctx_cache
 
 #[doc(hidden)]
 pub struct State {
-    ctx_cache: ContextCache< LittleEndian >,
+    ctx_cache: ContextCache<LittleEndian>,
     unwind_cache: UnwindInfoCache,
-    new_regs: Vec< (u16, u64) >
+    new_regs: Vec<(u16, u64)>,
 }
 
 impl Architecture for Arch {
@@ -155,7 +167,7 @@ impl Architecture for Arch {
     type Regs = Regs;
     type RegTy = u64;
 
-    fn register_name_str( register: u16 ) -> Option< &'static str > {
+    fn register_name_str(register: u16) -> Option<&'static str> {
         use self::dwarf::*;
 
         let name = match register {
@@ -179,10 +191,10 @@ impl Architecture for Arch {
             FLAGS => "EFLAGS",
             CS => "CS",
             SS => "SS",
-            _ => return None
+            _ => return None,
         };
 
-        Some( name )
+        Some(name)
     }
 
     #[inline]
@@ -190,54 +202,61 @@ impl Architecture for Arch {
         State {
             ctx_cache: ContextCache::new(),
             unwind_cache: UnwindInfoCache::new(),
-            new_regs: Vec::with_capacity( 32 )
+            new_regs: Vec::with_capacity(32),
         }
     }
 
-    fn clear_cache( state: &mut Self::State ) {
+    fn clear_cache(state: &mut Self::State) {
         state.unwind_cache.clear();
     }
 
-    fn unwind< M: MemoryReader< Self > >(
+    fn unwind<M: MemoryReader<Self>>(
         nth_frame: usize,
         memory: &M,
         state: &mut Self::State,
         regs: &mut Self::Regs,
-        initial_address: &mut Option< u64 >,
-        ra_address: &mut Option< u64 >
-    ) -> Option< UnwindStatus > {
-        if !regs.contains( dwarf::RBP ) {
-            let binary = lookup_binary( nth_frame, memory, regs )?;
-            if let Some( rbp ) = guess_ebp( nth_frame, memory, &mut state.ctx_cache, regs, binary ) {
-                regs.append( dwarf::RBP, rbp );
+        initial_address: &mut Option<u64>,
+        ra_address: &mut Option<u64>,
+    ) -> Option<UnwindStatus> {
+        if !regs.contains(dwarf::RBP) {
+            let binary = lookup_binary(nth_frame, memory, regs)?;
+            if let Some(rbp) = guess_ebp(nth_frame, memory, &mut state.ctx_cache, regs, binary) {
+                regs.append(dwarf::RBP, rbp);
             }
         }
 
-        let result = match dwarf_unwind( nth_frame, memory, &mut state.ctx_cache, &mut state.unwind_cache, regs, &mut state.new_regs ) {
-            Some( result ) => result,
+        let result = match dwarf_unwind(
+            nth_frame,
+            memory,
+            &mut state.ctx_cache,
+            &mut state.unwind_cache,
+            regs,
+            &mut state.new_regs,
+        ) {
+            Some(result) => result,
             None => {
-                if let Some( rbp ) = regs.get( dwarf::RBP ) {
-                    if !memory.is_stack_address( rbp ) {
+                if let Some(rbp) = regs.get(dwarf::RBP) {
+                    if !memory.is_stack_address(rbp) {
                         return None;
                     }
 
-                    if let Some( next_rbp ) = memory.get_pointer_at_address( rbp ) {
-                        if let Some( next_rip ) = memory.get_pointer_at_address( rbp + 8 ) {
+                    if let Some(next_rbp) = memory.get_pointer_at_address(rbp) {
+                        if let Some(next_rip) = memory.get_pointer_at_address(rbp + 8) {
                             trace!(
                                 "RBP-based unwinding: RBP: {:x} -> {:x}, RIP: {:x} -> {:x}",
                                 rbp,
                                 next_rbp,
-                                regs.get( dwarf::RETURN_ADDRESS ).expect( "no RIP" ),
+                                regs.get(dwarf::RETURN_ADDRESS).expect("no RIP"),
                                 next_rip
                             );
 
-                            if next_rbp > rbp && memory.is_stack_address( next_rbp ) {
+                            if next_rbp > rbp && memory.is_stack_address(next_rbp) {
                                 regs.clear();
-                                regs.append( dwarf::RSP, rbp + 16 );
-                                regs.append( dwarf::RBP, next_rbp );
-                                regs.append( dwarf::RETURN_ADDRESS, next_rip );
-                                *ra_address = Some( next_rip );
-                                return Some( UnwindStatus::InProgress );
+                                regs.append(dwarf::RSP, rbp + 16);
+                                regs.append(dwarf::RBP, next_rbp);
+                                regs.append(dwarf::RETURN_ADDRESS, next_rip);
+                                *ra_address = Some(next_rip);
+                                return Some(UnwindStatus::InProgress);
                             }
                         }
                     }
@@ -245,26 +264,35 @@ impl Architecture for Arch {
                 return None;
             }
         };
-        *initial_address = Some( result.initial_address );
+        *initial_address = Some(result.initial_address);
         *ra_address = result.ra_address;
         let cfa = result.cfa?;
 
         let mut recovered_return_address = false;
         for &(register, value) in &state.new_regs {
-            regs.append( register, value );
+            regs.append(register, value);
 
-            recovered_return_address = recovered_return_address || register == dwarf::RETURN_ADDRESS;
+            recovered_return_address =
+                recovered_return_address || register == dwarf::RETURN_ADDRESS;
         }
 
-        regs.append( dwarf::RSP, cfa );
+        regs.append(dwarf::RSP, cfa);
 
-        debug!( "Register {:?} at frame #{} is equal to 0x{:016X}", Self::register_name( dwarf::RSP ), nth_frame + 1, cfa );
+        debug!(
+            "Register {:?} at frame #{} is equal to 0x{:016X}",
+            Self::register_name(dwarf::RSP),
+            nth_frame + 1,
+            cfa
+        );
 
         if !recovered_return_address {
-            debug!( "Previous frame not found: failed to determine the return address of frame #{}", nth_frame + 1 );
-            return Some( UnwindStatus::Finished );
+            debug!(
+                "Previous frame not found: failed to determine the return address of frame #{}",
+                nth_frame + 1
+            );
+            return Some(UnwindStatus::Finished);
         }
 
-        Some( UnwindStatus::InProgress )
+        Some(UnwindStatus::InProgress)
     }
 }

@@ -53,7 +53,8 @@ struct DirectContext {
     _bytes: Arc<Vec<u8>>,
     /// SAFETY: borrows from `_bytes`. The Arc is Pin-ish (heap-stable)
     /// and the inner is dropped before _bytes is.
-    inner: addr2line::Context<addr2line::gimli::EndianSlice<'static, addr2line::gimli::RunTimeEndian>>,
+    inner:
+        addr2line::Context<addr2line::gimli::EndianSlice<'static, addr2line::gimli::RunTimeEndian>>,
 }
 
 struct OsoState {
@@ -261,7 +262,9 @@ impl OsoState {
                 member: f.member().map(|m| m.to_vec()),
             })
             .collect();
-        let contexts = std::iter::repeat_with(|| None).take(objects.len()).collect();
+        let contexts = std::iter::repeat_with(|| None)
+            .take(objects.len())
+            .collect();
         Some(OsoState {
             entries,
             objects,
@@ -271,10 +274,7 @@ impl OsoState {
 
     fn find_location(&mut self, probe: u64) -> Option<(String, u32)> {
         // Binary search for the function range containing `probe`.
-        let idx = match self
-            .entries
-            .binary_search_by_key(&probe, |e| e.address)
-        {
+        let idx = match self.entries.binary_search_by_key(&probe, |e| e.address) {
             Ok(i) => i,
             Err(0) => return None,
             Err(i) => i - 1,
@@ -370,7 +370,10 @@ impl SourceResolver {
     /// string when the file isn't loadable from disk.
     pub fn snippet(&mut self, file: &str, line: u32) -> String {
         let lines = self.source_lines(file);
-        let raw = match lines.as_ref().and_then(|v| v.get(line.saturating_sub(1) as usize)) {
+        let raw = match lines
+            .as_ref()
+            .and_then(|v| v.get(line.saturating_sub(1) as usize))
+        {
             Some(s) => s.trim().to_owned(),
             None => return String::new(),
         };
@@ -382,8 +385,7 @@ impl SourceResolver {
         if let Some(entry) = self.sources.get(file) {
             return entry.clone();
         }
-        let loaded = read_source(file)
-            .map(|s| Arc::new(s.lines().map(str::to_owned).collect()));
+        let loaded = read_source(file).map(|s| Arc::new(s.lines().map(str::to_owned).collect()));
         self.sources.insert(file.to_owned(), loaded.clone());
         loaded
     }

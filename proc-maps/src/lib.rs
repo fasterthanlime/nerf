@@ -10,21 +10,21 @@ pub struct Region {
     pub major: u32,
     pub minor: u32,
     pub inode: u64,
-    pub name: String
+    pub name: String,
 }
 
-fn get_until< 'a >( p: &mut &'a str, delimiter: char ) -> &'a str {
+fn get_until<'a>(p: &mut &'a str, delimiter: char) -> &'a str {
     let mut found = None;
     for (index, ch) in p.char_indices() {
         if ch == delimiter {
-            found = Some( index );
+            found = Some(index);
             break;
         }
     }
 
-    if let Some( index ) = found {
-        let (before, after) = p.split_at( index );
-        *p = &after[ delimiter.len_utf8().. ];
+    if let Some(index) = found {
+        let (before, after) = p.split_at(index);
+        *p = &after[delimiter.len_utf8()..];
         before
     } else {
         let before = *p;
@@ -33,45 +33,45 @@ fn get_until< 'a >( p: &mut &'a str, delimiter: char ) -> &'a str {
     }
 }
 
-fn get_char( p: &mut &str ) -> Option< char > {
+fn get_char(p: &mut &str) -> Option<char> {
     let ch = p.chars().next()?;
-    *p = &p[ ch.len_utf8().. ];
-    Some( ch )
+    *p = &p[ch.len_utf8()..];
+    Some(ch)
 }
 
-fn skip_whitespace( p: &mut &str ) {
-    while let Some( ch ) = p.chars().next() {
+fn skip_whitespace(p: &mut &str) {
+    while let Some(ch) = p.chars().next() {
         if ch == ' ' {
-            *p = &p[ ch.len_utf8().. ];
+            *p = &p[ch.len_utf8()..];
         } else {
             break;
         }
     }
 }
 
-pub fn parse( maps: &str ) -> Vec< Region > {
+pub fn parse(maps: &str) -> Vec<Region> {
     if maps.is_empty() {
         return Vec::new();
     }
 
     let mut output = Vec::new();
-    for mut line in maps.trim().split( '\n' ) {
-        let start = u64::from_str_radix( get_until( &mut line, '-' ), 16 ).unwrap();
-        let end = u64::from_str_radix( get_until( &mut line, ' ' ), 16 ).unwrap();
-        let is_read = get_char( &mut line ).unwrap() == 'r';
-        let is_write = get_char( &mut line ).unwrap() == 'w';
-        let is_executable = get_char( &mut line ).unwrap() == 'x';
-        let is_shared = get_char( &mut line ).unwrap() == 's';
-        get_char( &mut line );
+    for mut line in maps.trim().split('\n') {
+        let start = u64::from_str_radix(get_until(&mut line, '-'), 16).unwrap();
+        let end = u64::from_str_radix(get_until(&mut line, ' '), 16).unwrap();
+        let is_read = get_char(&mut line).unwrap() == 'r';
+        let is_write = get_char(&mut line).unwrap() == 'w';
+        let is_executable = get_char(&mut line).unwrap() == 'x';
+        let is_shared = get_char(&mut line).unwrap() == 's';
+        get_char(&mut line);
 
-        let file_offset = u64::from_str_radix( get_until( &mut line, ' ' ), 16 ).unwrap();
-        let major = u32::from_str_radix( get_until( &mut line, ':' ), 16 ).unwrap();
-        let minor = u32::from_str_radix( get_until( &mut line, ' ' ), 16 ).unwrap();
-        let inode = get_until( &mut line, ' ' ).parse().unwrap();
-        skip_whitespace( &mut line );
+        let file_offset = u64::from_str_radix(get_until(&mut line, ' '), 16).unwrap();
+        let major = u32::from_str_radix(get_until(&mut line, ':'), 16).unwrap();
+        let minor = u32::from_str_radix(get_until(&mut line, ' '), 16).unwrap();
+        let inode = get_until(&mut line, ' ').parse().unwrap();
+        skip_whitespace(&mut line);
         let name = line.to_owned();
 
-        output.push( Region {
+        output.push(Region {
             start,
             end,
             is_read,
@@ -82,7 +82,7 @@ pub fn parse( maps: &str ) -> Vec< Region > {
             major,
             minor,
             inode,
-            name
+            name,
         });
     }
 
@@ -92,13 +92,13 @@ pub fn parse( maps: &str ) -> Vec< Region > {
 #[test]
 fn test_get_until() {
     let mut p = "1234 5678";
-    assert_eq!( get_until( &mut p, ' ' ), "1234" );
-    assert_eq!( p, "5678" );
+    assert_eq!(get_until(&mut p, ' '), "1234");
+    assert_eq!(p, "5678");
 
-    assert_eq!( get_until( &mut p, ' ' ), "5678" );
-    assert_eq!( p, "" );
+    assert_eq!(get_until(&mut p, ' '), "5678");
+    assert_eq!(p, "");
 
-    assert_eq!( get_until( &mut p, ' ' ), "" );
+    assert_eq!(get_until(&mut p, ' '), "");
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn test_parse() {
 "#;
 
     assert_eq!(
-        parse( maps ),
+        parse(maps),
         vec![
             Region {
                 start: 0x00400000,
@@ -171,5 +171,5 @@ fn test_parse() {
 
 #[test]
 fn test_empty_maps() {
-    assert_eq!( parse( "" ), vec![] );
+    assert_eq!(parse(""), vec![]);
 }

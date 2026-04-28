@@ -14,10 +14,8 @@ use std::ffi::{c_char, c_int, c_void};
 
 use crate::error::Error;
 
-const KPERF_PATH: &[u8] =
-    b"/System/Library/PrivateFrameworks/kperf.framework/kperf\0";
-const KPERFDATA_PATH: &[u8] =
-    b"/System/Library/PrivateFrameworks/kperfdata.framework/kperfdata\0";
+const KPERF_PATH: &[u8] = b"/System/Library/PrivateFrameworks/kperf.framework/kperf\0";
+const KPERFDATA_PATH: &[u8] = b"/System/Library/PrivateFrameworks/kperfdata.framework/kperfdata\0";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -95,8 +93,7 @@ pub struct Frameworks {
     pub kpc_get_counter_count: unsafe extern "C" fn(u32) -> u32,
     pub kpc_get_config_count: unsafe extern "C" fn(u32) -> u32,
     pub kpc_set_config: unsafe extern "C" fn(u32, *mut KpcConfig) -> c_int,
-    pub kpc_get_thread_counters:
-        unsafe extern "C" fn(u32, u32, *mut u64) -> c_int,
+    pub kpc_get_thread_counters: unsafe extern "C" fn(u32, u32, *mut u64) -> c_int,
     pub kpc_set_counting: unsafe extern "C" fn(u32) -> c_int,
     pub kpc_set_thread_counting: unsafe extern "C" fn(u32) -> c_int,
 
@@ -104,10 +101,8 @@ pub struct Frameworks {
     pub kperf_action_count_set: unsafe extern "C" fn(u32) -> c_int,
     pub kperf_action_count_get: unsafe extern "C" fn(*mut u32) -> c_int,
     pub kperf_action_samplers_set: unsafe extern "C" fn(u32, u32) -> c_int,
-    pub kperf_action_samplers_get:
-        unsafe extern "C" fn(u32, *mut u32) -> c_int,
-    pub kperf_action_filter_set_by_pid:
-        unsafe extern "C" fn(u32, i32) -> c_int,
+    pub kperf_action_samplers_get: unsafe extern "C" fn(u32, *mut u32) -> c_int,
+    pub kperf_action_filter_set_by_pid: unsafe extern "C" fn(u32, i32) -> c_int,
     pub kperf_timer_count_set: unsafe extern "C" fn(u32) -> c_int,
     pub kperf_timer_count_get: unsafe extern "C" fn(*mut u32) -> c_int,
     pub kperf_timer_period_set: unsafe extern "C" fn(u32, u64) -> c_int,
@@ -124,48 +119,22 @@ pub struct Frameworks {
     pub kperf_tick_frequency: unsafe extern "C" fn() -> u64,
 
     // kperfdata (event database + config builder)
-    pub kpep_db_create:
-        unsafe extern "C" fn(*const c_char, *mut *mut KpepDb) -> c_int,
+    pub kpep_db_create: unsafe extern "C" fn(*const c_char, *mut *mut KpepDb) -> c_int,
     pub kpep_db_free: unsafe extern "C" fn(*mut KpepDb),
-    pub kpep_db_name:
-        unsafe extern "C" fn(*mut KpepDb, *mut *const c_char) -> c_int,
-    pub kpep_db_event: unsafe extern "C" fn(
-        *mut KpepDb,
-        *const c_char,
-        *mut *mut KpepEvent,
-    ) -> c_int,
-    pub kpep_db_events_count:
-        unsafe extern "C" fn(*mut KpepDb, *mut usize) -> c_int,
-    pub kpep_db_events: unsafe extern "C" fn(
-        *mut KpepDb,
-        *mut *mut KpepEvent,
-        usize,
-    ) -> c_int,
-    pub kpep_config_create:
-        unsafe extern "C" fn(*mut KpepDb, *mut *mut KpepConfig) -> c_int,
+    pub kpep_db_name: unsafe extern "C" fn(*mut KpepDb, *mut *const c_char) -> c_int,
+    pub kpep_db_event:
+        unsafe extern "C" fn(*mut KpepDb, *const c_char, *mut *mut KpepEvent) -> c_int,
+    pub kpep_db_events_count: unsafe extern "C" fn(*mut KpepDb, *mut usize) -> c_int,
+    pub kpep_db_events: unsafe extern "C" fn(*mut KpepDb, *mut *mut KpepEvent, usize) -> c_int,
+    pub kpep_config_create: unsafe extern "C" fn(*mut KpepDb, *mut *mut KpepConfig) -> c_int,
     pub kpep_config_free: unsafe extern "C" fn(*mut KpepConfig),
-    pub kpep_config_add_event: unsafe extern "C" fn(
-        *mut KpepConfig,
-        *mut *mut KpepEvent,
-        u32,
-        *mut u32,
-    ) -> c_int,
-    pub kpep_config_force_counters:
-        unsafe extern "C" fn(*mut KpepConfig) -> c_int,
-    pub kpep_config_kpc_classes:
-        unsafe extern "C" fn(*mut KpepConfig, *mut u32) -> c_int,
-    pub kpep_config_kpc_count:
-        unsafe extern "C" fn(*mut KpepConfig, *mut usize) -> c_int,
-    pub kpep_config_kpc_map: unsafe extern "C" fn(
-        *mut KpepConfig,
-        *mut usize,
-        usize,
-    ) -> c_int,
-    pub kpep_config_kpc: unsafe extern "C" fn(
-        *mut KpepConfig,
-        *mut KpcConfig,
-        usize,
-    ) -> c_int,
+    pub kpep_config_add_event:
+        unsafe extern "C" fn(*mut KpepConfig, *mut *mut KpepEvent, u32, *mut u32) -> c_int,
+    pub kpep_config_force_counters: unsafe extern "C" fn(*mut KpepConfig) -> c_int,
+    pub kpep_config_kpc_classes: unsafe extern "C" fn(*mut KpepConfig, *mut u32) -> c_int,
+    pub kpep_config_kpc_count: unsafe extern "C" fn(*mut KpepConfig, *mut usize) -> c_int,
+    pub kpep_config_kpc_map: unsafe extern "C" fn(*mut KpepConfig, *mut usize, usize) -> c_int,
+    pub kpep_config_kpc: unsafe extern "C" fn(*mut KpepConfig, *mut KpcConfig, usize) -> c_int,
 }
 
 /// Load both frameworks and resolve every symbol we need. dlopen
@@ -194,10 +163,7 @@ pub fn load() -> Result<Frameworks, Error> {
         kperf_action_count_get: sym!(kperf, kperf_action_count_get),
         kperf_action_samplers_set: sym!(kperf, kperf_action_samplers_set),
         kperf_action_samplers_get: sym!(kperf, kperf_action_samplers_get),
-        kperf_action_filter_set_by_pid: sym!(
-            kperf,
-            kperf_action_filter_set_by_pid
-        ),
+        kperf_action_filter_set_by_pid: sym!(kperf, kperf_action_filter_set_by_pid),
         kperf_timer_count_set: sym!(kperf, kperf_timer_count_set),
         kperf_timer_count_get: sym!(kperf, kperf_timer_count_get),
         kperf_timer_period_set: sym!(kperf, kperf_timer_period_set),
@@ -222,10 +188,7 @@ pub fn load() -> Result<Frameworks, Error> {
         kpep_config_create: sym!(kperfdata, kpep_config_create),
         kpep_config_free: sym!(kperfdata, kpep_config_free),
         kpep_config_add_event: sym!(kperfdata, kpep_config_add_event),
-        kpep_config_force_counters: sym!(
-            kperfdata,
-            kpep_config_force_counters
-        ),
+        kpep_config_force_counters: sym!(kperfdata, kpep_config_force_counters),
         kpep_config_kpc_classes: sym!(kperfdata, kpep_config_kpc_classes),
         kpep_config_kpc_count: sym!(kperfdata, kpep_config_kpc_count),
         kpep_config_kpc_map: sym!(kperfdata, kpep_config_kpc_map),
@@ -272,4 +235,3 @@ fn bytes_to_path(bytes: &[u8]) -> String {
     let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
     String::from_utf8_lossy(trimmed).into_owned()
 }
-

@@ -90,10 +90,8 @@ impl TargetImageWalker {
         if info.all_image_info_addr == 0 {
             return Err(WalkError::NoImageInfoAddr);
         }
-        let header = self.read_struct::<DyldAllImageInfos>(
-            info.all_image_info_addr,
-            "dyld_all_image_infos",
-        )?;
+        let header = self
+            .read_struct::<DyldAllImageInfos>(info.all_image_info_addr, "dyld_all_image_infos")?;
         if header.info_array == 0 || header.info_array_count == 0 {
             return Ok(Vec::new());
         }
@@ -106,7 +104,9 @@ impl TargetImageWalker {
             "dyld image array",
             // SAFETY: `images` is a unique mut Vec; we cast to
             // its raw byte buffer for the read.
-            unsafe { std::slice::from_raw_parts_mut(images.as_mut_ptr().cast::<u8>(), bytes_total) },
+            unsafe {
+                std::slice::from_raw_parts_mut(images.as_mut_ptr().cast::<u8>(), bytes_total)
+            },
         )?;
 
         let mut out: Vec<ImageEntry> = Vec::with_capacity(images.len() + 1);
@@ -120,8 +120,7 @@ impl TargetImageWalker {
         // avma_range.start so order doesn't matter for lookups.
         if header.dyld_image_load_address != 0 && header.dyld_path != 0 {
             if let Some(path) = self.read_c_string(header.dyld_path) {
-                let sections =
-                    crate::macho::parse_image(self.task, header.dyld_image_load_address);
+                let sections = crate::macho::parse_image(self.task, header.dyld_image_load_address);
                 out.push(ImageEntry {
                     path,
                     load_address: header.dyld_image_load_address,
@@ -181,12 +180,7 @@ impl TargetImageWalker {
         Ok(info)
     }
 
-    fn read_into(
-        &self,
-        addr: u64,
-        what: &'static str,
-        buf: &mut [u8],
-    ) -> Result<(), WalkError> {
+    fn read_into(&self, addr: u64, what: &'static str, buf: &mut [u8]) -> Result<(), WalkError> {
         let mut got: mach_vm_size_t = 0;
         // SAFETY: `buf` is a unique mut slice; addr is opaque
         // to the kernel; `got` is an out-pointer.
@@ -220,9 +214,7 @@ impl TargetImageWalker {
         // SAFETY: T is plain-old-data per its Default + Copy
         // requirement (we only construct repr(C) PODs from this
         // crate).
-        let buf = unsafe {
-            std::slice::from_raw_parts_mut((&mut t) as *mut T as *mut u8, bytes)
-        };
+        let buf = unsafe { std::slice::from_raw_parts_mut((&mut t) as *mut T as *mut u8, bytes) };
         self.read_into(addr, what, buf)?;
         Ok(t)
     }
@@ -272,8 +264,8 @@ struct TaskDyldInfo {
     _pad: u32,
 }
 
-const TASK_DYLD_INFO_COUNT: mach_msg_type_number_t = (std::mem::size_of::<TaskDyldInfo>()
-    / std::mem::size_of::<u32>()) as mach_msg_type_number_t;
+const TASK_DYLD_INFO_COUNT: mach_msg_type_number_t =
+    (std::mem::size_of::<TaskDyldInfo>() / std::mem::size_of::<u32>()) as mach_msg_type_number_t;
 
 /// First fields of `dyld_all_image_infos` from
 /// `<mach-o/dyld_images.h>`. We read more than we strictly need

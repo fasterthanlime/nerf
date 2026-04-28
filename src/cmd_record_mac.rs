@@ -7,11 +7,11 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use stax_mac_capture::{
-    BinaryLoadedEvent, BinaryUnloadedEvent, JitdumpEvent, SampleEvent, SampleSink,
-    ThreadNameEvent, WakeupEvent,
-};
 use nwind::UserFrame;
+use stax_mac_capture::{
+    BinaryLoadedEvent, BinaryUnloadedEvent, JitdumpEvent, SampleEvent, SampleSink, ThreadNameEvent,
+    WakeupEvent,
+};
 
 use crate::args::{self, TargetProcess};
 use crate::live_sink::{
@@ -31,9 +31,10 @@ pub fn main_with_live_sink(
 ) -> Result<(), Box<dyn Error>> {
     match args.target()? {
         TargetProcess::ByPid(pid) => record_existing_pid(args, pid, live_sink),
-        TargetProcess::Launch { program, args: prog_args } => {
-            record_child_launch(args, program, prog_args, live_sink)
-        }
+        TargetProcess::Launch {
+            program,
+            args: prog_args,
+        } => record_child_launch(args, program, prog_args, live_sink),
     }
 }
 
@@ -152,9 +153,7 @@ struct LiveOnlySink {
 /// know the pid.
 fn notify_target_attached(sink: &LiveOnlySink, pid: u32) {
     if let Some(live) = sink.live_sink.as_ref() {
-        futures::executor::block_on(
-            live.on_target_attached(&TargetAttached { pid, task_port: 0 }),
-        );
+        futures::executor::block_on(live.on_target_attached(&TargetAttached { pid, task_port: 0 }));
     }
 }
 
@@ -324,19 +323,17 @@ impl SampleSink for LiveOnlySink {
         let Some(sink) = self.live_sink.as_ref() else {
             return;
         };
-        block_sink(sink.on_probe_result(
-            &crate::live_sink::ProbeResultEvent {
-                tid: ev.tid,
-                kperf_ts: ev.kperf_ts_ns,
-                probe_done_ns: ev.probe_done_ns,
-                mach_pc: ev.mach_pc,
-                mach_lr: ev.mach_lr,
-                mach_fp: ev.mach_fp,
-                mach_sp: ev.mach_sp,
-                mach_walked: ev.mach_walked,
-                used_framehop: ev.used_framehop,
-            },
-        ));
+        block_sink(sink.on_probe_result(&crate::live_sink::ProbeResultEvent {
+            tid: ev.tid,
+            kperf_ts: ev.kperf_ts_ns,
+            probe_done_ns: ev.probe_done_ns,
+            mach_pc: ev.mach_pc,
+            mach_lr: ev.mach_lr,
+            mach_fp: ev.mach_fp,
+            mach_sp: ev.mach_sp,
+            mach_walked: ev.mach_walked,
+            used_framehop: ev.used_framehop,
+        }));
     }
 
     fn on_macho_byte_source(
@@ -376,4 +373,3 @@ impl Drop for ChildGuard {
         }
     }
 }
-

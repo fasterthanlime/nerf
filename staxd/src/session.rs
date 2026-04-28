@@ -13,10 +13,8 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use stax_mac_kperf_sys::bindings::{self, Frameworks};
-use stax_mac_kperf_sys::kdebug::{self, kdbg_class, kdbg_code, kdbg_func, kdbg_subclass, perf, KdBuf, KdRegtype, DBG_FUNC_END, DBG_FUNC_START, DBG_PERF, KDBG_TIMESTAMP_MASK};
+use stax_mac_kperf_sys::kdebug::{self, KdBuf, KdRegtype};
 use staxd_proto::{KdBufBatch, KdBufWire, RecordError, RecordSummary, SessionConfig};
-
-use crate::probe::{self, ProbeRequest};
 
 pub async fn run(
     config: SessionConfig,
@@ -44,21 +42,9 @@ pub async fn run(
 
     setup_kperf(&fw, &config)?;
 
-    // Spawn the probe BEFORE enabling kdebug. probe::spawn does
-    // the (slow) framehop unwinder build — image enumeration +
-    // Mach-O parsing — which can take 100ms+ on a target with
-    // many dylibs. If we let kdebug start emitting records during
-    // that window, they sit in the ringbuffer with their original
-    // kperf_ts and the probe worker chews through them serially
-    // afterwards, producing drift readings of 100ms+ on the
-    // *first* samples of every recording (warmup artefact, not
-    // steady state). Spawning first means kperf samples only
-    // start flowing when the probe is already consuming.
-    let probe_chan = probe::spawn(config.target_pid);
-
     setup_kdebug(&config)?;
 
-    let result = drain(&fw, &config, records, probe_chan).await;
+    let result = drain(&fw, &config, records).await;
 
     teardown(&fw);
     result
@@ -99,7 +85,10 @@ fn setup_kperf(fw: &Frameworks, config: &SessionConfig) -> Result<(), RecordErro
         unsafe { (fw.kperf_timer_action_set)(actionid, timerid) },
         "timer_action_set",
     )?;
-    kperf_call(unsafe { (fw.kperf_timer_pet_set)(timerid) }, "timer_pet_set")?;
+    kperf_call(
+        unsafe { (fw.kperf_timer_pet_set)(timerid) },
+        "timer_pet_set",
+    )?;
 
     if !config.pmu_event_configs.is_empty() {
         let mut configs = config.pmu_event_configs.clone();
@@ -145,26 +134,15 @@ async fn drain(
     _fw: &Frameworks,
     config: &SessionConfig,
     records: vox::Tx<KdBufBatch>,
-    mut probe_chan: Option<probe::ProbeChannel>,
 ) -> Result<RecordSummary, RecordError> {
     let session_start = Instant::now();
     // Match recorder.rs:377: drain at 2x the sample period so the
     // ringbuffer never fills up. 1kHz → 2ms.
-    let drain_period = Duration::from_micros(
-        ((1_000_000u64 / config.frequency_hz.max(1) as u64) * 2).max(500),
-    );
+    let drain_period =
+        Duration::from_micros(((1_000_000u64 / config.frequency_hz.max(1) as u64) * 2).max(500));
 
     let mut buf: Vec<KdBuf> = vec![empty_kdbuf(); config.buf_records as usize];
     let mut total_drained: u64 = 0;
-
-    // Race-against-return measurement probe ships its results
-    // back through `probe_chan.results`, which we drain into each
-    // KdBufBatch. Spawning happened in run() *before* setup_kdebug
-    // so the probe worker is already up by the time kperf starts
-    // emitting records.
-    let mut sample_parser = SampleBoundaryParser::default();
-    let mut probe_request_drops: u64 = 0;
-    let mut probe_results_buf: Vec<staxd_proto::ProbeResultWire> = Vec::new();
 
     loop {
         tokio::time::sleep(drain_period).await;
@@ -178,24 +156,6 @@ async fn drain(
         };
         total_drained += n as u64;
 
-        // Probe path: queue a request per completed sample, then
-        // drain whatever results have come back since last cycle.
-        // Costs in the drain loop are bounded — try_send per closed
-        // sample, try_recv to drain the back-channel.
-        if let Some(chan) = probe_chan.as_mut() {
-            for rec in &buf[..n] {
-                if let Some(req) = sample_parser.feed(rec) {
-                    if chan.requests.try_send(req).is_err() {
-                        probe_request_drops += 1;
-                    }
-                }
-            }
-            probe_results_buf.clear();
-            while let Ok(result) = chan.results.try_recv() {
-                probe_results_buf.push(result);
-            }
-        }
-
         // Always send a batch, even when n == 0. The send doubles
         // as our detection of "client went away" — without it, the
         // drain loop spins forever holding ktrace ownership long
@@ -203,7 +163,6 @@ async fn drain(
         let batch = KdBufBatch {
             records: buf[..n].iter().map(kdbuf_to_wire).collect(),
             drained_at_unix_ns: unix_ns_now(),
-            probe_results: std::mem::take(&mut probe_results_buf),
         };
         if let Err(e) = records.send(batch).await {
             info!(?e, "client closed records channel; ending session");
@@ -211,114 +170,10 @@ async fn drain(
         }
     }
 
-    if probe_chan.is_some() {
-        info!(
-            probe_request_drops,
-            "probe: drain loop ended (request_drops = times the probe-request channel was full)"
-        );
-    }
-    drop(probe_chan);
-
     Ok(RecordSummary {
         records_drained: total_drained,
         session_ns: session_start.elapsed().as_nanos() as u64,
     })
-}
-
-/// Tiny inline kdebug parser: just enough to detect the end of
-/// each kperf sample and capture the leaf user PC + appended LR
-/// for the probe. Mirrors `stax-mac-kperf-parse::parser::Parser`
-/// but stripped to the boundary fields we care about and the
-/// user-stack record. Lives here so staxd doesn't have to pull
-/// the parser crate's heavyweight deps (object/memmap/capture).
-#[derive(Default)]
-struct SampleBoundaryParser {
-    /// `Some` when we've seen a `PERF_GEN_EVENT|FUNC_START` and
-    /// not yet the matching FUNC_END.
-    current: Option<InProgress>,
-}
-
-struct InProgress {
-    tid: u32,
-    /// kdebug record's mach-tick timestamp from the FUNC_START
-    /// boundary record.
-    timestamp_mach: u64,
-    /// Total user frames the UHDR claims (includes the appended
-    /// LR fixup on arm64).
-    ustack_expected: u32,
-    /// Raw user frames as they arrive in PERF_CS_UDATA chunks. We
-    /// only need frame[0] (leaf PC) and the last frame (appended
-    /// LR), but it's easier to collect and index than to track a
-    /// running counter.
-    ustack: Vec<u64>,
-    /// Total kernel frames. Needed only for the kstack_depth
-    /// stat we write per probe (lets the analyser bucket by
-    /// "interrupt-from-kernel" vs "interrupt-from-user").
-    kstack_expected: u32,
-}
-
-impl SampleBoundaryParser {
-    fn feed(&mut self, rec: &KdBuf) -> Option<ProbeRequest> {
-        if kdbg_class(rec.debugid) != DBG_PERF {
-            return None;
-        }
-        let subclass = kdbg_subclass(rec.debugid);
-        let code = kdbg_code(rec.debugid);
-        let func = kdbg_func(rec.debugid);
-
-        match (subclass, code, func) {
-            (perf::sc::GENERIC, 0, DBG_FUNC_START) => {
-                self.current = Some(InProgress {
-                    tid: rec.arg5 as u32,
-                    timestamp_mach: rec.timestamp & KDBG_TIMESTAMP_MASK,
-                    ustack_expected: 0,
-                    ustack: Vec::new(),
-                    kstack_expected: 0,
-                });
-                None
-            }
-            (perf::sc::GENERIC, 0, DBG_FUNC_END) => {
-                let ip = self.current.take()?;
-                // Skip samples where kperf didn't manage to walk
-                // the user side — no PC means no probe target.
-                if ip.ustack.is_empty() {
-                    return None;
-                }
-                Some(ProbeRequest {
-                    tid: ip.tid,
-                    kperf_ts_mach: ip.timestamp_mach,
-                })
-            }
-            (perf::sc::CALLSTACK, perf::cs::UHDR, _) => {
-                if let Some(ip) = self.current.as_mut() {
-                    let main = rec.arg2 as u32;
-                    let async_n = rec.arg4 as u32;
-                    ip.ustack_expected = main.saturating_add(async_n);
-                    ip.ustack.reserve(ip.ustack_expected as usize);
-                }
-                None
-            }
-            (perf::sc::CALLSTACK, perf::cs::UDATA, _) => {
-                if let Some(ip) = self.current.as_mut() {
-                    let chunk = [rec.arg1, rec.arg2, rec.arg3, rec.arg4];
-                    let remaining = (ip.ustack_expected as usize)
-                        .saturating_sub(ip.ustack.len());
-                    let take = remaining.min(4);
-                    ip.ustack.extend_from_slice(&chunk[..take]);
-                }
-                None
-            }
-            (perf::sc::CALLSTACK, perf::cs::KHDR, _) => {
-                if let Some(ip) = self.current.as_mut() {
-                    let main = rec.arg2 as u32;
-                    let async_n = rec.arg4 as u32;
-                    ip.kstack_expected = main.saturating_add(async_n);
-                }
-                None
-            }
-            _ => None,
-        }
-    }
 }
 
 fn teardown(fw: &Frameworks) {
@@ -342,7 +197,10 @@ fn kperf_call(rc: i32, op: &'static str) -> Result<(), RecordError> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(RecordError::Kperf { op: op.to_string(), code: rc })
+        Err(RecordError::Kperf {
+            op: op.to_string(),
+            code: rc,
+        })
     }
 }
 
@@ -354,10 +212,14 @@ fn map_kperf_err(e: stax_mac_kperf_sys::Error) -> RecordError {
             op: op.to_string(),
             message: source.to_string(),
         },
-        Error::Kperf { op, code } => RecordError::Kperf { op: op.to_string(), code },
-        Error::Kpep { op, code } => {
-            RecordError::Kperf { op: format!("kpep:{op}"), code }
-        }
+        Error::Kperf { op, code } => RecordError::Kperf {
+            op: op.to_string(),
+            code,
+        },
+        Error::Kpep { op, code } => RecordError::Kperf {
+            op: format!("kpep:{op}"),
+            code,
+        },
         Error::FrameworkLoad { path, msg } => RecordError::Sysctl {
             op: "FrameworkLoad".into(),
             message: format!("{path}: {msg}"),

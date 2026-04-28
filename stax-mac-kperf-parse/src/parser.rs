@@ -20,8 +20,8 @@
 //! See xnu `osfmk/kperf/{buffer.h, callstack.c, kperf.c, pet.c}`.
 
 use stax_mac_kperf_sys::kdebug::{
-    kdbg_class, kdbg_code, kdbg_func, kdbg_subclass, perf, KdBuf,
-    DBG_FUNC_END, DBG_FUNC_START, DBG_PERF, KDBG_TIMESTAMP_MASK,
+    kdbg_class, kdbg_code, kdbg_func, kdbg_subclass, perf, KdBuf, DBG_FUNC_END, DBG_FUNC_START,
+    DBG_PERF, KDBG_TIMESTAMP_MASK,
 };
 
 /// One completed sample. Lifetime tied to the parser's internal

@@ -15,8 +15,8 @@ use stax_live_proto::{
     TopSort, TopUpdate, ViewParams,
 };
 
-pub use crate::aggregator::{IntervalKind, PmuSample};
 use crate::aggregator::{Aggregation, EventCtx, OffCpuBreakdown, PmcAccum, StackNode};
+pub use crate::aggregator::{IntervalKind, PmuSample};
 
 mod aggregator;
 mod binaries;
@@ -27,7 +27,6 @@ pub mod source;
 
 pub use aggregator::{Aggregator, ProbeResultRecord};
 pub use binaries::{BinaryRegistry, LiveSymbolOwned, LoadedBinary};
-
 
 #[derive(Clone)]
 pub struct LiveServer {
@@ -193,11 +192,7 @@ impl Profiler for LiveServer {
         });
     }
 
-    async fn subscribe_timeline(
-        &self,
-        tid: Option<u32>,
-        output: vox::Tx<TimelineUpdate>,
-    ) {
+    async fn subscribe_timeline(&self, tid: Option<u32>, output: vox::Tx<TimelineUpdate>) {
         tracing::info!(?tid, "subscribe_timeline: starting stream");
         let aggregator = self.aggregator.clone();
         tokio::spawn(async move {
@@ -302,11 +297,7 @@ impl Profiler for LiveServer {
         self.paused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn subscribe_probe_diff(
-        &self,
-        tid: Option<u32>,
-        output: vox::Tx<ProbeDiffUpdate>,
-    ) {
+    async fn subscribe_probe_diff(&self, tid: Option<u32>, output: vox::Tx<ProbeDiffUpdate>) {
         tracing::info!(?tid, "subscribe_probe_diff: starting stream");
         let aggregator = self.aggregator.clone();
         let binaries = self.binaries.clone();
@@ -496,23 +487,21 @@ fn build_intervals_update(
 
         if entries.len() < DRILLDOWN_ENTRY_CAP {
             // Resolve the waker symbol into the shared string table.
-            let (waker_address, waker_function_name, waker_binary) = match (
-                waker_tid,
-                waker_user_stack.as_deref(),
-            ) {
-                (Some(_), Some(stack)) => match stack.first().copied() {
-                    Some(addr) => match binaries.lookup_symbol(addr) {
-                        Some(r) => (
-                            Some(addr),
-                            Some(interner.intern(r.function_name)),
-                            Some(interner.intern(r.binary)),
-                        ),
-                        None => (Some(addr), None, None),
+            let (waker_address, waker_function_name, waker_binary) =
+                match (waker_tid, waker_user_stack.as_deref()) {
+                    (Some(_), Some(stack)) => match stack.first().copied() {
+                        Some(addr) => match binaries.lookup_symbol(addr) {
+                            Some(r) => (
+                                Some(addr),
+                                Some(interner.intern(r.function_name)),
+                                Some(interner.intern(r.binary)),
+                            ),
+                            None => (Some(addr), None, None),
+                        },
+                        None => (None, None, None),
                     },
-                    None => (None, None, None),
-                },
-                _ => (None, None, None),
-            };
+                    _ => (None, None, None),
+                };
             entries.push(IntervalEntry {
                 tid: event_tid,
                 start_ns: raw.start_ns.saturating_sub(session_start),
@@ -660,8 +649,10 @@ fn build_probe_diff_update(
     // Per-thread bounded ring of *raw* entry references — no
     // ResolvedFrame allocation yet. After the main pass we pick
     // the focus thread and resolve only its kept entries.
-    let mut per_thread_recent: std::collections::HashMap<u32, std::collections::VecDeque<RawEntry>> =
-        std::collections::HashMap::new();
+    let mut per_thread_recent: std::collections::HashMap<
+        u32,
+        std::collections::VecDeque<RawEntry>,
+    > = std::collections::HashMap::new();
 
     for thread_tid in agg.iter_threads() {
         if let Some(want) = only_tid {
@@ -734,7 +725,11 @@ fn build_probe_diff_update(
                     for d in 0..max_depth {
                         depth_total[d] += 1;
                         let kperf_frame = pet.stack[d];
-                        let probe_frame = if d == 0 { probe.mach_pc } else { probe_walk[d - 1] };
+                        let probe_frame = if d == 0 {
+                            probe.mach_pc
+                        } else {
+                            probe_walk[d - 1]
+                        };
                         if kperf_frame == probe_frame {
                             depth_match[d] += 1;
                         }
@@ -769,19 +764,15 @@ fn build_probe_diff_update(
                         t_stitchable += 1;
                     }
 
-                    let ring = per_thread_recent
-                        .entry(thread_tid)
-                        .or_insert_with(|| {
-                            std::collections::VecDeque::with_capacity(PROBE_RECENT_CAP)
-                        });
+                    let ring = per_thread_recent.entry(thread_tid).or_insert_with(|| {
+                        std::collections::VecDeque::with_capacity(PROBE_RECENT_CAP)
+                    });
                     if ring.len() == PROBE_RECENT_CAP {
                         ring.pop_front();
                     }
                     ring.push_back(RawEntry {
                         timestamp_ns: pet.timestamp_ns.saturating_sub(session_start),
-                        drift_ns: drift_ns_signed
-                            .clamp(i64::MIN as i128, i64::MAX as i128)
-                            as i64,
+                        drift_ns: drift_ns_signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
                         common_suffix: common as u32,
                         pc_match,
                         stitchable,
@@ -1076,14 +1067,11 @@ fn group_top_entries(
             .entry(key)
             .and_modify(|g| {
                 g.self_on_cpu_ns = g.self_on_cpu_ns.saturating_add(stats.self_on_cpu_ns);
-                g.total_on_cpu_ns =
-                    g.total_on_cpu_ns.saturating_add(stats.total_on_cpu_ns);
+                g.total_on_cpu_ns = g.total_on_cpu_ns.saturating_add(stats.total_on_cpu_ns);
                 g.self_off_cpu.add_other(&stats.self_off_cpu);
                 g.total_off_cpu.add_other(&stats.total_off_cpu);
-                g.self_pet_samples =
-                    g.self_pet_samples.saturating_add(stats.self_pet_samples);
-                g.total_pet_samples =
-                    g.total_pet_samples.saturating_add(stats.total_pet_samples);
+                g.self_pet_samples = g.self_pet_samples.saturating_add(stats.self_pet_samples);
+                g.total_pet_samples = g.total_pet_samples.saturating_add(stats.total_pet_samples);
                 g.self_off_cpu_intervals = g
                     .self_off_cpu_intervals
                     .saturating_add(stats.self_off_cpu_intervals);
@@ -1179,10 +1167,7 @@ fn group_top_entries(
 /// Bucket size is chosen so we stay around `TARGET_BUCKETS`
 /// regardless of recording duration, with a sensible minimum so we
 /// don't over-quantize a 1-second recording.
-fn build_timeline_update(
-    aggregator: &Arc<RwLock<Aggregator>>,
-    tid: Option<u32>,
-) -> TimelineUpdate {
+fn build_timeline_update(aggregator: &Arc<RwLock<Aggregator>>, tid: Option<u32>) -> TimelineUpdate {
     const TARGET_BUCKETS: u64 = 200;
     const MIN_BUCKET_NS: u64 = 50_000_000; // 50 ms
 
@@ -1205,7 +1190,11 @@ fn build_timeline_update(
 
     for (_tid, interval) in agg.iter_intervals(tid) {
         let int_start = interval.start_ns;
-        let int_end = if interval.end_ns == 0 { last } else { interval.end_ns };
+        let int_end = if interval.end_ns == 0 {
+            last
+        } else {
+            interval.end_ns
+        };
         if int_end <= int_start {
             continue;
         }
@@ -1287,10 +1276,7 @@ fn compute_neighbors_update(
         children: HashMap<SymbolKey, SymbolNode>,
     }
 
-    fn classify(
-        addr: u64,
-        bins: &BinaryRegistry,
-    ) -> (SymbolKey, bool, stax_demangle::Language) {
+    fn classify(addr: u64, bins: &BinaryRegistry) -> (SymbolKey, bool, stax_demangle::Language) {
         match bins.lookup_symbol(addr) {
             Some(r) => (
                 (Some(r.function_name), Some(r.binary)),
@@ -1313,9 +1299,7 @@ fn compute_neighbors_update(
         node.on_cpu_ns = node.on_cpu_ns.saturating_add(src.on_cpu_ns);
         node.off_cpu.add_other(&src.off_cpu);
         node.pet_samples = node.pet_samples.saturating_add(src.pet_samples);
-        node.off_cpu_intervals = node
-            .off_cpu_intervals
-            .saturating_add(src.off_cpu_intervals);
+        node.off_cpu_intervals = node.off_cpu_intervals.saturating_add(src.off_cpu_intervals);
         let candidate = src.on_cpu_ns;
         if candidate > node.rep_self_ns {
             node.rep_address = addr;
@@ -1325,11 +1309,7 @@ fn compute_neighbors_update(
         }
     }
 
-    fn merge_descendants(
-        dst: &mut SymbolNode,
-        src: &StackNode,
-        bins: &BinaryRegistry,
-    ) {
+    fn merge_descendants(dst: &mut SymbolNode, src: &StackNode, bins: &BinaryRegistry) {
         for (caddr, child) in &src.children {
             let (key, is_main, language) = classify(*caddr, bins);
             let entry = dst.children.entry(key).or_default();
@@ -1369,7 +1349,9 @@ fn compute_neighbors_update(
             ancestors.push(node_addr);
         }
         for (caddr, child) in &node.children {
-            walk(child, *caddr, ancestors, target_key, bins, callers, callees, own);
+            walk(
+                child, *caddr, ancestors, target_key, bins, callers, callees, own,
+            );
         }
         if pushed {
             ancestors.pop();
@@ -1546,10 +1528,7 @@ impl StringInterner {
     }
 }
 
-fn compute_flame_update(
-    aggregation: &Aggregation,
-    binaries: &BinaryRegistry,
-) -> FlamegraphUpdate {
+fn compute_flame_update(aggregation: &Aggregation, binaries: &BinaryRegistry) -> FlamegraphUpdate {
     let total_on_cpu_ns = aggregation.total_on_cpu_ns;
     let total_off_cpu = aggregation.total_off_cpu;
     let total_combined = total_on_cpu_ns.saturating_add(total_off_cpu.total_ns());
@@ -1560,8 +1539,12 @@ fn compute_flame_update(
     // it; the residue cell still catches the truly-tiny tail.
     let threshold = (total_combined / 2000).max(1);
     let mut interner = StringInterner::new();
-    let (mut children, residue) =
-        build_children_with_residue(&[&aggregation.flame_root], threshold, binaries, &mut interner);
+    let (mut children, residue) = build_children_with_residue(
+        &[&aggregation.flame_root],
+        threshold,
+        binaries,
+        &mut interner,
+    );
     // build_children_with_residue already returns children sorted;
     // fold_recursion only rewrites a node's children Vec, never the
     // node's own data, so the top-level order stays correct.
@@ -1671,12 +1654,7 @@ fn build_children_with_residue(
         for (&addr, child) in &src.children {
             let resolved = binaries.lookup_symbol(addr);
             let (fname, bin, is_main, lang) = match resolved {
-                Some(r) => (
-                    Some(r.function_name),
-                    Some(r.binary),
-                    r.is_main,
-                    r.language,
-                ),
+                Some(r) => (Some(r.function_name), Some(r.binary), r.is_main, r.language),
                 None => (None, None, false, stax_demangle::Language::Unknown),
             };
             let key = (fname, bin);
@@ -1759,8 +1737,8 @@ fn build_children_with_residue(
             residue_on_cpu_ns = residue_on_cpu_ns.saturating_add(acc.on_cpu_ns);
             residue_off_cpu.add_other(&acc.off_cpu);
             residue_pet_samples = residue_pet_samples.saturating_add(acc.pet_samples);
-            residue_off_cpu_intervals = residue_off_cpu_intervals
-                .saturating_add(acc.off_cpu_intervals);
+            residue_off_cpu_intervals =
+                residue_off_cpu_intervals.saturating_add(acc.off_cpu_intervals);
             residue_dropped += 1;
         }
     }

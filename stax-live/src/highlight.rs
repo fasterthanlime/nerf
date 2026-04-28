@@ -72,6 +72,9 @@ mod tests {
         let html = hl.highlight_line("mov rax, 0x42");
         // Default format is custom elements: `<a-f>`, `<a-v>`, etc. Just
         // sanity-check the output isn't empty and contains *some* tag.
-        assert!(html.contains("<a-"), "expected custom-tag output, got {html:?}");
+        assert!(
+            html.contains("<a-"),
+            "expected custom-tag output, got {html:?}"
+        );
     }
 }

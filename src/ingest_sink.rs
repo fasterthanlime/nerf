@@ -146,14 +146,16 @@ impl LiveSink for IngestSink {
                 waker_tid,
                 waker_user_stack,
             } => {
-                let _ = self.tx.send(IngestEvent::OffCpuInterval(WireOffCpuInterval {
-                    tid: ev.tid,
-                    start_ns: ev.start_ns,
-                    end_ns: ev.end_ns,
-                    stack: stack.iter().map(|f| f.address).collect(),
-                    waker_tid: *waker_tid,
-                    waker_user_stack: waker_user_stack.map(|s| s.to_vec()),
-                }));
+                let _ = self
+                    .tx
+                    .send(IngestEvent::OffCpuInterval(WireOffCpuInterval {
+                        tid: ev.tid,
+                        start_ns: ev.start_ns,
+                        end_ns: ev.end_ns,
+                        stack: stack.iter().map(|f| f.address).collect(),
+                        waker_tid: *waker_tid,
+                        waker_user_stack: waker_user_stack.map(|s| s.to_vec()),
+                    }));
             }
         }
     }
@@ -175,7 +177,11 @@ impl LiveSink for IngestSink {
 pub async fn connect_and_register(
     server_socket: &str,
     config: stax_live_proto::RunConfig,
-) -> eyre::Result<(stax_live_proto::RunId, IngestSink, tokio::task::JoinHandle<()>)> {
+) -> eyre::Result<(
+    stax_live_proto::RunId,
+    IngestSink,
+    tokio::task::JoinHandle<()>,
+)> {
     let url = format!("local://{server_socket}");
     let client: RunIngestClient = vox::connect(&url).await?;
 

@@ -243,11 +243,7 @@ impl Pipeline {
     /// emit `SampleEvent`s, `WakeupEvent`s, and `CpuIntervalEvent`s
     /// to the sink. The caller is responsible for sourcing the
     /// records (drain via `KERN_KDREADTR`, or receive via vox).
-    pub fn process_records<S: SampleSink>(
-        &mut self,
-        records: &[KdBuf],
-        sink: &mut S,
-    ) {
+    pub fn process_records<S: SampleSink>(&mut self, records: &[KdBuf], sink: &mut S) {
         self.total_drained += records.len() as u64;
         let pid = self.config.pid;
         let pmc_idx_l1d = self.config.pmc_idx_l1d;
@@ -261,9 +257,7 @@ impl Pipeline {
                     kdbg_func(rec.debugid),
                 );
                 *self.histogram.entry(key).or_insert(0) += 1;
-            } else if class == DBG_MACH
-                && kdbg_subclass(rec.debugid) == kdebug::DBG_MACH_SCHED
-            {
+            } else if class == DBG_MACH && kdbg_subclass(rec.debugid) == kdebug::DBG_MACH_SCHED {
                 self.offcpu.feed(rec);
                 continue;
             }
@@ -294,11 +288,7 @@ impl Pipeline {
                         *pmu_total_insns = pmu_total_insns.saturating_add(i);
                     }
                 }
-                offcpu.note_sample(
-                    sample.tid,
-                    sample.user_backtrace,
-                    sample.kernel_backtrace,
-                );
+                offcpu.note_sample(sample.tid, sample.user_backtrace, sample.kernel_backtrace);
                 // With lightweight_pet=0 kperf brackets every thread
                 // every tick, so blocked threads emit empty-stack
                 // samples that just inflate the in-kernel residue.
@@ -410,9 +400,7 @@ impl Pipeline {
                     let kallsyms = image.format_kallsyms(slide);
                     sink.on_kallsyms(&kallsyms);
                 }
-                None => log::warn!(
-                    "kernel slide estimator collected no votes; skipping kallsyms"
-                ),
+                None => log::warn!("kernel slide estimator collected no votes; skipping kallsyms"),
             }
         }
 
@@ -457,11 +445,7 @@ impl Pipeline {
     }
 }
 
-fn scan_thread_names<S: SampleSink>(
-    pid: u32,
-    sink: &mut S,
-    cache: &mut ThreadNameCache,
-) {
+fn scan_thread_names<S: SampleSink>(pid: u32, sink: &mut S, cache: &mut ThreadNameCache) {
     // Initial scan: ask libproc for whatever it knows. Later
     // scans (`scan_thread_names_for_observed`) follow kperf's tid
     // set, which is the only thing the live registry actually
@@ -474,7 +458,11 @@ fn scan_thread_names<S: SampleSink>(
         let tid = tid64 as u32;
         if let Ok(Some(name)) = libproc::thread_name(pid, tid64) {
             if cache.note_thread(tid, &name) {
-                sink.on_thread_name(ThreadNameEvent { pid, tid, name: &name });
+                sink.on_thread_name(ThreadNameEvent {
+                    pid,
+                    tid,
+                    name: &name,
+                });
             }
         }
     }
@@ -496,7 +484,11 @@ fn scan_thread_names_for_observed<S: SampleSink>(
     for &tid in seen {
         if let Ok(Some(name)) = libproc::thread_name_by_id(pid, tid as u64) {
             if cache.note_thread(tid, &name) {
-                sink.on_thread_name(ThreadNameEvent { pid, tid, name: &name });
+                sink.on_thread_name(ThreadNameEvent {
+                    pid,
+                    tid,
+                    name: &name,
+                });
             }
         }
     }

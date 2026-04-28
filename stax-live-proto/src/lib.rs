@@ -563,8 +563,8 @@ pub struct ProbeDiffUpdate {
     pub paired: u64,
     /// kperf samples observed without a matching probe result. A
     /// run of `kperf_only > 0` while `total_probes == 0` means the
-    /// probe is disabled or task_for_pid failed; otherwise it's a
-    /// pairing race or a probe-side drop.
+    /// correlated shade probe is disabled/unimplemented; otherwise
+    /// it's a pairing race or a probe-side drop.
     pub kperf_only: u64,
     /// Probe results observed without a matching kperf sample —
     /// indicates the probe fired but the matching kperf record
@@ -622,12 +622,7 @@ pub struct AnnotatedView {
 pub trait Profiler {
     /// Snapshot of the top-N functions, ranked by `sort`. `params`
     /// bundles thread/time/exclude filters.
-    async fn top(
-        &self,
-        limit: u32,
-        sort: TopSort,
-        params: ViewParams,
-    ) -> Vec<TopEntry>;
+    async fn top(&self, limit: u32, sort: TopSort, params: ViewParams) -> Vec<TopEntry>;
 
     async fn subscribe_top(
         &self,
@@ -650,21 +645,13 @@ pub trait Profiler {
         output: vox::Tx<AnnotatedView>,
     );
 
-    async fn subscribe_flamegraph(
-        &self,
-        params: ViewParams,
-        output: vox::Tx<FlamegraphUpdate>,
-    );
+    async fn subscribe_flamegraph(&self, params: ViewParams, output: vox::Tx<FlamegraphUpdate>);
 
     async fn subscribe_threads(&self, output: vox::Tx<ThreadsUpdate>);
 
     /// Always relative to the full recording (no `filter`); brush
     /// selection happens on top of the unfiltered timeline.
-    async fn subscribe_timeline(
-        &self,
-        tid: Option<u32>,
-        output: vox::Tx<TimelineUpdate>,
-    );
+    async fn subscribe_timeline(&self, tid: Option<u32>, output: vox::Tx<TimelineUpdate>);
 
     async fn subscribe_neighbors(
         &self,
@@ -678,11 +665,7 @@ pub trait Profiler {
     /// MACH_MAKERUNNABLE wakeup edges. The wakee's tid is required;
     /// `None` produces an empty update (we don't aggregate across
     /// threads).
-    async fn subscribe_wakers(
-        &self,
-        wakee_tid: u32,
-        output: vox::Tx<WakersUpdate>,
-    );
+    async fn subscribe_wakers(&self, wakee_tid: u32, output: vox::Tx<WakersUpdate>);
 
     /// Stream the off-CPU intervals attributed to a single stack
     /// node, in chronological order. Lets the UI drill into a flame
@@ -723,11 +706,7 @@ pub trait Profiler {
     /// stacks symbolicated through the live BinaryRegistry. Pass
     /// `tid = Some(_)` to scope to a single thread, or `None` for
     /// all threads.
-    async fn subscribe_probe_diff(
-        &self,
-        tid: Option<u32>,
-        output: vox::Tx<ProbeDiffUpdate>,
-    );
+    async fn subscribe_probe_diff(&self, tid: Option<u32>, output: vox::Tx<ProbeDiffUpdate>);
 }
 
 /// Stable handle for one run hosted by the server. Returned by
@@ -783,18 +762,8 @@ pub struct RunSummary {
     pub label: String,
     /// PET stack-walk hits ingested so far. Sourced from kperf
     /// (kdebug PERF_CS_UHDR/UDATA), one per kernel-side sampling
-    /// tick. User stacks here are FP-walked — broken for FP-less
-    /// code (Rust release without -C force-frame-pointers, JIT).
-    /// Use `walker_samples` when accuracy matters more than
-    /// timing fidelity.
+    /// tick.
     pub pet_samples: u64,
-    /// Framehop-walked user stacks pushed by stax-shade. These
-    /// are atomic-from-target-perspective (the thread is
-    /// suspended for the duration of the walk) and accurate for
-    /// FP-less code. Independent stream from `pet_samples`; no
-    /// kernel-graph attached, no atomic stitch with kperf
-    /// possible without kernel cooperation we don't have.
-    pub walker_samples: u64,
     /// Off-CPU intervals ingested so far.
     pub off_cpu_intervals: u64,
 }
@@ -919,12 +888,10 @@ pub struct WireWakeup {
 }
 
 /// One race-against-return probe result, correlated with a kperf
-/// sample by `(tid, kperf_ts_mach)`. The probe ran in staxd shortly
-/// after the kperf PMI sample landed: it suspended the originating
-/// thread, captured registers, walked the stack via framehop (or
-/// FP-walk fallback), and shipped the result back through the
-/// existing batch channel. Server resolves addresses through the
-/// same BinaryRegistry path it uses for kperf samples.
+/// sample by `(tid, kperf_ts_mach)`. This is produced by the
+/// attachment-side target helper, not by staxd. Server resolves
+/// addresses through the same BinaryRegistry path it uses for
+/// kperf samples.
 #[derive(Clone, Debug, Facet)]
 pub struct WireProbeResult {
     pub tid: u32,
@@ -960,13 +927,23 @@ pub struct WireProbeResult {
 pub enum IngestEvent {
     /// Recorder acquired its handle on the target. Fires once at
     /// the start of recording.
-    TargetAttached { pid: u32, task_port: u64 },
+    TargetAttached {
+        pid: u32,
+        task_port: u64,
+    },
     Sample(WireSampleEvent),
     OnCpuInterval(WireOnCpuInterval),
     OffCpuInterval(WireOffCpuInterval),
     BinaryLoaded(WireBinaryLoaded),
-    BinaryUnloaded { path: String, base_avma: u64 },
-    ThreadName { pid: u32, tid: u32, name: String },
+    BinaryUnloaded {
+        path: String,
+        base_avma: u64,
+    },
+    ThreadName {
+        pid: u32,
+        tid: u32,
+        name: String,
+    },
     Wakeup(WireWakeup),
     /// Race-against-return probe result for one kperf sample.
     /// Correlate against a `Sample` by `(tid, kperf_ts_ns)`.
@@ -1017,11 +994,7 @@ pub trait RunControl {
     /// Block until `condition` fires, the active run stops, or
     /// `timeout_ms` elapses (whichever comes first). Returns
     /// `NoActiveRun` immediately when nothing is recording.
-    async fn wait_active(
-        &self,
-        condition: WaitCondition,
-        timeout_ms: Option<u64>,
-    ) -> WaitOutcome;
+    async fn wait_active(&self, condition: WaitCondition, timeout_ms: Option<u64>) -> WaitOutcome;
 
     /// Ask the recorder to stop the active run cleanly. Returns the
     /// final `RunSummary` once the run has transitioned to `Stopped`.

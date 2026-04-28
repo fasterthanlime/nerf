@@ -21,14 +21,9 @@ pub fn disassemble(
     hl: &mut AsmHighlighter,
     mut self_lookup: impl FnMut(u64) -> (u64, u64),
 ) -> Vec<AnnotatedLine> {
-    let arch = resolved
-        .arch
-        .as_deref()
-        .unwrap_or(host_arch());
+    let arch = resolved.arch.as_deref().unwrap_or(host_arch());
     match arch {
-        "aarch64" | "arm64" | "arm64e" => {
-            disassemble_aarch64(resolved, hl, &mut self_lookup)
-        }
+        "aarch64" | "arm64" | "arm64e" => disassemble_aarch64(resolved, hl, &mut self_lookup),
         "amd64" | "x86_64" | "x86_64h" => disassemble_amd64(resolved, hl, &mut self_lookup),
         _ => Vec::new(),
     }

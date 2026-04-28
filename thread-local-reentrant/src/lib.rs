@@ -1,52 +1,38 @@
-use {
-    std::{
-        cell::{
-            UnsafeCell
-        },
-        mem::{
-            ManuallyDrop
-        },
-        ops::{
-            Deref,
-            DerefMut
-        },
-        sync::{
-            atomic::{
-                AtomicUsize,
-                Ordering
-            }
-        }
-    }
+use std::{
+    cell::UnsafeCell,
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 #[repr(transparent)]
 #[must_use]
-pub struct TlsValue< T >( T );
+pub struct TlsValue<T>(T);
 
-impl< T > Deref for TlsValue< T > {
+impl<T> Deref for TlsValue<T> {
     type Target = T;
-    fn deref( &self ) -> &Self::Target {
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl< T > DerefMut for TlsValue< T > {
-    fn deref_mut( &mut self ) -> &mut Self::Target {
+impl<T> DerefMut for TlsValue<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-enum SlotKind< T > {
+enum SlotKind<T> {
     Uninitialized,
-    Initialized( ManuallyDrop< T > ),
+    Initialized(ManuallyDrop<T>),
     Destroyed,
-    Initializing
+    Initializing,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AccessError {
     Uninitialized,
-    Destroyed
+    Destroyed,
 }
 
 pub const INCOMPLETE: usize = 0;
@@ -54,25 +40,26 @@ const COMPLETE: usize = 1;
 const RUNNING: usize = 2;
 
 #[cold]
-pub unsafe fn initialize_pthread_key< T >(
+pub unsafe fn initialize_pthread_key<T>(
     key: *mut libc::pthread_key_t,
-    once: &AtomicUsize
+    once: &AtomicUsize,
 ) -> libc::pthread_key_t {
-    unsafe extern "C" fn destructor< T >( cell: *mut libc::c_void ) {
-        let kind = cell as *mut SlotKind< T >;
-        if let SlotKind::Initialized( mut value ) = std::ptr::replace( kind, SlotKind::Destroyed ) {
-            std::mem::ManuallyDrop::drop( &mut value );
+    unsafe extern "C" fn destructor<T>(cell: *mut libc::c_void) {
+        let kind = cell as *mut SlotKind<T>;
+        if let SlotKind::Initialized(mut value) = std::ptr::replace(kind, SlotKind::Destroyed) {
+            std::mem::ManuallyDrop::drop(&mut value);
         }
     }
 
-    if once.load( Ordering::Acquire ) != COMPLETE {
+    if once.load(Ordering::Acquire) != COMPLETE {
         loop {
-            let old = once.compare_exchange( INCOMPLETE, RUNNING, Ordering::SeqCst, Ordering::SeqCst );
+            let old =
+                once.compare_exchange(INCOMPLETE, RUNNING, Ordering::SeqCst, Ordering::SeqCst);
             if old.is_ok() {
-                libc::pthread_key_create( key, Some( destructor::< T > ) );
-                once.store( COMPLETE, Ordering::SeqCst );
+                libc::pthread_key_create(key, Some(destructor::<T>));
+                once.store(COMPLETE, Ordering::SeqCst);
                 break;
-            } else if old == Err( COMPLETE ) {
+            } else if old == Err(COMPLETE) {
                 break;
             } else {
                 std::thread::yield_now();
@@ -86,45 +73,48 @@ pub unsafe fn initialize_pthread_key< T >(
 
 #[cold]
 #[inline(never)]
-unsafe fn initialize_slot< K >( slot: &Slot< K::Value > ) -> &K::Value
-    where K: Key + ?Sized
+unsafe fn initialize_slot<K>(slot: &Slot<K::Value>) -> &K::Value
+where
+    K: Key + ?Sized,
 {
-    let pointer: *mut SlotKind< K::Value > = slot.0.get();
+    let pointer: *mut SlotKind<K::Value> = slot.0.get();
 
-    assert!( matches!( *pointer, SlotKind::Uninitialized ) );
+    assert!(matches!(*pointer, SlotKind::Uninitialized));
     *pointer = SlotKind::Initializing;
 
-    let value = K::construct( move |value| {
-        libc::pthread_setspecific( K::initialize_pthread_key(), pointer as *const libc::c_void );
-        TlsValue( value )
+    let value = K::construct(move |value| {
+        libc::pthread_setspecific(K::initialize_pthread_key(), pointer as *const libc::c_void);
+        TlsValue(value)
     });
 
-    *pointer = SlotKind::Initialized( ManuallyDrop::new( value.0 ) );
+    *pointer = SlotKind::Initialized(ManuallyDrop::new(value.0));
 
     match *pointer {
-        SlotKind::Initialized( ref value ) => &value,
-        _ => unreachable!()
+        SlotKind::Initialized(ref value) => &value,
+        _ => unreachable!(),
     }
 }
 
 pub trait Key {
     type Value;
 
-    fn construct( callback: impl FnOnce( Self::Value ) -> TlsValue< Self::Value > ) -> TlsValue< Self::Value >;
+    fn construct(
+        callback: impl FnOnce(Self::Value) -> TlsValue<Self::Value>,
+    ) -> TlsValue<Self::Value>;
     fn initialize_pthread_key() -> libc::pthread_key_t;
-    fn access_raw< R >( callback: impl FnOnce( &Slot< Self::Value > ) -> R ) -> R;
+    fn access_raw<R>(callback: impl FnOnce(&Slot<Self::Value>) -> R) -> R;
 
     #[inline(always)]
-    fn access< R >( callback: impl FnOnce( &Self::Value ) -> R ) -> Result< R, AccessError > {
-        Self::access_raw( |slot| {
+    fn access<R>(callback: impl FnOnce(&Self::Value) -> R) -> Result<R, AccessError> {
+        Self::access_raw(|slot| {
             let value = match *unsafe { &mut *slot.0.get() } {
-                SlotKind::Initialized( ref value ) => value,
-                SlotKind::Destroyed => return Err( AccessError::Destroyed ),
-                SlotKind::Initializing => return Err( AccessError::Uninitialized ),
-                SlotKind::Uninitialized => unsafe { initialize_slot::< Self >( slot ) }
+                SlotKind::Initialized(ref value) => value,
+                SlotKind::Destroyed => return Err(AccessError::Destroyed),
+                SlotKind::Initializing => return Err(AccessError::Uninitialized),
+                SlotKind::Uninitialized => unsafe { initialize_slot::<Self>(slot) },
             };
 
-            Ok( callback( value ) )
+            Ok(callback(value))
         })
     }
 }
@@ -138,35 +128,37 @@ macro_rules! thread_local_reentrant {
             type Value = $ty;
 
             fn construct(
-                callback: impl FnOnce( Self::Value ) -> $crate::TlsValue< Self::Value >
-            ) -> $crate::TlsValue< Self::Value > {
+                callback: impl FnOnce(Self::Value) -> $crate::TlsValue<Self::Value>,
+            ) -> $crate::TlsValue<Self::Value> {
                 let $callback = callback;
                 $ctor
             }
 
             fn initialize_pthread_key() -> libc::pthread_key_t {
                 static mut KEY: libc::pthread_key_t = 0;
-                static ONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new( $crate::INCOMPLETE );
+                static ONCE: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new($crate::INCOMPLETE);
 
-                unsafe {
-                    $crate::initialize_pthread_key::< $ty >( std::ptr::addr_of_mut!( KEY ), &ONCE )
-                }
+                unsafe { $crate::initialize_pthread_key::<$ty>(std::ptr::addr_of_mut!(KEY), &ONCE) }
             }
 
             #[inline(always)]
-            fn access_raw< R >( callback: impl FnOnce( &$crate::Slot< Self::Value > ) -> R ) -> R {
+            fn access_raw<R>(callback: impl FnOnce(&$crate::Slot<Self::Value>) -> R) -> R {
                 thread_local! {
                     static TLS: $crate::Slot< $ty > = const { $crate::Slot::uninit() };
                 }
-                TLS.with( |slot| callback( slot ) )
+                TLS.with(|slot| callback(slot))
             }
         }
 
         impl $name {
             #[allow(dead_code)]
             #[inline(always)]
-            pub fn try_with< R >( &self, callback: impl FnOnce( &$ty ) -> R ) -> Result< R, $crate::AccessError > {
-                <Self as $crate::Key>::access( callback )
+            pub fn try_with<R>(
+                &self,
+                callback: impl FnOnce(&$ty) -> R,
+            ) -> Result<R, $crate::AccessError> {
+                <Self as $crate::Key>::access(callback)
             }
         }
     };
@@ -180,34 +172,34 @@ macro_rules! thread_local_reentrant {
     };
 }
 
-pub struct Slot< T >( UnsafeCell< SlotKind< T > > );
+pub struct Slot<T>(UnsafeCell<SlotKind<T>>);
 
-impl< T > Slot< T > {
+impl<T> Slot<T> {
     #[inline]
     pub const fn uninit() -> Self {
-        Slot( UnsafeCell::new( SlotKind::Uninitialized ) )
+        Slot(UnsafeCell::new(SlotKind::Uninitialized))
     }
 }
 
 #[test]
 fn test_slot_does_not_need_drop() {
-    assert_eq!( std::mem::needs_drop::< Slot< String > >(), false );
+    assert_eq!(std::mem::needs_drop::<Slot<String>>(), false);
 }
 
 #[test]
 fn test_thread_local_reentrant_basic() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static CTOR_COUNTER: AtomicUsize = AtomicUsize::new( 0 );
-    static DTOR_COUNTER: AtomicUsize = AtomicUsize::new( 0 );
+    static CTOR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    static DTOR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     struct Dummy {
-        text: String
+        text: String,
     }
 
     impl Drop for Dummy {
-        fn drop( &mut self ) {
-            DTOR_COUNTER.fetch_add( 1, Ordering::SeqCst );
+        fn drop(&mut self) {
+            DTOR_COUNTER.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -228,38 +220,38 @@ fn test_thread_local_reentrant_basic() {
         };
     }
 
-    assert_eq!( CTOR_COUNTER.load( Ordering::SeqCst ), 0 );
-    assert_eq!( DTOR_COUNTER.load( Ordering::SeqCst ), 0 );
+    assert_eq!(CTOR_COUNTER.load(Ordering::SeqCst), 0);
+    assert_eq!(DTOR_COUNTER.load(Ordering::SeqCst), 0);
 
-    let thread = std::thread::spawn( || {
-        assert_eq!( CTOR_COUNTER.load( Ordering::SeqCst ), 0 );
-        assert_eq!( DTOR_COUNTER.load( Ordering::SeqCst ), 0 );
+    let thread = std::thread::spawn(|| {
+        assert_eq!(CTOR_COUNTER.load(Ordering::SeqCst), 0);
+        assert_eq!(DTOR_COUNTER.load(Ordering::SeqCst), 0);
 
-        let value = VALUE.try_with( |value| value.text.clone() );
-        assert_eq!( value.unwrap(), "foobar" );
+        let value = VALUE.try_with(|value| value.text.clone());
+        assert_eq!(value.unwrap(), "foobar");
 
-        assert_eq!( CTOR_COUNTER.load( Ordering::SeqCst ), 1 );
-        assert_eq!( DTOR_COUNTER.load( Ordering::SeqCst ), 0 );
+        assert_eq!(CTOR_COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(DTOR_COUNTER.load(Ordering::SeqCst), 0);
     });
 
     thread.join().unwrap();
 
-    assert_eq!( CTOR_COUNTER.load( Ordering::SeqCst ), 1 );
-    assert_eq!( DTOR_COUNTER.load( Ordering::SeqCst ), 1 );
+    assert_eq!(CTOR_COUNTER.load(Ordering::SeqCst), 1);
+    assert_eq!(DTOR_COUNTER.load(Ordering::SeqCst), 1);
 
     for _ in 0..2 {
-        let value = VALUE.try_with( |value| value.text.clone() );
-        assert_eq!( value.unwrap(), "foobar" );
+        let value = VALUE.try_with(|value| value.text.clone());
+        assert_eq!(value.unwrap(), "foobar");
 
-        assert_eq!( CTOR_COUNTER.load( Ordering::SeqCst ), 2 );
-        assert_eq!( DTOR_COUNTER.load( Ordering::SeqCst ), 1 );
+        assert_eq!(CTOR_COUNTER.load(Ordering::SeqCst), 2);
+        assert_eq!(DTOR_COUNTER.load(Ordering::SeqCst), 1);
     }
 }
 
 #[test]
 fn test_thread_local_reentrant_custom_constructor() {
     struct Tls {
-        value: u32
+        value: u32,
     }
 
     thread_local_reentrant! {
@@ -275,14 +267,14 @@ fn test_thread_local_reentrant_custom_constructor() {
         };
     }
 
-    let value = TLS.try_with( |value| value.value );
-    assert_eq!( value.unwrap(), 20 );
+    let value = TLS.try_with(|value| value.value);
+    assert_eq!(value.unwrap(), 20);
 }
 
 #[test]
 fn test_thread_local_reentrant_uninitialized() {
     struct Tls {
-        value: u32
+        value: u32,
     }
 
     thread_local_reentrant! {
@@ -296,6 +288,6 @@ fn test_thread_local_reentrant_uninitialized() {
         };
     }
 
-    let value = TLS.try_with( |value| value.value );
-    assert_eq!( value.unwrap(), 20 );
+    let value = TLS.try_with(|value| value.value);
+    assert_eq!(value.unwrap(), 20);
 }

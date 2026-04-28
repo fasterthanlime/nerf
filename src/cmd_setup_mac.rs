@@ -2,9 +2,9 @@
 //!
 //! Two modes, dispatched on euid at runtime:
 //!
-//!   * **non-root**: ad-hoc-codesign the current `stax` binary with the
-//!     `com.apple.security.cs.debugger` entitlement. (Adapted from
-//!     samply/src/mac/codesign_setup.rs, 1920bd32, MIT OR Apache-2.0.)
+//!   * **non-root**: explain the current install path. `cargo xtask
+//!     install` builds, copies, ad-hoc-signs, and bootstraps the
+//!     unprivileged server.
 //!
 //!   * **root** (`sudo stax setup`): install `staxd` as a
 //!     LaunchDaemon. Copies `~$SUDO_USER/.cargo/bin/staxd` to
@@ -88,10 +88,8 @@ fn is_root() -> bool {
 // ---------------------------------------------------------------------------
 
 /// Non-root entry point: tell the user the modern install path.
-/// We used to codesign `stax` itself with cs.debugger here; that
-/// entitlement now lives on `stax-shade` exclusively (see
-/// stax-shade/src/main.rs for the why) and `cargo xtask install`
-/// handles its codesign automatically. Nothing to do here.
+/// `cargo xtask install` handles build/copy/ad-hoc-sign for the
+/// user binaries and bootstraps stax-server. Nothing to do here.
 fn codesign_self(_args: &args::SetupArgs) -> Result<(), Box<dyn Error>> {
     println!("`stax setup` (no sudo) is a no-op now.");
     println!();
@@ -99,9 +97,8 @@ fn codesign_self(_args: &args::SetupArgs) -> Result<(), Box<dyn Error>> {
     println!();
     println!("    cargo xtask install");
     println!();
-    println!("…that codesigns stax-shade (the only entitlement-bearing");
-    println!("binary in the architecture) and bootstraps stax-server");
-    println!("as a per-user LaunchAgent.");
+    println!("…that ad-hoc signs copied binaries and bootstraps");
+    println!("stax-server as a per-user LaunchAgent.");
     println!();
     println!("Then, one-time only, install the privileged daemon:");
     println!();
@@ -141,17 +138,15 @@ Press Enter to continue, or Ctrl-C to cancel."#,
     }
 
     println!(":: copying binary -> {}", BINARY_INSTALL_PATH);
-    fs::copy(&staged, BINARY_INSTALL_PATH).map_err(|err| {
-        format!("copying staxd to {}: {err}", BINARY_INSTALL_PATH)
-    })?;
+    fs::copy(&staged, BINARY_INSTALL_PATH)
+        .map_err(|err| format!("copying staxd to {}: {err}", BINARY_INSTALL_PATH))?;
     fs::set_permissions(BINARY_INSTALL_PATH, fs::Permissions::from_mode(0o755))?;
 
-    codesign_staxd(BINARY_INSTALL_PATH)?;
+    codesign_staxd_adhoc(BINARY_INSTALL_PATH)?;
 
     println!(":: writing LaunchDaemon plist -> {}", PLIST_PATH);
-    fs::write(PLIST_PATH, NPERFD_LAUNCHD_PLIST).map_err(|err| {
-        format!("writing {}: {err}", PLIST_PATH)
-    })?;
+    fs::write(PLIST_PATH, NPERFD_LAUNCHD_PLIST)
+        .map_err(|err| format!("writing {}: {err}", PLIST_PATH))?;
     fs::set_permissions(PLIST_PATH, fs::Permissions::from_mode(0o644))?;
 
     // Reload via launchctl. `bootstrap` is the modern verb (macOS 10.10+);
@@ -178,9 +173,7 @@ Press Enter to continue, or Ctrl-C to cancel."#,
     println!();
     println!(":: staxd installed and running.");
     println!(":: socket    : /var/run/staxd.sock");
-    println!(
-        ":: logs      : sudo log stream --predicate 'subsystem == \"eu.bearcove.staxd\"'"
-    );
+    println!(":: logs      : sudo log stream --predicate 'subsystem == \"eu.bearcove.staxd\"'");
     println!(":: now: stax record --serve 127.0.0.1:8080 -- /bin/foo");
     Ok(())
 }
@@ -216,48 +209,17 @@ fn locate_staged_daemon() -> Result<PathBuf, Box<dyn Error>> {
     .into())
 }
 
-/// Ad-hoc codesign `staxd` at its final install path with the
-/// cs.debugger entitlement. Required so the race-against-return
-/// probe (probe.rs) can call task_for_pid on hardened-runtime
-/// targets even when running as root. Mirrors the entitlement set
-/// xtask applies to stax-shade.
-///
-/// Why here and not in `cargo xtask install`: signing the binary
-/// at one path and then `fs::copy`'ing it to another invalidates
-/// the embedded signature on macOS. Sign in place at the final
-/// destination.
-fn codesign_staxd(path: &str) -> Result<(), Box<dyn Error>> {
-    const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>com.apple.security.cs.debugger</key>
-	<true/>
-	<key>com.apple.security.get-task-allow</key>
-	<true/>
-	<key>com.apple.security.cs.allow-jit</key>
-	<true/>
-	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-	<true/>
-</dict>
-</plist>
-"#;
-    let mut ent_path = env::temp_dir();
-    ent_path.push(format!("stax-setup-staxd-ent-{}.xml", std::process::id()));
-    fs::write(&ent_path, ENTITLEMENTS)?;
-
-    println!(":: codesigning {path} with com.apple.security.cs.debugger");
+/// Ad-hoc codesign `staxd` at its final install path. Signing at
+/// one path and then copying to another invalidates the embedded
+/// signature on macOS, so sign in place at the final destination.
+fn codesign_staxd_adhoc(path: &str) -> Result<(), Box<dyn Error>> {
+    println!(":: codesigning {path} ad-hoc");
     let status = Command::new("codesign")
         .arg("--sign")
         .arg("-")
         .arg("--force")
-        .arg("--options=runtime")
-        .arg("--entitlements")
-        .arg(&ent_path)
         .arg(path)
         .status()?;
-
-    let _ = fs::remove_file(&ent_path);
 
     if !status.success() {
         return Err(format!("codesign exited with {status}").into());
@@ -299,4 +261,3 @@ fn home_dir_for_user(name: &OsStr) -> Option<PathBuf> {
     let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
 }
-

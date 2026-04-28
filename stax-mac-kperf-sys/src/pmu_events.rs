@@ -88,7 +88,9 @@ pub const PMU_SLOTS: usize = 2;
 /// events failed to resolve. In that case the caller should still
 /// proceed with the FIXED class only.
 pub fn configure(fw: &Frameworks) -> Option<ConfiguredPmu> {
-    use crate::bindings::{KPC_CLASS_CONFIGURABLE, KPC_CLASS_CONFIGURABLE_MASK, KPC_CLASS_FIXED_MASK};
+    use crate::bindings::{
+        KPC_CLASS_CONFIGURABLE, KPC_CLASS_CONFIGURABLE_MASK, KPC_CLASS_FIXED_MASK,
+    };
 
     let mut db: *mut KpepDb = ptr::null_mut();
     let rc = unsafe { (fw.kpep_db_create)(ptr::null(), &mut db) };
@@ -136,19 +138,19 @@ pub fn configure(fw: &Frameworks) -> Option<ConfiguredPmu> {
         };
 
         let mut idx_used: u32 = 0;
-        let rc = unsafe {
-            (fw.kpep_config_add_event)(config, &mut event_ptr, 0, &mut idx_used)
-        };
+        let rc = unsafe { (fw.kpep_config_add_event)(config, &mut event_ptr, 0, &mut idx_used) };
         if rc != 0 {
-            log::info!(
-                "pmu: kpep_config_add_event failed for {name} (rc={rc}); skipping"
-            );
+            log::info!("pmu: kpep_config_add_event failed for {name} (rc={rc}); skipping");
             continue;
         }
         slot_indices[slot_idx] = Some(pmc_index_after_fixed);
         pmc_index_after_fixed += 1;
         resolved_any = true;
-        log::info!("pmu: event slot {:?} = {name} (counter index {})", entry.slot, pmc_index_after_fixed - 1);
+        log::info!(
+            "pmu: event slot {:?} = {name} (counter index {})",
+            entry.slot,
+            pmc_index_after_fixed - 1
+        );
     }
 
     if !resolved_any {
@@ -178,9 +180,7 @@ pub fn configure(fw: &Frameworks) -> Option<ConfiguredPmu> {
     // not the number of entries. Passing the entry count makes kpep
     // think the buffer is too small and bail with rc=4.
     let buf_bytes = configs.len() * std::mem::size_of::<KpcConfig>();
-    let rc = unsafe {
-        (fw.kpep_config_kpc)(config, configs.as_mut_ptr(), buf_bytes)
-    };
+    let rc = unsafe { (fw.kpep_config_kpc)(config, configs.as_mut_ptr(), buf_bytes) };
     if rc != 0 {
         log::warn!("kpep_config_kpc failed (rc={rc})");
         return None;

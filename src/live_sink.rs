@@ -8,7 +8,7 @@ pub use stax_mac_capture::MachOByteSource;
 /// One PET stack-walk hit. PET samples are stack-identity *only* in
 /// the new model: time accounting comes from `CpuIntervalEvent`s
 /// sourced from SCHED records.
-pub struct SampleEvent< 'a > {
+pub struct SampleEvent<'a> {
     pub timestamp: u64,
     pub pid: u32,
     pub tid: u32,
@@ -33,15 +33,15 @@ pub struct SampleEvent< 'a > {
 /// for the semantics; this is the live-sink mirror with a
 /// `UserFrame`-typed stack instead of raw `u64`s so it composes with
 /// the rest of the `live_sink` event types.
-pub struct CpuIntervalEvent< 'a > {
+pub struct CpuIntervalEvent<'a> {
     pub pid: u32,
     pub tid: u32,
     pub start_ns: u64,
     pub end_ns: u64,
-    pub kind: CpuIntervalKind< 'a >,
+    pub kind: CpuIntervalKind<'a>,
 }
 
-pub enum CpuIntervalKind< 'a > {
+pub enum CpuIntervalKind<'a> {
     OnCpu,
     OffCpu {
         /// Cached user-space stack at moment of blocking, leaf-first.
@@ -54,14 +54,14 @@ pub enum CpuIntervalKind< 'a > {
 /// One symbol from a binary's symbol table (Mach-O `nlist_64` or ELF
 /// symtab/dynsym). Addresses are SVMAs (binary-relative; same space as
 /// `BinaryLoadedEvent::text_svma`).
-pub struct LiveSymbol< 'a > {
+pub struct LiveSymbol<'a> {
     pub start_svma: u64,
     pub end_svma: u64,
     /// Raw, possibly mangled, possibly non-UTF-8 symbol bytes.
     pub name: &'a [u8],
 }
 
-pub struct BinaryLoadedEvent< 'a > {
+pub struct BinaryLoadedEvent<'a> {
     /// Filesystem path the dynamic loader resolved this image to (or
     /// the dyld cache install-name on macOS for system dylibs).
     pub path: &'a str,
@@ -75,21 +75,21 @@ pub struct BinaryLoadedEvent< 'a > {
     pub text_svma: u64,
     /// Architecture identifier matching `archive::Packet::MachineInfo`
     /// (e.g. "aarch64", "amd64"). Used to pick the disassembler.
-    pub arch: Option< &'a str >,
+    pub arch: Option<&'a str>,
     /// Whether this image is the main executable (Mach-O `MH_EXECUTE`
     /// / ELF `ET_EXEC`/`ET_DYN` with PIE). The live UI uses this to
     /// visually distinguish target code from system dylibs.
     pub is_executable: bool,
-    pub symbols: &'a [LiveSymbol< 'a >],
+    pub symbols: &'a [LiveSymbol<'a>],
     /// Raw `__TEXT` bytes for this image, when the recorder captured
     /// them inline (currently: JIT'd code via the jitdump tailer).
     /// Used by the binary registry as a disassembly source for
     /// images that aren't on disk and that we can't `mach_vm_read`
     /// against.
-    pub text_bytes: Option< &'a [u8] >,
+    pub text_bytes: Option<&'a [u8]>,
 }
 
-pub struct BinaryUnloadedEvent< 'a > {
+pub struct BinaryUnloadedEvent<'a> {
     pub path: &'a str,
     pub base_avma: u64,
 }
@@ -108,7 +108,7 @@ pub struct TargetAttached {
 /// One thread in the target acquired (or had its name updated to)
 /// `name`. The live aggregator stashes these by tid so the UI can
 /// label thread-filter selections.
-pub struct ThreadName< 'a > {
+pub struct ThreadName<'a> {
     pub pid: u32,
     pub tid: u32,
     pub name: &'a str,
@@ -118,7 +118,7 @@ pub struct ThreadName< 'a > {
 /// thread's most recent PET tick, so the live aggregator can build
 /// a "who woke me?" view per wakee tid -- naming the symbols where
 /// the wake-up call was issued from.
-pub struct WakeupEvent< 'a > {
+pub struct WakeupEvent<'a> {
     pub timestamp: u64,
     pub pid: u32,
     pub waker_tid: u32,

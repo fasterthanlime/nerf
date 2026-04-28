@@ -42,18 +42,14 @@ impl PmcAccum {
         self.cycles = self.cycles.saturating_add(s.cycles);
         self.instructions = self.instructions.saturating_add(s.instructions);
         self.l1d_misses = self.l1d_misses.saturating_add(s.l1d_misses);
-        self.branch_mispreds = self
-            .branch_mispreds
-            .saturating_add(s.branch_mispreds);
+        self.branch_mispreds = self.branch_mispreds.saturating_add(s.branch_mispreds);
     }
 
     pub fn add_other(&mut self, other: &PmcAccum) {
         self.cycles = self.cycles.saturating_add(other.cycles);
         self.instructions = self.instructions.saturating_add(other.instructions);
         self.l1d_misses = self.l1d_misses.saturating_add(other.l1d_misses);
-        self.branch_mispreds = self
-            .branch_mispreds
-            .saturating_add(other.branch_mispreds);
+        self.branch_mispreds = self.branch_mispreds.saturating_add(other.branch_mispreds);
     }
 }
 
@@ -152,22 +148,11 @@ pub struct PetSample {
     pub pmc: PmuSample,
 }
 
-/// One framehop-walked user stack from stax-shade. Distinct from
-/// `PetSample`: source is shade's `thread_suspend` + `framehop`
-/// path, not kperf. Atomic-from-target-perspective; no kernel
-/// stack and no PMU.
-pub struct WalkerSample {
-    pub timestamp_ns: u64,
-    pub stack: Box<[u64]>,
-}
-
 /// Race-against-return probe output paired with one kperf
-/// `PetSample` by `(tid, timestamp_ns == kperf_ts)`. Source: staxd
-/// suspends the sampled thread shortly after kperf's PMI lands,
-/// captures registers, walks via framehop (or FP-walk fallback).
-/// Stored alongside the kperf sample so the UI / aggregator can
-/// diff the two stacks and surface the common-suffix / divergence
-/// for atomic-stitch experiments.
+/// `PetSample` by `(tid, timestamp_ns == kperf_ts)`. This is the
+/// future shade-owned correlated stack probe, kept as an ingest
+/// event/server-side queue because the UI diff path is still the
+/// right shape. staxd must not produce these.
 pub struct ProbeResultRecord {
     pub tid: u32,
     /// Mach-tick timestamp of the matching kperf sample (matches
@@ -237,7 +222,6 @@ const MAX_EVENTS_PER_THREAD: usize = 100_000;
 #[derive(Default)]
 pub struct ThreadStats {
     pub(crate) pet_samples: std::collections::VecDeque<PetSample>,
-    pub(crate) walker_samples: std::collections::VecDeque<WalkerSample>,
     pub(crate) intervals: std::collections::VecDeque<RawInterval>,
     pub(crate) wakeups: std::collections::VecDeque<RawWakeup>,
     /// Probe results indexed by `kperf_ts` so a UI / query can
@@ -327,24 +311,6 @@ pub struct Aggregator {
 }
 
 impl Aggregator {
-    /// Append a framehop-walked stack from stax-shade. Lives on
-    /// its own per-thread queue; queries that want
-    /// "shade-accurate user only" read this, queries that want
-    /// "kperf-paired with kernel" read `pet_samples`. Never
-    /// merged automatically — the two streams aren't atomic with
-    /// each other.
-    pub fn record_walker_sample(&mut self, tid: u32, timestamp_ns: u64, user_addrs: &[u64]) {
-        self.note_timestamp(timestamp_ns);
-        let stats = self.threads.entry(tid).or_default();
-        if stats.walker_samples.len() >= MAX_EVENTS_PER_THREAD {
-            stats.walker_samples.pop_front();
-        }
-        stats.walker_samples.push_back(WalkerSample {
-            timestamp_ns,
-            stack: user_addrs.to_vec().into_boxed_slice(),
-        });
-    }
-
     /// Record a race-against-return probe result. Pairs with the
     /// kperf `PetSample` that has the same `(tid, kperf_ts)` —
     /// queries can correlate at read time.
@@ -378,13 +344,7 @@ impl Aggregator {
         });
     }
 
-    pub fn record_interval(
-        &mut self,
-        tid: u32,
-        start_ns: u64,
-        end_ns: u64,
-        kind: IntervalKind,
-    ) {
+    pub fn record_interval(&mut self, tid: u32, start_ns: u64, end_ns: u64, kind: IntervalKind) {
         self.note_timestamp(start_ns);
         if end_ns != 0 {
             self.note_timestamp(end_ns);

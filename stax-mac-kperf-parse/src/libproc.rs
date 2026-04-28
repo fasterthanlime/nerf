@@ -188,7 +188,10 @@ pub fn enumerate_regions(pid: u32) -> Vec<Region> {
         }
         let pri = &info.prp_prinfo;
         let path_bytes = info.prp_vip.vip_path;
-        let nul = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+        let nul = path_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(path_bytes.len());
         let path = String::from_utf8_lossy(&path_bytes[..nul]).into_owned();
         out.push(Region {
             address: pri.pri_address,

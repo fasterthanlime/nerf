@@ -14,12 +14,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use stax_mac_capture::{ProbeResultEvent, SampleSink};
+use log::{info, warn};
+use stax_mac_capture::SampleSink;
 use stax_mac_kperf_parse::pipeline::{Pipeline, PipelineConfig};
 use stax_mac_kperf_sys::bindings::sampler;
-use stax_mac_kperf_sys::kdebug::{self, KdBuf, DBG_MACH, DBG_MACH_SCHED, DBG_PERF};
-use staxd_proto::{KdBufBatch, KdBufWire, StaxdClient, SessionConfig};
-use log::{info, warn};
+use stax_mac_kperf_sys::kdebug::{self, DBG_MACH, DBG_MACH_SCHED, DBG_PERF, KdBuf};
+use staxd_proto::{KdBufBatch, KdBufWire, SessionConfig, StaxdClient};
 
 /// User-facing options. Mirrors the shape of
 /// `stax_mac_kperf::RecordOptions` so plumbing through the existing
@@ -57,7 +57,10 @@ impl Default for RemoteOptions {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("connecting to staxd at {url}: {source}")]
-    Connect { url: String, source: Box<dyn std::error::Error + Send + Sync> },
+    Connect {
+        url: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[error("staxd record() RPC failed: {0:?}")]
     Rpc(staxd_proto::RecordError),
@@ -122,8 +125,8 @@ pub async fn drive_session<S: SampleSink + Send + 'static>(
     // tailer. Its periodic scans (image rescan, thread-name rescan)
     // are *synchronous* and do disk IO + symbol-table parsing —
     // running them on the same task as `rx.recv()` would (and did)
-    // wedge the recv path during scans, fill the kdebug ring on the
-    // daemon side, and starve the probe.
+    // wedge the recv path during scans and fill the kdebug ring on
+    // the daemon side.
     //
     // Move the pipeline + sink onto a dedicated OS worker thread.
     // This recv loop becomes pure I/O: receive, hand off, repeat.
@@ -218,7 +221,6 @@ pub async fn drive_session<S: SampleSink + Send + 'static>(
             // queue briefly here instead of stalling vox credit.
             let _ = worker_tx.send(WorkerMsg::Batch(OwnedBatch {
                 records: batch.records,
-                probe_results: batch.probe_results,
             }));
         });
     }
@@ -265,11 +267,9 @@ pub async fn drive_session<S: SampleSink + Send + 'static>(
 
 /// Owned, thread-Send'able mirror of `KdBufBatch`. We can't move
 /// the SelfRef across thread boundaries, so the recv loop pulls
-/// the records + probe_results out and ships them to the worker
-/// via this struct.
+/// the records out and ships them to the worker via this struct.
 struct OwnedBatch {
     records: Vec<KdBufWire>,
-    probe_results: Vec<staxd_proto::ProbeResultWire>,
 }
 
 enum WorkerMsg {
@@ -278,9 +278,8 @@ enum WorkerMsg {
 
 /// Dedicated OS thread that owns the Pipeline + Sink. Drives all
 /// the synchronous work: parser, periodic libproc scans (with
-/// their fs::read + Mach-O parsing), probe-result emission. Loops
-/// on `recv_timeout` so periodic ticks fire even when no batches
-/// are arriving.
+/// their fs::read + Mach-O parsing). Loops on `recv_timeout` so
+/// periodic ticks fire even when no batches are arriving.
 fn worker_thread<S: SampleSink>(
     config: PipelineConfig,
     shared_cache: Option<Arc<stax_mac_shared_cache::SharedCache>>,
@@ -298,19 +297,6 @@ fn worker_thread<S: SampleSink>(
             Ok(WorkerMsg::Batch(batch)) => {
                 let kdbufs: Vec<KdBuf> = batch.records.iter().map(wire_to_kdbuf).collect();
                 pipeline.process_records(&kdbufs, &mut sink);
-                for pr in &batch.probe_results {
-                    sink.on_probe_result(ProbeResultEvent {
-                        tid: pr.tid,
-                        kperf_ts_ns: pr.kperf_ts_mach,
-                        probe_done_ns: pr.probe_done_mach,
-                        mach_pc: pr.mach_pc,
-                        mach_lr: pr.mach_lr,
-                        mach_fp: pr.mach_fp,
-                        mach_sp: pr.mach_sp,
-                        mach_walked: &pr.mach_walked,
-                        used_framehop: pr.used_framehop,
-                    });
-                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,

@@ -25,7 +25,9 @@
 
 use std::collections::HashMap;
 
-use stax_mac_kperf_sys::kdebug::{kdbg_code, kdbg_subclass, mach_sched, KdBuf, KDBG_TIMESTAMP_MASK};
+use stax_mac_kperf_sys::kdebug::{
+    kdbg_code, kdbg_subclass, mach_sched, KdBuf, KDBG_TIMESTAMP_MASK,
+};
 
 #[derive(Default)]
 pub struct CpuIntervalTracker {
@@ -234,9 +236,7 @@ impl CpuIntervalTracker {
                     return;
                 }
                 let waker_user_stack = match self.threads.get(&waker_tid) {
-                    Some(s) if !s.last_user_stack.is_empty()
-                        || !s.last_kernel_stack.is_empty() =>
-                    {
+                    Some(s) if !s.last_user_stack.is_empty() || !s.last_kernel_stack.is_empty() => {
                         s.last_user_stack.clone()
                     }
                     _ => return,

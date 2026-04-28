@@ -132,8 +132,7 @@ pub fn parse_image(task: mach_port_t, load_address: u64) -> Option<MachoSections
             break;
         }
         // SAFETY: bounds checked above.
-        let lc: LoadCommand =
-            unsafe { std::ptr::read_unaligned(cmds.as_ptr().add(cursor).cast()) };
+        let lc: LoadCommand = unsafe { std::ptr::read_unaligned(cmds.as_ptr().add(cursor).cast()) };
         let lc_size = lc.cmdsize as usize;
         if lc_size == 0 || cursor + lc_size > cmds.len() {
             break;
@@ -143,9 +142,8 @@ pub fn parse_image(task: mach_port_t, load_address: u64) -> Option<MachoSections
                 if cursor + std::mem::size_of::<SegmentCommand64>() > cmds.len() {
                     break;
                 }
-                let seg: SegmentCommand64 = unsafe {
-                    std::ptr::read_unaligned(cmds.as_ptr().add(cursor).cast())
-                };
+                let seg: SegmentCommand64 =
+                    unsafe { std::ptr::read_unaligned(cmds.as_ptr().add(cursor).cast()) };
                 // Compute the slide off __TEXT, not the first
                 // segment. Main executables on macOS lead with
                 // __PAGEZERO (vmaddr=0, vmsize=4GB) — basing the
@@ -166,11 +164,9 @@ pub fn parse_image(task: mach_port_t, load_address: u64) -> Option<MachoSections
                     if sect_off + std::mem::size_of::<Section64>() > cmds.len() {
                         break;
                     }
-                    let sect: Section64 = unsafe {
-                        std::ptr::read_unaligned(cmds.as_ptr().add(sect_off).cast())
-                    };
-                    let avma_start =
-                        (sect.addr as i64).wrapping_add(out.slide) as u64;
+                    let sect: Section64 =
+                        unsafe { std::ptr::read_unaligned(cmds.as_ptr().add(sect_off).cast()) };
+                    let avma_start = (sect.addr as i64).wrapping_add(out.slide) as u64;
                     if name_eq(&sect.sectname, b"__got") {
                         out.got_avma = Some(avma_start..avma_start + sect.size);
                     }
@@ -182,9 +178,8 @@ pub fn parse_image(task: mach_port_t, load_address: u64) -> Option<MachoSections
             }
             LC_UUID => {
                 if cursor + std::mem::size_of::<UuidCommand>() <= cmds.len() {
-                    let u: UuidCommand = unsafe {
-                        std::ptr::read_unaligned(cmds.as_ptr().add(cursor).cast())
-                    };
+                    let u: UuidCommand =
+                        unsafe { std::ptr::read_unaligned(cmds.as_ptr().add(cursor).cast()) };
                     out.uuid = Some(u.uuid);
                 }
             }

@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let workspace_root = workspace_root();
-    let out_dir = workspace_root.join("frontend").join("src").join("generated");
+    let out_dir = workspace_root
+        .join("frontend")
+        .join("src")
+        .join("generated");
     std::fs::create_dir_all(&out_dir)?;
 
     for service in stax_live_proto::all_services() {
@@ -40,7 +43,10 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn write_if_changed(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<(), Box<dyn Error>> {
+fn write_if_changed(
+    path: &std::path::Path,
+    contents: impl AsRef<[u8]>,
+) -> Result<(), Box<dyn Error>> {
     let contents = contents.as_ref();
     if std::fs::read(path).ok().as_deref() == Some(contents) {
         println!("Unchanged {}", path.display());

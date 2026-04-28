@@ -1,9 +1,9 @@
-use gimli::LittleEndian;
-use crate::arch::{Architecture, Registers, UnwindStatus};
 use crate::address_space::MemoryReader;
-use crate::frame_descriptions::{ContextCache, UnwindInfoCache};
-use crate::types::{Endianness, Bitness};
+use crate::arch::{Architecture, Registers, UnwindStatus};
 use crate::dwarf::dwarf_unwind;
+use crate::frame_descriptions::{ContextCache, UnwindInfoCache};
+use crate::types::{Bitness, Endianness};
+use gimli::LittleEndian;
 
 // Source: DWARF for the ARM 64-bit, 3.1 DWARF register names
 //         http://infocenter.arm.com/help/topic/com.arm.doc.ihi0057b/IHI0057B_aadwarf64.pdf
@@ -77,8 +77,7 @@ static REGS: &'static [u16] = &[
     dwarf::X29,
     dwarf::X30,
     dwarf::X31,
-
-    dwarf::PC
+    dwarf::PC,
 ];
 
 #[repr(C)]
@@ -119,21 +118,21 @@ pub struct Regs {
 
     pc: u64,
 
-    mask: u64
+    mask: u64,
 }
 
-unsafe_impl_registers!( Regs, REGS, u64 );
-impl_local_regs!( Regs, "aarch64", get_regs_aarch64 );
-impl_regs_debug!( Regs, REGS, Arch );
+unsafe_impl_registers!(Regs, REGS, u64);
+impl_local_regs!(Regs, "aarch64", get_regs_aarch64);
+impl_regs_debug!(Regs, REGS, Arch);
 
 #[allow(dead_code)]
 pub struct Arch {}
 
 #[doc(hidden)]
 pub struct State {
-    ctx_cache: ContextCache< LittleEndian >,
+    ctx_cache: ContextCache<LittleEndian>,
     unwind_cache: UnwindInfoCache,
-    new_regs: Vec< (u16, u64) >
+    new_regs: Vec<(u16, u64)>,
 }
 
 impl Architecture for Arch {
@@ -149,7 +148,7 @@ impl Architecture for Arch {
     type Regs = Regs;
     type RegTy = u64;
 
-    fn register_name_str( register: u16 ) -> Option< &'static str > {
+    fn register_name_str(register: u16) -> Option<&'static str> {
         use self::dwarf::*;
 
         let name = match register {
@@ -185,10 +184,10 @@ impl Architecture for Arch {
             X29 => "X29",
             X30 => "LR",
             X31 => "SP",
-            _ => return None
+            _ => return None,
         };
 
-        Some( name )
+        Some(name)
     }
 
     #[inline]
@@ -196,45 +195,60 @@ impl Architecture for Arch {
         State {
             ctx_cache: ContextCache::new(),
             unwind_cache: UnwindInfoCache::new(),
-            new_regs: Vec::with_capacity( 32 )
+            new_regs: Vec::with_capacity(32),
         }
     }
 
-    fn clear_cache( state: &mut Self::State ) {
+    fn clear_cache(state: &mut Self::State) {
         state.unwind_cache.clear();
     }
 
     #[inline]
-    fn unwind< M: MemoryReader< Self > >(
+    fn unwind<M: MemoryReader<Self>>(
         nth_frame: usize,
         memory: &M,
         state: &mut Self::State,
         regs: &mut Self::Regs,
-        initial_address: &mut Option< u64 >,
-        ra_address: &mut Option< u64 >
-    ) -> Option< UnwindStatus > {
-        let result = dwarf_unwind( nth_frame, memory, &mut state.ctx_cache, &mut state.unwind_cache, regs, &mut state.new_regs )?;
-        *initial_address = Some( result.initial_address );
+        initial_address: &mut Option<u64>,
+        ra_address: &mut Option<u64>,
+    ) -> Option<UnwindStatus> {
+        let result = dwarf_unwind(
+            nth_frame,
+            memory,
+            &mut state.ctx_cache,
+            &mut state.unwind_cache,
+            regs,
+            &mut state.new_regs,
+        )?;
+        *initial_address = Some(result.initial_address);
         *ra_address = result.ra_address;
         let cfa = result.cfa?;
 
         let mut recovered_return_address = false;
         for &(register, value) in &state.new_regs {
-            regs.append( register, value );
+            regs.append(register, value);
 
             recovered_return_address = recovered_return_address || register == dwarf::X30;
         }
 
-        regs.append( dwarf::X31, cfa );
+        regs.append(dwarf::X31, cfa);
 
-        debug!( "Register {:?} at frame #{} is equal to 0x{:016X}", Self::register_name( dwarf::X31 ), nth_frame + 1, cfa );
+        debug!(
+            "Register {:?} at frame #{} is equal to 0x{:016X}",
+            Self::register_name(dwarf::X31),
+            nth_frame + 1,
+            cfa
+        );
 
         if recovered_return_address || nth_frame == 0 {
             regs.pc = regs.x30;
-            Some( UnwindStatus::InProgress )
+            Some(UnwindStatus::InProgress)
         } else {
-            debug!( "Previous frame not found: failed to determine the return address of frame #{}", nth_frame + 1 );
-            Some( UnwindStatus::Finished )
+            debug!(
+                "Previous frame not found: failed to determine the return address of frame #{}",
+                nth_frame + 1
+            );
+            Some(UnwindStatus::Finished)
         }
     }
 }

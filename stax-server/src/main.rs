@@ -16,18 +16,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::{Mutex, RwLock};
 use stax_live::source::SourceResolver;
 use stax_live::{
-    Aggregator, BinaryRegistry, IntervalKind, LiveServer, LiveSymbolOwned, LoadedBinary,
-    PmuSample,
+    Aggregator, BinaryRegistry, IntervalKind, LiveServer, LiveSymbolOwned, LoadedBinary, PmuSample,
 };
 use stax_live_proto::{
-    IngestEvent, ProfilerDispatcher, RunConfig, RunControl, RunControlDispatcher, RunId,
-    RunIngest, RunIngestDispatcher, RunState, RunSummary, ServerStatus, StopReason,
-    WaitCondition, WaitOutcome,
+    IngestEvent, ProfilerDispatcher, RunConfig, RunControl, RunControlDispatcher, RunId, RunIngest,
+    RunIngestDispatcher, RunState, RunSummary, ServerStatus, StopReason, WaitCondition,
+    WaitOutcome,
 };
+use stax_shade_proto::{ShadeAck, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher};
 use vox::VoxListener;
-use stax_shade_proto::{
-    ShadeAck, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher, WalkerSample,
-};
 
 const DEFAULT_SOCK_NAME: &str = "stax-server.sock";
 const DEFAULT_WS_BIND: &str = "127.0.0.1:8080";
@@ -44,16 +41,15 @@ async fn main() -> eyre::Result<()> {
     let server = ServerState::new(socket.clone());
     server.attach_local_shared_cache();
 
-    let local_listener = vox::transport::local::LocalLinkAcceptor::bind(
-        socket.to_string_lossy().into_owned(),
-    )?;
+    let local_listener =
+        vox::transport::local::LocalLinkAcceptor::bind(socket.to_string_lossy().into_owned())?;
     tracing::info!("stax-server listening on local://{}", socket.display());
 
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
 
-    let ws_addr = std::env::var("STAX_SERVER_WS_BIND")
-        .unwrap_or_else(|_| DEFAULT_WS_BIND.to_owned());
+    let ws_addr =
+        std::env::var("STAX_SERVER_WS_BIND").unwrap_or_else(|_| DEFAULT_WS_BIND.to_owned());
     let mut ws_listener = vox::WsListener::bind(&ws_addr).await?;
     let ws_local = ws_listener.local_addr()?;
     tracing::info!("stax-server listening on ws://{ws_local}");
@@ -113,35 +109,37 @@ fn build_factory(
     server: ServerState,
     shade_slot: ShadeSlot,
 ) -> impl vox::ConnectionAcceptor + 'static {
-    vox::acceptor_fn(move |request: &vox::ConnectionRequest,
-                            connection: vox::PendingConnection|
-                            -> Result<(), vox::Metadata<'static>> {
-        match request.service() {
-            "RunControl" => {
-                connection.handle_with(RunControlDispatcher::new(server.clone()));
-                Ok(())
+    vox::acceptor_fn(
+        move |request: &vox::ConnectionRequest,
+              connection: vox::PendingConnection|
+              -> Result<(), vox::Metadata<'static>> {
+            match request.service() {
+                "RunControl" => {
+                    connection.handle_with(RunControlDispatcher::new(server.clone()));
+                    Ok(())
+                }
+                "RunIngest" => {
+                    connection.handle_with(RunIngestDispatcher::new(server.clone()));
+                    Ok(())
+                }
+                "Profiler" => {
+                    connection.handle_with(ProfilerDispatcher::new(server.profiler()));
+                    Ok(())
+                }
+                "ShadeRegistry" => {
+                    connection.handle_with(ShadeRegistryDispatcher::new(ShadeRegistryImpl {
+                        server: server.clone(),
+                        shade_slot: shade_slot.clone(),
+                    }));
+                    Ok(())
+                }
+                other => {
+                    tracing::warn!("stax-server: rejecting unknown service {other:?}");
+                    Err(vec![])
+                }
             }
-            "RunIngest" => {
-                connection.handle_with(RunIngestDispatcher::new(server.clone()));
-                Ok(())
-            }
-            "Profiler" => {
-                connection.handle_with(ProfilerDispatcher::new(server.profiler()));
-                Ok(())
-            }
-            "ShadeRegistry" => {
-                connection.handle_with(ShadeRegistryDispatcher::new(ShadeRegistryImpl {
-                    server: server.clone(),
-                    shade_slot: shade_slot.clone(),
-                }));
-                Ok(())
-            }
-            other => {
-                tracing::warn!("stax-server: rejecting unknown service {other:?}");
-                Err(vec![])
-            }
-        }
-    })
+        },
+    )
 }
 
 /// Local-socket accept path uses non_resumable so the daemon notices
@@ -175,10 +173,7 @@ fn spawn_session_local(server: ServerState, link: vox::transport::local::LocalLi
 /// resumable-by-default; we still want the per-session slot so a
 /// browser-resident shade (future debugging tool) would have a
 /// cleanup path too.
-fn spawn_session_ws(
-    server: ServerState,
-    link: <vox::WsListener as vox::VoxListener>::Link,
-) {
+fn spawn_session_ws(server: ServerState, link: <vox::WsListener as vox::VoxListener>::Link) {
     let shade_slot: ShadeSlot = Arc::new(parking_lot::Mutex::new(None));
     let factory = build_factory(server.clone(), shade_slot.clone());
     tokio::spawn(async move {
@@ -359,41 +354,6 @@ impl ServerState {
         }
     }
 
-    /// Ingest a batch of framehop walker samples published by the
-    /// shade. Walker samples land on `Aggregator::record_walker_sample`,
-    /// a per-thread queue distinct from kperf's `pet_samples`. The
-    /// two streams aren't atomic with each other (kperf samples
-    /// in-kernel-interrupt; walker samples via thread_suspend in
-    /// the shade) so we never merge them — that's the deliberate
-    /// design. Run summary counts the two streams separately
-    /// (`pet_samples` vs `walker_samples`).
-    fn ingest_walker_samples(
-        &self,
-        run_id: u64,
-        samples: Vec<WalkerSample>,
-    ) -> Result<(), String> {
-        let n = samples.len();
-        {
-            let mut inner = self.inner.lock();
-            let Some(active) = inner.active.as_mut() else {
-                return Err("no active run".to_owned());
-            };
-            if active.id.0 != run_id {
-                return Err(format!(
-                    "run id mismatch: shade for {run_id}, server's active run is {}",
-                    active.id.0
-                ));
-            }
-            active.walker_samples = active.walker_samples.saturating_add(n as u64);
-        }
-
-        let mut agg = self.aggregator.write();
-        for s in samples {
-            agg.record_walker_sample(s.tid, s.timestamp_ns, &s.frames);
-        }
-        Ok(())
-    }
-
     /// Called by the accept-loop after a session closes, with the
     /// `shade_pid` (if any) that registered through this session.
     /// Clears `active_shade` if it still matches — the run may
@@ -404,10 +364,7 @@ impl ServerState {
         if let Some(info) = inner.active_shade.as_ref()
             && info.shade_pid == shade_pid
         {
-            tracing::info!(
-                shade_pid,
-                "shade session closed; clearing active_shade"
-            );
+            tracing::info!(shade_pid, "shade session closed; clearing active_shade");
             inner.active_shade = None;
         }
     }
@@ -415,18 +372,17 @@ impl ServerState {
     /// Spawn a `stax-shade` child process to attach to `pid`.
     /// Stores the `Child` handle on `Inner::shade_child` so we
     /// can reap on cleanup. Best-effort: if the binary isn't
-    /// found or `Command::spawn` fails we log and move on —
-    /// kperf-side recording keeps working, just without
-    /// framehop-accurate user stacks. The shade will dial back
-    /// in on its own and call `register_shade`, at which point
-    /// `active_shade` gets populated.
+    /// found or `Command::spawn` fails we log and move on. The
+    /// shade will dial back in on its own and call
+    /// `register_shade`, at which point `active_shade` gets
+    /// populated.
     fn spawn_shade(&self, run_id: RunId, pid: u32) {
         let bin = match resolve_shade_path() {
             Some(p) => p,
             None => {
                 tracing::warn!(
                     "stax-shade binary not found in any of the candidate \
-                     locations; user stacks will use kperf's FP walker. \
+                     locations; target-side helpers are disabled for this run. \
                      `cargo xtask install` should land it in ~/.cargo/bin/."
                 );
                 return;
@@ -461,7 +417,7 @@ impl ServerState {
             }
             Err(e) => {
                 tracing::warn!(
-                    "failed to spawn {}: {e}; user stacks will fall back to kperf's FP walker",
+                    "failed to spawn {}: {e}; target-side helpers are disabled for this run",
                     bin.display()
                 );
             }
@@ -639,21 +595,15 @@ impl RunControl for ServerState {
         out
     }
 
-    async fn wait_active(
-        &self,
-        condition: WaitCondition,
-        timeout_ms: Option<u64>,
-    ) -> WaitOutcome {
+    async fn wait_active(&self, condition: WaitCondition, timeout_ms: Option<u64>) -> WaitOutcome {
         // Polling implementation while we sketch the lifecycle. Will
         // graduate to event-driven (notify on state-transition) once
         // the rest of the daemon stabilises.
-        let deadline = timeout_ms.map(|ms| {
-            std::time::Instant::now() + Duration::from_millis(ms)
-        });
+        let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
         let condition_deadline = match &condition {
-            WaitCondition::ForSeconds { seconds } => Some(
-                std::time::Instant::now() + Duration::from_secs(*seconds),
-            ),
+            WaitCondition::ForSeconds { seconds } => {
+                Some(std::time::Instant::now() + Duration::from_secs(*seconds))
+            }
             _ => None,
         };
         loop {
@@ -744,14 +694,6 @@ impl ShadeRegistry for ShadeRegistryImpl {
         }
         Ok(ack)
     }
-
-    async fn publish_walker_samples(
-        &self,
-        run_id: u64,
-        samples: Vec<WalkerSample>,
-    ) -> Result<(), String> {
-        self.server.ingest_walker_samples(run_id, samples)
-    }
 }
 
 impl RunIngest for ServerState {
@@ -770,7 +712,6 @@ impl RunIngest for ServerState {
             target_pid: None,
             label: config.label,
             pet_samples: 0,
-            walker_samples: 0,
             off_cpu_intervals: 0,
         };
         let cancel = Arc::new(tokio::sync::Notify::new());
@@ -880,9 +821,12 @@ impl ServerState {
                 );
             }
             IngestEvent::OnCpuInterval(i) => {
-                self.aggregator
-                    .write()
-                    .record_interval(i.tid, i.start_ns, i.end_ns, IntervalKind::OnCpu);
+                self.aggregator.write().record_interval(
+                    i.tid,
+                    i.start_ns,
+                    i.end_ns,
+                    IntervalKind::OnCpu,
+                );
             }
             IngestEvent::OffCpuInterval(i) => {
                 let stack = i.stack.into_boxed_slice();

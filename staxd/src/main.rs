@@ -30,13 +30,11 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use staxd_proto::{
-    DaemonStatus, KdBufBatch, Staxd, StaxdDispatcher, RecordError, RecordSummary,
-    SessionConfig, SessionState,
+    DaemonStatus, KdBufBatch, RecordError, RecordSummary, SessionConfig, SessionState, Staxd,
+    StaxdDispatcher,
 };
 
-mod probe;
 mod session;
-mod unwind;
 
 /// Default socket path. Production deployments pass their own via
 /// `--socket` (the LaunchDaemon plist normally puts it under
@@ -60,20 +58,16 @@ async fn main() -> Result<()> {
 
     let server = StaxdServer::new();
 
-    let listener = vox::transport::local::LocalLinkAcceptor::bind(
-        socket_path.to_string_lossy().into_owned(),
-    )
-    .with_context(|| format!("binding {}", socket_path.display()))?;
+    let listener =
+        vox::transport::local::LocalLinkAcceptor::bind(socket_path.to_string_lossy().into_owned())
+            .with_context(|| format!("binding {}", socket_path.display()))?;
     info!("staxd listening on local://{}", socket_path.display());
 
     // Best-effort permissive perms for development. Production via
     // launchd uses the plist's Sockets dict so we don't run this
     // branch.
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(
-        &socket_path,
-        std::fs::Permissions::from_mode(0o666),
-    );
+    let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666));
 
     // Inline accept loop instead of `vox::serve_listener` so we can
     // pass `.non_resumable()` to the session builder. Default for
@@ -169,7 +163,9 @@ struct SessionInfo {
 
 impl StaxdServer {
     fn new() -> Self {
-        Self { session: Arc::new(Mutex::new(None)) }
+        Self {
+            session: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
@@ -208,7 +204,10 @@ impl Staxd for StaxdServer {
             });
         }
         let started_at_unix_ns = unix_ns_now();
-        *guard = Some(SessionInfo { target_pid: config.target_pid, started_at_unix_ns });
+        *guard = Some(SessionInfo {
+            target_pid: config.target_pid,
+            started_at_unix_ns,
+        });
         drop(guard);
 
         info!(
@@ -244,9 +243,9 @@ impl Staxd for StaxdServer {
 ///    daemon in foreground for development. No-op when stderr is
 ///    redirected by launchd.
 fn init_logging() {
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("staxd=info,stax_mac_kperf_sys=info"));
