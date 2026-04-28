@@ -117,18 +117,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> eyre::Result<()> {
-    let pid = match (cli.attach, cli.launch, cli.command.first()) {
-        (Some(pid), false, _) => pid,
-        (None, true, Some(_)) => {
-            // Stage B doesn't implement the launch path yet — left
-            // as a hard error so we never silently fall through.
-            // Implementation sketch:
-            // posix_spawnattr_setflags(POSIX_SPAWN_START_SUSPENDED),
-            // posix_spawn, task_for_pid on the freshly-spawned pid,
-            // set up exception ports if branch-stepping is enabled,
-            // then task_resume.
-            eyre::bail!("--launch path is unimplemented (stages A/B)")
-        }
+    let mode = match (cli.attach, cli.launch, cli.command.first()) {
+        (Some(pid), false, _) => AttachMode::Existing(pid),
+        (None, true, Some(_)) => AttachMode::Launch(cli.command.clone()),
         (Some(_), true, _) => {
             eyre::bail!("--attach and --launch are mutually exclusive")
         }
@@ -140,8 +131,20 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         }
     };
 
-    let task = task_for_pid(pid)?;
-    tracing::info!(pid, task_port = task, "attached to existing process");
+    let attached = match mode {
+        AttachMode::Existing(pid) => {
+            let task = task_for_pid(pid)?;
+            tracing::info!(pid, task_port = task, "attached to existing process");
+            Attached {
+                pid,
+                task,
+                pre_resume: None,
+            }
+        }
+        AttachMode::Launch(argv) => launch_suspended(argv)?,
+    };
+    let pid = attached.pid;
+    let _task = attached.task;
 
     // If a server socket was provided, dial in and register so the
     // server knows we're up and which run we belong to. When
@@ -156,8 +159,155 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         );
     }
 
+    // For --launch we held the target suspended through
+    // task_for_pid + register_shade so neither kperf-side nor
+    // shade-side could miss the very first instructions. Now
+    // that the server knows about us and (eventually) staxd has
+    // the kperf session running, resume.
+    if let Some(pre_resume) = attached.pre_resume {
+        pre_resume.resume()?;
+    }
+
     park_until_signal().await;
     Ok(())
+}
+
+enum AttachMode {
+    Existing(u32),
+    Launch(Vec<String>),
+}
+
+struct Attached {
+    pid: u32,
+    task: mach2::port::mach_port_t,
+    /// `Some` for `--launch`: target was started suspended via
+    /// POSIX_SPAWN_START_SUSPENDED and is waiting for us to resume
+    /// it. `None` for `--attach`: target was already running.
+    pre_resume: Option<PreResume>,
+}
+
+struct PreResume {
+    task: mach2::port::mach_port_t,
+}
+
+impl PreResume {
+    fn resume(self) -> eyre::Result<()> {
+        use mach2::kern_return::KERN_SUCCESS;
+        use mach2::task::task_resume;
+        // SAFETY: task is a valid Mach port acquired via task_for_pid
+        // on the just-spawned child. task_resume is safe to call on
+        // a suspended task port owned by us.
+        let kr = unsafe { task_resume(self.task) };
+        if kr != KERN_SUCCESS {
+            eyre::bail!("task_resume failed: kr={kr}");
+        }
+        tracing::info!("target resumed");
+        Ok(())
+    }
+}
+
+/// Spawn a fresh child via `posix_spawn` with
+/// `POSIX_SPAWN_START_SUSPENDED`, acquire its task port, and
+/// hand back the suspended-attachment record. The caller is
+/// expected to do whatever pre-resume setup it needs (register
+/// with stax-server, wait for kperf to be primed, install
+/// breakpoints, …) and then call `PreResume::resume`.
+///
+/// Argv: `argv[0]` is the program path; the rest are passed to
+/// the child as-is. We use `posix_spawn` (not `posix_spawnp`) so
+/// the program path is taken literally — callers that want PATH
+/// resolution can invoke `which(1)` first.
+fn launch_suspended(argv: Vec<String>) -> eyre::Result<Attached> {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+    use std::ptr;
+
+    if argv.is_empty() {
+        eyre::bail!("--launch requires at least one positional argument (the program path)");
+    }
+
+    let program = CString::new(argv[0].as_str())
+        .map_err(|_| eyre::eyre!("program path contains an interior NUL"))?;
+    let argv_c: Vec<CString> = argv
+        .iter()
+        .map(|s| CString::new(s.as_str()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| eyre::eyre!("argv contains an interior NUL"))?;
+    let mut argv_p: Vec<*mut c_char> = argv_c
+        .iter()
+        .map(|c| c.as_ptr() as *mut c_char)
+        .collect();
+    argv_p.push(ptr::null_mut());
+
+    let mut attr: libc::posix_spawnattr_t = ptr::null_mut();
+    // SAFETY: posix_spawnattr_init writes through the out-pointer.
+    // We pair it with destroy below so the kernel side cleans up.
+    let r = unsafe { libc::posix_spawnattr_init(&mut attr) };
+    if r != 0 {
+        eyre::bail!("posix_spawnattr_init: {r}");
+    }
+    // The whole point: child stays parked at its first instruction
+    // until we task_resume. SETSIGDEF is recommended by Apple's
+    // header so the child gets a clean signal mask regardless of
+    // ours.
+    let flags = libc::POSIX_SPAWN_START_SUSPENDED | libc::POSIX_SPAWN_SETSIGDEF;
+    let r = unsafe { libc::posix_spawnattr_setflags(&mut attr, flags as libc::c_short) };
+    if r != 0 {
+        unsafe {
+            libc::posix_spawnattr_destroy(&mut attr);
+        }
+        eyre::bail!("posix_spawnattr_setflags: {r}");
+    }
+
+    let mut pid: libc::pid_t = 0;
+    let r = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            program.as_ptr(),
+            ptr::null(),
+            &attr,
+            argv_p.as_ptr(),
+            // Inherit our environment as-is — we want PATH /
+            // DYLD_* / etc. flowing through to the child.
+            extern_environ(),
+        )
+    };
+    unsafe {
+        libc::posix_spawnattr_destroy(&mut attr);
+    }
+    if r != 0 {
+        eyre::bail!("posix_spawn({}): {r}", argv[0]);
+    }
+    let pid_u32 = pid as u32;
+    tracing::info!(pid = pid_u32, program = %argv[0], "spawned target (suspended)");
+
+    let task = task_for_pid(pid_u32).inspect_err(|_| {
+        // Best-effort: the child is suspended and we own it; if
+        // task_for_pid failed, there's no point leaving the
+        // process around. SIGKILL it and reap.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+    })?;
+
+    Ok(Attached {
+        pid: pid_u32,
+        task,
+        pre_resume: Some(PreResume { task }),
+    })
+}
+
+unsafe extern "C" {
+    static environ: *mut *mut std::os::raw::c_char;
+}
+
+fn extern_environ() -> *const *mut std::os::raw::c_char {
+    // SAFETY: read of process-wide global. macOS exposes
+    // `environ` as the canonical envp; posix_spawn accepts a
+    // const pointer to it.
+    unsafe { environ as *const _ }
 }
 
 async fn register_with_server(socket: &str, run_id: u64, target_pid: u32) -> eyre::Result<()> {
