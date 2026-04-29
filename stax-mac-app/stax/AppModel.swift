@@ -35,6 +35,7 @@ final class AppModel {
         didSet {
             guard oldValue != focusedFunctionId else { return }
             restartAnnotatedSubscription()
+            restartNeighborsSubscription()
         }
     }
 
@@ -42,6 +43,11 @@ final class AppModel {
     /// Populated by `subscribe_annotated` while a function is focused;
     /// nil while the flame graph is the top pane.
     var annotated: AnnotatedView? = nil
+
+    /// Time-bucketed activity for the minimap. Always relative to
+    /// the full recording (no filter); brush selection happens on
+    /// top of the unfiltered timeline.
+    var timeline: TimelineUpdate? = nil
 
     enum CPUMode: String, CaseIterable, Identifiable {
         case onCPU = "on-cpu"
@@ -235,10 +241,11 @@ final class AppModel {
     var connectionStatus: String = "disconnected"
     private let service = ProfilerService()
     private var streamTasks: [Task<Void, Never>] = []
-    /// Restartable subscription: cancel + relaunch every time
-    /// `focusedFunctionId` changes. Holds nil while the flame graph
-    /// is the top pane.
+    /// Restartable subscriptions: cancel + relaunch every time
+    /// `focusedFunctionId` changes. Both hold nil while the flame
+    /// graph is the top pane.
     private var annotatedTask: Task<Void, Never>?
+    private var neighborsTask: Task<Void, Never>?
 
     /// Connect to stax-server, then start subscriptions that drive
     /// live-data fields (`threads`, `functions`, total stats, …).
@@ -269,6 +276,9 @@ final class AppModel {
             })
             streamTasks.append(Task { [weak self] in
                 await self?.runTopSubscription(client: client)
+            })
+            streamTasks.append(Task { [weak self] in
+                await self?.runTimelineSubscription(client: client)
             })
         case .failed(let why):
             connectionStatus = why
@@ -377,6 +387,46 @@ final class AppModel {
         }
     }
 
+    private func runTimelineSubscription(client: ProfilerClient) async {
+        let (tx, rx) = channel(
+            serialize: { (val: TimelineUpdate, buf: inout ByteBuffer) in
+                encodeTimelineUpdate(val, into: &buf)
+            },
+            deserialize: { (buf: inout ByteBuffer) in
+                try decodeTimelineUpdate(from: &buf)
+            }
+        )
+
+        // The timeline is always relative to the whole recording —
+        // brush selection is applied client-side. `tid: nil` means
+        // "all threads".
+        Task {
+            do {
+                try await client.subscribeTimeline(tid: nil, output: tx)
+                NSLog("stax: subscribeTimeline call returned")
+            } catch {
+                NSLog("stax: subscribeTimeline call failed: %@", "\(error)")
+            }
+        }
+
+        do {
+            var count = 0
+            for try await update in rx {
+                count += 1
+                NSLog(
+                    "stax: timeline update #%d (%d buckets, duration=%llu ns)",
+                    count,
+                    update.buckets.count,
+                    update.recordingDurationNs
+                )
+                self.timeline = update
+            }
+            NSLog("stax: timeline stream ended")
+        } catch {
+            NSLog("stax: timeline stream error: %@", "\(error)")
+        }
+    }
+
     private func model_tidFilterAsU32() -> UInt32? {
         guard let tid = threadFilter else { return nil }
         return UInt32(exactly: tid)
@@ -398,6 +448,112 @@ final class AppModel {
         annotatedTask = Task { [weak self] in
             await self?.runAnnotatedSubscription(client: client, address: address)
         }
+    }
+
+    /// Cancel any in-flight neighbors subscription and start a new
+    /// one for the currently-focused function (if any). The result
+    /// populates `familyCallers` / `familyFocused` / `familyCallees`,
+    /// which the call-graph view reads.
+    private func restartNeighborsSubscription() {
+        neighborsTask?.cancel()
+        neighborsTask = nil
+        guard
+            let id = focusedFunctionId,
+            let fn = functions.first(where: { $0.id == id })
+        else { return }
+        guard case .ready(let client) = service.state else { return }
+
+        let address = fn.address
+        neighborsTask = Task { [weak self] in
+            await self?.runNeighborsSubscription(client: client, address: address)
+        }
+    }
+
+    private func runNeighborsSubscription(
+        client: ProfilerClient,
+        address: UInt64
+    ) async {
+        let (tx, rx) = channel(
+            serialize: { (val: NeighborsUpdate, buf: inout ByteBuffer) in
+                encodeNeighborsUpdate(val, into: &buf)
+            },
+            deserialize: { (buf: inout ByteBuffer) in
+                try decodeNeighborsUpdate(from: &buf)
+            }
+        )
+
+        let params = ViewParams(
+            tid: model_tidFilterAsU32(),
+            filter: LiveFilter(timeRange: nil, excludeSymbols: [])
+        )
+
+        Task {
+            do {
+                try await client.subscribeNeighbors(
+                    address: address,
+                    params: params,
+                    output: tx
+                )
+                NSLog("stax: subscribeNeighbors call returned")
+            } catch {
+                NSLog("stax: subscribeNeighbors call failed: %@", "\(error)")
+            }
+        }
+
+        do {
+            for try await update in rx {
+                if Task.isCancelled { break }
+                NSLog(
+                    "stax: neighbors update (%d callers, %d callees)",
+                    update.callersTree.children.count,
+                    update.calleesTree.children.count
+                )
+                applyNeighbors(update)
+            }
+        } catch {
+            NSLog("stax: neighbors stream error: %@", "\(error)")
+        }
+    }
+
+    private func applyNeighbors(_ update: NeighborsUpdate) {
+        let strings = update.strings
+
+        func resolveOptional(_ idx: UInt32?) -> String? {
+            guard let i = idx, Int(i) < strings.count else { return nil }
+            return strings[Int(i)]
+        }
+        func resolveLanguage(_ idx: UInt32) -> String {
+            Int(idx) < strings.count ? strings[Int(idx)] : ""
+        }
+        func nodeToMember(_ node: FlameNode) -> FamilyMember {
+            let name =
+                resolveOptional(node.functionName)
+                ?? String(format: "0x%llx", node.address)
+            let binary = resolveOptional(node.binary) ?? "(no binary)"
+            return FamilyMember(
+                name: name,
+                binary: binary,
+                kind: symbolKind(forLanguage: resolveLanguage(node.language)),
+                totalTime: TimeInterval(node.onCpuNs) / 1_000_000_000,
+                callCount: max(1, Int(node.petSamples))
+            )
+        }
+
+        let focusedAddress = update.callersTree.address
+        let focusedName =
+            resolveOptional(update.functionName)
+            ?? String(format: "0x%llx", focusedAddress)
+        let focusedBinary = resolveOptional(update.binary) ?? "(no binary)"
+
+        self.familyFocused = FamilyMember(
+            name: focusedName,
+            binary: focusedBinary,
+            kind: symbolKind(forLanguage: resolveLanguage(update.language)),
+            totalTime: TimeInterval(update.ownOnCpuNs) / 1_000_000_000,
+            callCount: max(1, Int(update.ownPetSamples))
+        )
+        self.familyCallers = update.callersTree.children.map(nodeToMember)
+        self.familyCallees = update.calleesTree.children.map(nodeToMember)
     }
 
     private func runAnnotatedSubscription(

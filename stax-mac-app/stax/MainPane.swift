@@ -41,13 +41,8 @@ struct MainPane: View {
     }
 
     private var minimap: some View {
-        ZStack {
-            Color(nsColor: .underPageBackgroundColor)
-            Text("minimap")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
-        .frame(height: 56)
+        Minimap(timeline: model.timeline)
+            .frame(height: 56)
     }
 
     private var flame: some View {
@@ -58,6 +53,67 @@ struct MainPane: View {
                 .foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct Minimap: View {
+    let timeline: TimelineUpdate?
+
+    var body: some View {
+        ZStack {
+            Color(nsColor: .underPageBackgroundColor)
+            if let timeline, !timeline.buckets.isEmpty {
+                Canvas { ctx, size in
+                    drawTimeline(timeline, in: ctx, size: size)
+                }
+            } else {
+                Text("waiting for timeline…")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    /// Each bucket renders as two stacked columns: on-CPU (green) at
+    /// the bottom, off-CPU (gray) above it. Bar height is fraction of
+    /// the bucket-window the thread group spent in that state.
+    private func drawTimeline(
+        _ timeline: TimelineUpdate,
+        in ctx: GraphicsContext,
+        size: CGSize
+    ) {
+        guard !timeline.buckets.isEmpty else { return }
+        let bucketCount = timeline.buckets.count
+        let bucketWidth = size.width / CGFloat(bucketCount)
+        let bucketSizeNs = max(1, Double(timeline.bucketSizeNs))
+
+        // Cap at the bucket size — saturated buckets reach the top.
+        let onColor = Color.green.opacity(0.7)
+        let offColor = Color.gray.opacity(0.45)
+
+        for (i, bucket) in timeline.buckets.enumerated() {
+            let x = CGFloat(i) * bucketWidth
+            let onRatio = min(1, Double(bucket.onCpuNs) / bucketSizeNs)
+            let offRatio = min(1, Double(bucket.offCpuNs) / bucketSizeNs)
+
+            let onHeight = CGFloat(onRatio) * size.height
+            let offHeight = CGFloat(offRatio) * (size.height - onHeight)
+
+            let onRect = CGRect(
+                x: x,
+                y: size.height - onHeight,
+                width: max(1, bucketWidth - 0.5),
+                height: onHeight
+            )
+            let offRect = CGRect(
+                x: x,
+                y: size.height - onHeight - offHeight,
+                width: max(1, bucketWidth - 0.5),
+                height: offHeight
+            )
+            ctx.fill(Path(onRect), with: .color(onColor))
+            ctx.fill(Path(offRect), with: .color(offColor))
+        }
     }
 }
 
