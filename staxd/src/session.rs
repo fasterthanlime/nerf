@@ -23,18 +23,37 @@ pub async fn run(
     records: vox::Tx<KdBufBatch>,
     cancel: Arc<AtomicBool>,
 ) -> Result<RecordSummary, RecordError> {
+    let run_start = Instant::now();
+    info!(
+        pid = config.target_pid,
+        frequency_hz = config.frequency_hz,
+        buf_records = config.buf_records,
+        samplers = config.samplers,
+        class_mask = config.class_mask,
+        "staxd session starting"
+    );
+
+    let phase_start = Instant::now();
     let fw = bindings::load().map_err(map_kperf_err)?;
+    info!(elapsed = ?phase_start.elapsed(), "staxd loaded kperf frameworks");
 
     // Earliest cheapest root check. Same gate as the rest of the
     // kpc surface so any failure here also predicts everything else.
+    let phase_start = Instant::now();
     let mut force_ctrs: i32 = 0;
     let rc = unsafe { (fw.kpc_force_all_ctrs_get)(&mut force_ctrs) };
     if rc != 0 {
         return Err(RecordError::NotRoot);
     }
+    info!(
+        elapsed = ?phase_start.elapsed(),
+        force_ctrs,
+        "staxd root/kpc gate passed"
+    );
 
     // Wipe stale state from a previous half-finished session — same
     // motivation as recorder.rs:80-89.
+    let phase_start = Instant::now();
     unsafe {
         let _ = (fw.kperf_sample_set)(0);
         let _ = (fw.kperf_reset)();
@@ -42,14 +61,25 @@ pub async fn run(
     let _ = kdebug::set_lightweight_pet(0);
     let _ = kdebug::enable(false);
     let _ = kdebug::reset();
+    info!(elapsed = ?phase_start.elapsed(), "staxd cleared stale kperf/kdebug state");
 
+    let phase_start = Instant::now();
     setup_kperf(&fw, &config)?;
+    info!(elapsed = ?phase_start.elapsed(), "staxd configured kperf");
 
+    let phase_start = Instant::now();
     setup_kdebug(&config)?;
+    info!(elapsed = ?phase_start.elapsed(), "staxd configured/enabled kdebug");
 
     let result = drain(&fw, &config, records, cancel).await;
 
+    let phase_start = Instant::now();
     teardown(&fw);
+    info!(
+        elapsed = ?phase_start.elapsed(),
+        total_elapsed = ?run_start.elapsed(),
+        "staxd session torn down"
+    );
     result
 }
 
@@ -147,16 +177,25 @@ async fn drain(
 
     let mut buf: Vec<KdBuf> = vec![empty_kdbuf(); config.buf_records as usize];
     let mut total_drained: u64 = 0;
+    let mut first_nonempty_logged = false;
+    let mut send_count: u64 = 0;
+
+    info!(
+        drain_period = ?drain_period,
+        buf_records = config.buf_records,
+        "staxd drain loop starting"
+    );
 
     // Signal "kperf/kdebug is configured and enabled" before the
     // first timed drain. Launch-mode shade uses this as the safe
     // point to resume a suspended child; waiting for the first real
     // read can add hundreds of ms and can include stale system-wide
     // SCHED records unrelated to the target.
+    let sent_ready_at_unix_ns = unix_ns_now();
     if let Err(e) = records
         .send(KdBufBatch {
             records: Vec::new(),
-            drained_at_unix_ns: unix_ns_now(),
+            drained_at_unix_ns: sent_ready_at_unix_ns,
         })
         .await
     {
@@ -166,6 +205,12 @@ async fn drain(
             session_ns: session_start.elapsed().as_nanos() as u64,
         });
     }
+    send_count += 1;
+    info!(
+        elapsed = ?session_start.elapsed(),
+        drained_at_unix_ns = sent_ready_at_unix_ns,
+        "staxd sent ready batch"
+    );
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -188,6 +233,19 @@ async fn drain(
             }
         };
         total_drained += n as u64;
+        let drained_at_unix_ns = unix_ns_now();
+        if n > 0 && !first_nonempty_logged {
+            first_nonempty_logged = true;
+            info!(
+                elapsed = ?session_start.elapsed(),
+                records = n,
+                first_ts = buf.first().map(|rec| rec.timestamp).unwrap_or(0),
+                last_ts = buf.get(n.saturating_sub(1)).map(|rec| rec.timestamp).unwrap_or(0),
+                drained_at_unix_ns,
+                ready_to_first_nonempty_ns = drained_at_unix_ns.saturating_sub(sent_ready_at_unix_ns),
+                "staxd first non-empty kdebug drain"
+            );
+        }
 
         // Always send a batch, even when n == 0. The send doubles
         // as our detection of "client went away" — without it, the
@@ -195,13 +253,21 @@ async fn drain(
         // after the client disconnected.
         let batch = KdBufBatch {
             records: buf[..n].iter().map(kdbuf_to_wire).collect(),
-            drained_at_unix_ns: unix_ns_now(),
+            drained_at_unix_ns,
         };
         if let Err(e) = records.send(batch).await {
             info!(?e, "client closed records channel; ending session");
             break;
         }
+        send_count += 1;
     }
+
+    info!(
+        records_drained = total_drained,
+        sends = send_count,
+        elapsed = ?session_start.elapsed(),
+        "staxd drain loop ended"
+    );
 
     Ok(RecordSummary {
         records_drained: total_drained,

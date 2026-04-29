@@ -115,6 +115,12 @@ where
         format!("local://{}", opts.daemon_socket)
     };
 
+    let client_start = Instant::now();
+    info!(
+        "staxd-client: session starting url={url} pid={} frequency_hz={} buf_records={} duration={:?}",
+        opts.pid, opts.frequency_hz, opts.buf_records, opts.duration
+    );
+    let phase_start = Instant::now();
     info!("staxd-client: connecting to {url}");
     let client: StaxdClient = match vox::connect(&url).await {
         Ok(c) => c,
@@ -137,14 +143,22 @@ where
             });
         }
     };
+    info!(
+        "staxd-client: connected to daemon elapsed={:?}",
+        phase_start.elapsed()
+    );
 
+    let phase_start = Instant::now();
     let status = client
         .status()
         .await
         .map_err(|e| Error::VoxCall(format!("status: {e:?}")))?;
     info!(
-        "staxd-client: daemon v{} arch={} state={:?}",
-        status.version, status.host_arch, status.state
+        "staxd-client: daemon v{} arch={} state={:?} elapsed={:?}",
+        status.version,
+        status.host_arch,
+        status.state,
+        phase_start.elapsed()
     );
 
     // Pipeline owns the parser + off-CPU tracker + image scanner +
@@ -171,10 +185,15 @@ where
     let (worker_tx, worker_rx) = std::sync::mpsc::channel::<WorkerMsg>();
     let abort_worker_backlog = Arc::new(AtomicBool::new(false));
     let worker_abort = abort_worker_backlog.clone();
+    let phase_start = Instant::now();
     let worker_handle = std::thread::Builder::new()
         .name("staxd-client-worker".to_owned())
         .spawn(move || worker_thread(pipeline_config, shared_cache, sink, worker_abort, worker_rx))
         .map_err(|e| Error::VoxCall(format!("spawn worker thread: {e}")))?;
+    info!(
+        "staxd-client: parser worker spawned elapsed={:?}",
+        phase_start.elapsed()
+    );
 
     // Build the session config the daemon expects. Filter range covers
     // DBG_MACH..DBG_PERF, mirroring the in-process recorder's default
@@ -195,6 +214,8 @@ where
     // the RPC, drain `rx` here. The RPC future doesn't resolve until
     // the daemon's record() returns (clean stop or error).
     let (tx, mut rx) = vox::channel::<KdBufBatch>();
+    let record_rpc_start = Instant::now();
+    info!("staxd-client: spawning record RPC");
     let record_fut = tokio::spawn({
         let client = client.clone();
         async move { client.record(session_config, tx).await }
@@ -203,6 +224,9 @@ where
     let session_start = Instant::now();
     let mut total_drained: u64 = 0;
     let mut seen_first_batch = false;
+    let mut seen_first_nonempty_batch = false;
+    let mut probe_trigger_count: u64 = 0;
+    let mut first_probe_trigger_logged = false;
     let mut probe_trigger_scanner = KperfProbeTriggerScanner::default();
 
     loop {
@@ -240,14 +264,41 @@ where
             if !seen_first_batch {
                 seen_first_batch = true;
                 info!(
-                    "staxd-client: first batch ({} records) arrived {:?} after session start",
+                    "staxd-client: first batch arrived records={} since_client_start={:?} since_record_rpc_spawn={:?} since_recv_loop_start={:?} drained_at_unix_ns={} received_at_unix_ns={}",
                     batch.records.len(),
+                    client_start.elapsed(),
+                    record_rpc_start.elapsed(),
                     session_start.elapsed(),
+                    batch.drained_at_unix_ns,
+                    unix_ns_now()
                 );
                 on_first_batch();
             }
+            if !batch.records.is_empty() && !seen_first_nonempty_batch {
+                seen_first_nonempty_batch = true;
+                info!(
+                    "staxd-client: first non-empty batch arrived records={} first_ts={} last_ts={} drained_at_unix_ns={} received_at_unix_ns={} since_client_start={:?} since_record_rpc_spawn={:?}",
+                    batch.records.len(),
+                    batch.records.first().map(|rec| rec.timestamp).unwrap_or(0),
+                    batch.records.last().map(|rec| rec.timestamp).unwrap_or(0),
+                    batch.drained_at_unix_ns,
+                    unix_ns_now(),
+                    client_start.elapsed(),
+                    record_rpc_start.elapsed()
+                );
+            }
             for rec in &batch.records {
                 if let Some((tid, ts)) = probe_trigger_scanner.feed(rec) {
+                    probe_trigger_count += 1;
+                    if !first_probe_trigger_logged {
+                        first_probe_trigger_logged = true;
+                        info!(
+                            "staxd-client: first race-kperf probe trigger tid={tid} kperf_ts={ts} trigger_count={} since_client_start={:?} since_record_rpc_spawn={:?}",
+                            probe_trigger_count,
+                            client_start.elapsed(),
+                            record_rpc_start.elapsed()
+                        );
+                    }
                     on_kperf_sample_start(tid, ts);
                 }
             }
@@ -299,6 +350,12 @@ where
         .map_err(|e| Error::VoxCall(format!("join worker: {e:?}")))?;
 
     info!("staxd-client: locally drained {total_drained} records");
+    info!(
+        "staxd-client: session finished total_elapsed={:?} records={} probe_triggers={}",
+        client_start.elapsed(),
+        total_drained,
+        probe_trigger_count
+    );
     Ok(())
 }
 
@@ -311,6 +368,10 @@ async fn join_worker_with_deadline(
     match tokio::time::timeout(WORKER_SHUTDOWN_BUDGET, &mut join).await {
         Ok(result) => {
             let _ = result?;
+            info!(
+                "staxd-client-worker: shutdown drained within budget budget={:?}",
+                WORKER_SHUTDOWN_BUDGET
+            );
         }
         Err(_) => {
             warn!(
@@ -397,11 +458,28 @@ fn worker_thread<S: SampleSink>(
     abort_backlog: Arc<AtomicBool>,
     rx: std::sync::mpsc::Receiver<WorkerMsg>,
 ) {
+    let worker_start = Instant::now();
+    info!(
+        "staxd-client-worker: starting parser pipeline pid={} frequency_hz={} has_shared_cache={}",
+        config.pid,
+        config.frequency_hz,
+        shared_cache.is_some()
+    );
+    let phase_start = Instant::now();
     let mut pipeline = Pipeline::new(config, shared_cache, &mut sink);
+    info!(
+        "staxd-client-worker: parser pipeline ready elapsed={:?}",
+        phase_start.elapsed()
+    );
 
     // Tick cadence — drives image / thread-name / jitdump
     // rescans. Lives here, not on the recv loop.
     const TICK_INTERVAL: Duration = Duration::from_millis(50);
+    const SLOW_PROCESS_RECORDS: Duration = Duration::from_millis(10);
+    const SLOW_TICK: Duration = Duration::from_millis(10);
+    let mut processed_batches: u64 = 0;
+    let mut processed_records: u64 = 0;
+    let mut first_batch_logged = false;
 
     loop {
         if abort_backlog.load(Ordering::Acquire) {
@@ -417,7 +495,29 @@ fn worker_thread<S: SampleSink>(
                     break;
                 }
                 let kdbufs: Vec<KdBuf> = batch.records.iter().map(wire_to_kdbuf).collect();
+                if !first_batch_logged {
+                    first_batch_logged = true;
+                    info!(
+                        "staxd-client-worker: first kdebug batch queued to parser records={} first_ts={} last_ts={} since_worker_start={:?}",
+                        kdbufs.len(),
+                        kdbufs.first().map(|rec| rec.timestamp).unwrap_or(0),
+                        kdbufs.last().map(|rec| rec.timestamp).unwrap_or(0),
+                        worker_start.elapsed()
+                    );
+                }
+                let phase_start = Instant::now();
                 pipeline.process_records(&kdbufs, &mut sink);
+                let elapsed = phase_start.elapsed();
+                processed_batches += 1;
+                processed_records += kdbufs.len() as u64;
+                if elapsed >= SLOW_PROCESS_RECORDS {
+                    info!(
+                        "staxd-client-worker: slow process_records elapsed={elapsed:?} records={} processed_batches={} processed_records={}",
+                        kdbufs.len(),
+                        processed_batches,
+                        processed_records
+                    );
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -425,10 +525,26 @@ fn worker_thread<S: SampleSink>(
         // Periodic libproc scans — sync, may do disk IO. That's
         // fine *here*: this thread is dedicated, so a slow scan
         // can't block recv or vox.
+        let phase_start = Instant::now();
         pipeline.tick(&mut sink);
+        let elapsed = phase_start.elapsed();
+        if elapsed >= SLOW_TICK {
+            info!(
+                "staxd-client-worker: slow pipeline tick elapsed={elapsed:?} processed_batches={} processed_records={}",
+                processed_batches, processed_records
+            );
+        }
     }
 
+    let phase_start = Instant::now();
     pipeline.finish(&mut sink);
+    info!(
+        "staxd-client-worker: parser pipeline finished elapsed={:?} total_elapsed={:?} processed_batches={} processed_records={}",
+        phase_start.elapsed(),
+        worker_start.elapsed(),
+        processed_batches,
+        processed_records
+    );
 }
 
 fn wire_to_kdbuf(w: &KdBufWire) -> KdBuf {
@@ -443,4 +559,11 @@ fn wire_to_kdbuf(w: &KdBufWire) -> KdBuf {
         cpuid: w.cpuid,
         unused: w.unused,
     }
+}
+
+fn unix_ns_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }

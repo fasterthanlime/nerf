@@ -61,7 +61,7 @@ use std::os::fd::RawFd;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eyre::WrapErr;
 use facet::Facet;
@@ -244,13 +244,46 @@ async fn run_recording(
     terminal: Option<Pty>,
     launched_pid: Option<u32>,
 ) -> eyre::Result<()> {
+    let recording_start = Instant::now();
+    let run_id_raw = run_id.0;
+    tracing::info!(
+        run_id = run_id_raw,
+        pid,
+        launched_pid,
+        has_pre_resume = pre_resume.is_some(),
+        has_terminal = terminal.is_some(),
+        race_kperf = cli.race_kperf,
+        frequency_hz = cli.frequency,
+        daemon_socket = %cli.daemon_socket,
+        "shade recording lifecycle starting"
+    );
+
+    let phase_start = Instant::now();
     let (_server_client, mut commands) = register_with_server(server_socket, run_id.0, pid).await?;
+    tracing::info!(
+        run_id = run_id.0,
+        elapsed = ?phase_start.elapsed(),
+        "shade registered with server"
+    );
+    let phase_start = Instant::now();
     let (ingest_sink, forwarder) =
         stax_core::ingest_sink::connect_to_existing_run(server_socket, run_id).await?;
+    tracing::info!(
+        run_id = run_id.0,
+        elapsed = ?phase_start.elapsed(),
+        "shade connected ingest sink"
+    );
+    let phase_start = Instant::now();
     let terminal_pump = match terminal {
         Some(pty) => Some(start_terminal_pump(server_socket, run_id, pty).await?),
         None => None,
     };
+    tracing::info!(
+        run_id = run_id.0,
+        elapsed = ?phase_start.elapsed(),
+        has_terminal_pump = terminal_pump.is_some(),
+        "shade terminal pump configured"
+    );
 
     let sink = LiveOnlySink::new(Some(Box::new(ingest_sink)));
     sink.notify_target_attached(pid);
@@ -270,6 +303,9 @@ async fn run_recording(
         duration: cli.time_limit.map(Duration::from_secs),
         ..Default::default()
     };
+    let drive_pid = opts.pid;
+    let drive_frequency = opts.frequency_hz;
+    let drive_buf_records = opts.buf_records;
 
     let server_stop_requested = Arc::new(AtomicBool::new(false));
     let server_stop_for_task = server_stop_requested.clone();
@@ -308,6 +344,14 @@ async fn run_recording(
     let pre_resume_for_recording_start = pre_resume.clone();
     let child_exit = Arc::new(Mutex::new(None));
     let child_exit_for_stop = child_exit.clone();
+    tracing::info!(
+        run_id = run_id.0,
+        pid = drive_pid,
+        frequency_hz = drive_frequency,
+        buf_records = drive_buf_records,
+        elapsed = ?recording_start.elapsed(),
+        "shade entering staxd-client drive_session"
+    );
     let result = staxd_client::drive_session_with_hooks(
         opts,
         sink,
@@ -331,6 +375,10 @@ async fn run_recording(
             false
         },
         move || {
+            tracing::info!(
+                run_id = run_id_raw,
+                "shade observed staxd ready/first batch; resuming launch-suspended target if present"
+            );
             if let Some(pre_resume) = pre_resume_for_recording_start
                 .lock()
                 .expect("pre_resume poisoned")
@@ -348,8 +396,26 @@ async fn run_recording(
         },
     )
     .await;
+    match &result {
+        Ok(()) => tracing::info!(
+            run_id = run_id.0,
+            elapsed = ?recording_start.elapsed(),
+            "shade staxd-client drive_session completed"
+        ),
+        Err(e) => tracing::warn!(
+            run_id = run_id.0,
+            elapsed = ?recording_start.elapsed(),
+            error = %e,
+            "shade staxd-client drive_session failed"
+        ),
+    }
 
     if let Some(pre_resume) = pre_resume.lock().expect("pre_resume poisoned").take() {
+        tracing::warn!(
+            run_id = run_id.0,
+            elapsed = ?recording_start.elapsed(),
+            "shade drive_session returned before staxd-ready resume hook fired; resuming target now"
+        );
         pre_resume.resume()?;
     }
 
@@ -365,9 +431,19 @@ async fn run_recording(
         if let Some(exit) = *child_exit.lock().expect("child_exit poisoned") {
             terminal_pump.report_exit(exit);
         }
+        tracing::info!(
+            run_id = run_id.0,
+            elapsed = ?recording_start.elapsed(),
+            "shade finishing terminal pump"
+        );
         terminal_pump.finish().await;
     }
 
+    tracing::info!(
+        run_id = run_id.0,
+        elapsed = ?recording_start.elapsed(),
+        "shade awaiting ingest forwarder"
+    );
     if let Err(e) = forwarder.await {
         tracing::warn!("ingest forwarder task ended unexpectedly: {e}");
     }

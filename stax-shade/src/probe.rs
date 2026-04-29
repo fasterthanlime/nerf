@@ -131,10 +131,28 @@ impl RaceProbeWorker {
         std::thread::Builder::new()
             .name("stax-race-probe".to_owned())
             .spawn(move || {
+                tracing::info!("race-kperf probe worker started");
                 let mut probe = RaceProbe::new(task);
+                let mut batches: u64 = 0;
+                let mut requests_seen: u64 = 0;
+                let mut results_sent: u64 = 0;
+                let mut first_request_logged = false;
+                let mut first_result_logged = false;
                 while let Some(batch) = worker_requests.take_all() {
+                    batches += 1;
                     let worker_batch_len = batch.len() as u32;
                     for req in batch {
+                        requests_seen += 1;
+                        if !first_request_logged {
+                            first_request_logged = true;
+                            tracing::info!(
+                                tid = req.tid,
+                                kperf_ts = req.kperf_ts,
+                                coalesced = req.coalesced_requests,
+                                worker_batch_len,
+                                "race-kperf probe worker received first request"
+                            );
+                        }
                         let timing = ProbeTiming {
                             kperf_ts: req.kperf_ts,
                             enqueued: req.enqueued_ticks,
@@ -156,16 +174,41 @@ impl RaceProbeWorker {
                                 walked: snapshot.walked,
                             };
                             if res_tx.send(out).is_err() {
+                                tracing::info!(
+                                    batches,
+                                    requests_seen,
+                                    results_sent,
+                                    "race-kperf probe result receiver closed"
+                                );
                                 return;
+                            }
+                            results_sent += 1;
+                            if !first_result_logged {
+                                first_result_logged = true;
+                                tracing::info!(
+                                    tid = req.tid,
+                                    kperf_ts = req.kperf_ts,
+                                    results_sent,
+                                    coalesced = req.coalesced_requests,
+                                    worker_batch_len,
+                                    "race-kperf probe worker sent first result"
+                                );
                             }
                         }
                     }
                 }
+                tracing::info!(
+                    batches,
+                    requests_seen,
+                    results_sent,
+                    "race-kperf probe worker exiting"
+                );
             })
             .expect("spawn race probe worker");
         Self {
             trigger: RaceProbeTrigger {
                 requests,
+                enqueued_probe_requests: Arc::new(AtomicU64::new(0)),
                 coalesced_probe_requests: Arc::new(AtomicU64::new(0)),
             },
             res_rx,
@@ -194,6 +237,7 @@ impl Drop for RaceProbeWorker {
 #[derive(Clone)]
 pub struct RaceProbeTrigger {
     requests: Arc<LatestProbeRequests>,
+    enqueued_probe_requests: Arc<AtomicU64>,
     coalesced_probe_requests: Arc<AtomicU64>,
 }
 
@@ -203,12 +247,30 @@ impl RaceProbeTrigger {
     /// request for the same tid; that is intentional because
     /// race-kperf wants fresh observations, not FIFO delivery.
     pub fn enqueue(&self, tid: u32, kperf_ts: u64) -> bool {
+        let enqueued = self
+            .enqueued_probe_requests
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         let replaced = self.requests.push(ProbeRequest {
             tid,
             kperf_ts,
             enqueued_ticks: unsafe { mach_absolute_time() },
             coalesced_requests: 0,
         });
+        if enqueued == 1 {
+            tracing::info!(
+                tid,
+                kperf_ts,
+                replaced,
+                "race-kperf first probe request enqueued"
+            );
+        } else if enqueued.is_multiple_of(1024) {
+            tracing::debug!(
+                enqueued,
+                coalesced = self.coalesced_probe_requests.load(Ordering::Relaxed),
+                "race-kperf probe requests enqueued"
+            );
+        }
         if replaced {
             let coalesced = self
                 .coalesced_probe_requests
