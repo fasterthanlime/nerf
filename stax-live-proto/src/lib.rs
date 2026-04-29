@@ -551,6 +551,18 @@ pub struct ProbeDiffDepthCell {
 
 #[derive(Clone, Copy, Debug, Default, Facet)]
 pub struct ProbeTimingBreakdown {
+    /// Raw mach tick timestamps for reconstructing the exact handoff path.
+    pub kperf_ts_ticks: u64,
+    pub staxd_read_started_ticks: u64,
+    pub staxd_drained_ticks: u64,
+    pub staxd_send_started_ticks: u64,
+    pub client_received_ticks: u64,
+    pub enqueued_ticks: u64,
+    pub worker_started_ticks: u64,
+    pub thread_lookup_done_ticks: u64,
+    pub state_done_ticks: u64,
+    pub resume_done_ticks: u64,
+    pub walk_done_ticks: u64,
     /// kperf sample timestamp -> race-probe enqueue.
     pub kperf_to_enqueue_ns: u64,
     /// kperf sample timestamp -> daemon read start.

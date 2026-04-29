@@ -39,6 +39,60 @@ export interface ServerStatus {
   active: RunSummary[];
 }
 
+export interface CounterSnapshot {
+  name: string;
+  value: bigint;
+}
+
+export interface GaugeSnapshot {
+  name: string;
+  value: bigint;
+}
+
+export interface HistogramBucketSnapshot {
+  le: bigint;
+  count: bigint;
+}
+
+export interface HistogramSnapshot {
+  name: string;
+  count: bigint;
+  sum: bigint;
+  max: bigint;
+  buckets: HistogramBucketSnapshot[];
+  overflow: bigint;
+}
+
+export interface PhaseSnapshot {
+  name: string;
+  state: string;
+  detail: string;
+  entered_at_unix_ns: bigint;
+  elapsed_ns: bigint;
+}
+
+export interface RecentEventSnapshot {
+  at_unix_ns: bigint;
+  name: string;
+  detail: string;
+}
+
+export interface TelemetrySnapshot {
+  component: string;
+  generated_at_unix_ns: bigint;
+  counters: CounterSnapshot[];
+  gauges: GaugeSnapshot[];
+  histograms: HistogramSnapshot[];
+  phases: PhaseSnapshot[];
+  recent_events: RecentEventSnapshot[];
+}
+
+export interface DiagnosticsSnapshot {
+  server_started_at_unix_ns: bigint;
+  active: RunSummary[];
+  telemetry: TelemetrySnapshot;
+}
+
 export interface RunConfig {
   label: string;
   frequency_hz: number;
@@ -100,6 +154,9 @@ export type StatusResponse = ServerStatus;
 export type ListRunsRequest = [];
 export type ListRunsResponse = RunSummary[];
 
+export type DiagnosticsRequest = [];
+export type DiagnosticsResponse = DiagnosticsSnapshot;
+
 export type StartAttachRequest = [
   number, // pid
   RunConfig, // config
@@ -137,6 +194,11 @@ export interface RunControlCaller {
    * (in-memory only for now; on-disk persistence is a follow-up).
    */
   listRuns(): Promise<RunSummary[]>;
+  /**
+   * Point-in-time server diagnostics: current run plus stax-owned
+   * telemetry counters, phases, histograms, and recent events.
+   */
+  diagnostics(): Promise<DiagnosticsSnapshot>;
   /** Start a recording by attaching stax-shade to an existing pid. */
   startAttach(pid: number, config: RunConfig, daemonSocket: string, timeLimitSecs: bigint | null): Promise<{ ok: true; value: RunId } | { ok: false; error: RunControlError }>;
   /**
@@ -199,6 +261,22 @@ export class RunControlClient implements RunControlCaller {
         sendSchemas,
       });
       return value as RunSummary[];
+  }
+
+  /**
+   * Point-in-time server diagnostics: current run plus stax-owned
+   * telemetry counters, phases, histograms, and recent events.
+   */
+  async diagnostics(): Promise<DiagnosticsSnapshot> {
+    const descriptor = runControl_diagnostics_method;
+    const sendSchemas = runControl_descriptor.send_schemas;
+      const value = await this.caller.call({
+        method: "RunControl.diagnostics",
+        args: {},
+        descriptor,
+        sendSchemas,
+      });
+      return value as DiagnosticsSnapshot;
   }
 
   /** Start a recording by attaching stax-shade to an existing pid. */
@@ -320,6 +398,7 @@ export async function connectRunControl(
 export interface RunControlHandler {
   status(): Promise<ServerStatus> | ServerStatus;
   listRuns(): Promise<RunSummary[]> | RunSummary[];
+  diagnostics(): Promise<DiagnosticsSnapshot> | DiagnosticsSnapshot;
   startAttach(pid: number, config: RunConfig, daemonSocket: string, timeLimitSecs: bigint | null): Promise<{ ok: true; value: RunId } | { ok: false; error: RunControlError }> | { ok: true; value: RunId } | { ok: false; error: RunControlError };
   startLaunch(request: LaunchRequest, terminalInput: Rx<TerminalInput>, terminalOutput: Tx<TerminalOutput>): Promise<{ ok: true; value: RunId } | { ok: false; error: RunControlError }> | { ok: true; value: RunId } | { ok: false; error: RunControlError };
   waitActive(condition: WaitCondition, timeoutMs: bigint | null): Promise<WaitOutcome> | WaitOutcome;
@@ -349,6 +428,13 @@ export class RunControlDispatcher implements Dispatcher {
     } else if (method.id === 0x660607fe04b64c9fn) {
       try {
         const result = await this.handler.listRuns();
+        call.reply(result);
+      } catch (error) {
+        call.replyInternalError(error instanceof Error ? error.message : String(error));
+      }
+    } else if (method.id === 0x7552fdb2e206709an) {
+      try {
+        const result = await this.handler.diagnostics();
         call.reply(result);
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
@@ -404,6 +490,15 @@ export const runControl_send_schemas: import("@bearcove/vox-core").ServiceSendSc
     [0xa938a91823178fd5n, { id: 0xa938a91823178fd5n, type_params: [], kind: { tag: 'struct', name: 'RunSummary', fields: [{ name: 'id', type_ref: { tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, required: true }, { name: 'state', type_ref: { tag: 'concrete', type_id: 0xee0f06d5e8720d1fn, args: [] }, required: true }, { name: 'stop_reason', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xd93d51583a6b18d0n, args: [] }] }, required: true }, { name: 'started_at_unix_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'stopped_at_unix_ns', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }] }, required: true }, { name: 'target_pid', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'label', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu_intervals', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
     [0x0a96b404b4d79d67n, { id: 0x0a96b404b4d79d67n, type_params: ['T'], kind: { tag: 'list', element: { tag: 'var', name: 'T' } } }],
     [0x7959968283e55af0n, { id: 0x7959968283e55af0n, type_params: [], kind: { tag: 'struct', name: 'ServerStatus', fields: [{ name: 'server_started_at_unix_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'active', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xa938a91823178fd5n, args: [] }] }, required: true }] } }],
+    [0xf3feeff1f2d83e69n, { id: 0xf3feeff1f2d83e69n, type_params: [], kind: { tag: 'struct', name: 'CounterSnapshot', fields: [{ name: 'name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'value', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0xc6eb8c46f1e17fban, { id: 0xc6eb8c46f1e17fban, type_params: [], kind: { tag: 'primitive', primitive_type: 'i64' } }],
+    [0x0bf06be9dfc2b38an, { id: 0x0bf06be9dfc2b38an, type_params: [], kind: { tag: 'struct', name: 'GaugeSnapshot', fields: [{ name: 'name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'value', type_ref: { tag: 'concrete', type_id: 0xc6eb8c46f1e17fban, args: [] }, required: true }] } }],
+    [0x35d210172af27f64n, { id: 0x35d210172af27f64n, type_params: [], kind: { tag: 'struct', name: 'HistogramBucketSnapshot', fields: [{ name: 'le', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'count', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0x5330c1aff3e803efn, { id: 0x5330c1aff3e803efn, type_params: [], kind: { tag: 'struct', name: 'HistogramSnapshot', fields: [{ name: 'name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'count', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'sum', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'max', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'buckets', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x35d210172af27f64n, args: [] }] }, required: true }, { name: 'overflow', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0x25a99f6586249222n, { id: 0x25a99f6586249222n, type_params: [], kind: { tag: 'struct', name: 'PhaseSnapshot', fields: [{ name: 'name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'state', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'detail', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'entered_at_unix_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'elapsed_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0xb5210d4e956c1ab9n, { id: 0xb5210d4e956c1ab9n, type_params: [], kind: { tag: 'struct', name: 'RecentEventSnapshot', fields: [{ name: 'at_unix_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'detail', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }],
+    [0x8f20ae08d9ed6222n, { id: 0x8f20ae08d9ed6222n, type_params: [], kind: { tag: 'struct', name: 'TelemetrySnapshot', fields: [{ name: 'component', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'generated_at_unix_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'counters', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xf3feeff1f2d83e69n, args: [] }] }, required: true }, { name: 'gauges', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x0bf06be9dfc2b38an, args: [] }] }, required: true }, { name: 'histograms', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x5330c1aff3e803efn, args: [] }] }, required: true }, { name: 'phases', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x25a99f6586249222n, args: [] }] }, required: true }, { name: 'recent_events', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xb5210d4e956c1ab9n, args: [] }] }, required: true }] } }],
+    [0x0e957287fe0fa537n, { id: 0x0e957287fe0fa537n, type_params: [], kind: { tag: 'struct', name: 'DiagnosticsSnapshot', fields: [{ name: 'server_started_at_unix_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'active', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xa938a91823178fd5n, args: [] }] }, required: true }, { name: 'telemetry', type_ref: { tag: 'concrete', type_id: 0x8f20ae08d9ed6222n, args: [] }, required: true }] } }],
     [0x9c002a4450cb58dcn, { id: 0x9c002a4450cb58dcn, type_params: [], kind: { tag: 'struct', name: 'RunConfig', fields: [{ name: 'label', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'frequency_hz', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'race_kperf', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }] } }],
     [0x915c6fb5b64f270bn, { id: 0x915c6fb5b64f270bn, type_params: ['T0', 'T1', 'T2', 'T3'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }, { tag: 'var', name: 'T2' }, { tag: 'var', name: 'T3' }] } }],
     [0xffd5a98ac5bd6a87n, { id: 0xffd5a98ac5bd6a87n, type_params: [], kind: { tag: 'enum', name: 'RunControlError', variants: [{ name: 'NoActiveRun', index: 0, payload: { tag: 'unit' } }, { name: 'AlreadyActive', index: 1, payload: { tag: 'unit' } }, { name: 'SpawnFailed', index: 2, payload: { tag: 'struct', fields: [{ name: 'detail', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }, { name: 'Internal', index: 3, payload: { tag: 'struct', fields: [{ name: 'message', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }] } }],
@@ -425,6 +520,7 @@ export const runControl_send_schemas: import("@bearcove/vox-core").ServiceSendSc
   methods: new Map<bigint, import("@bearcove/vox-core").MethodSendSchemas>([
     [0x874da25beec8b931n, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x7959968283e55af0n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x660607fe04b64c9fn, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xa938a91823178fd5n, args: [] }] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x7552fdb2e206709an, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x0e957287fe0fa537n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xd1fa0143fbbb5525n, { argsRootRef: { tag: 'concrete', type_id: 0x915c6fb5b64f270bn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0x9c002a4450cb58dcn, args: [] }, { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xffd5a98ac5bd6a87n, args: [] }] }] } }],
     [0x153c5c16f3b393d4n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0x305469155a65a7bdn, args: [] }, { tag: 'concrete', type_id: 0x967a48ac345e2f5en, args: [{ tag: 'concrete', type_id: 0x797416a1cb38d4abn, args: [] }] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x9fb0b239b7b475ddn, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xffd5a98ac5bd6a87n, args: [] }] }] } }],
     [0x0ab236833a4327den, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x8fbc99220193571bn, args: [] }, { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x22ef152b3afb1613n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
@@ -441,6 +537,12 @@ export const runControl_status_method: MethodDescriptor = {
 export const runControl_listRuns_method: MethodDescriptor = {
   name: 'listRuns',
   id: 0x660607fe04b64c9fn,
+  retry: { persist: false, idem: false },
+};
+
+export const runControl_diagnostics_method: MethodDescriptor = {
+  name: 'diagnostics',
+  id: 0x7552fdb2e206709an,
   retry: { persist: false, idem: false },
 };
 
@@ -475,6 +577,7 @@ export const runControl_descriptor: ServiceDescriptor = {
   methods: new Map<bigint, MethodDescriptor>([
     [runControl_status_method.id, runControl_status_method],
     [runControl_listRuns_method.id, runControl_listRuns_method],
+    [runControl_diagnostics_method.id, runControl_diagnostics_method],
     [runControl_startAttach_method.id, runControl_startAttach_method],
     [runControl_startLaunch_method.id, runControl_startLaunch_method],
     [runControl_waitActive_method.id, runControl_waitActive_method],

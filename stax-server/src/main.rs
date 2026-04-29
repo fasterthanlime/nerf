@@ -47,6 +47,11 @@ async fn main() -> eyre::Result<()> {
     }
 
     let server = ServerState::new(socket.clone());
+    let _telemetry_registration = stax_vox_observe::register_global_telemetry(
+        "stax-server",
+        "server",
+        server.telemetry.registry.clone(),
+    );
     server.attach_local_shared_cache();
 
     let local_listener =

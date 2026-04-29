@@ -130,6 +130,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_logging();
+    let telemetry = stax_telemetry::TelemetryRegistry::new("stax-shade");
+    let _telemetry_registration =
+        stax_vox_observe::register_global_telemetry("stax-shade", "process", telemetry.clone());
     let _vox_sigusr1_dump = stax_vox_observe::install_global_sigusr1_dump("stax-shade");
 
     let cli: Cli = args::Driver::new(
@@ -145,14 +148,14 @@ async fn main() -> ExitCode {
     .run()
     .unwrap();
 
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, telemetry).await {
         tracing::error!("stax-shade failed: {e:?}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-async fn run(cli: Cli) -> eyre::Result<()> {
+async fn run(cli: Cli, telemetry: stax_telemetry::TelemetryRegistry) -> eyre::Result<()> {
     let mode = match (cli.attach, cli.launch, cli.command.first()) {
         (Some(pid), false, _) => AttachMode::Existing(pid),
         (None, true, Some(_)) => AttachMode::Launch(cli.command.clone()),
@@ -215,6 +218,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
                 attached.pre_resume,
                 terminal,
                 launched_pid,
+                telemetry.clone(),
             )
             .await?;
         }
@@ -244,6 +248,7 @@ async fn run_recording(
     pre_resume: Option<PreResume>,
     terminal: Option<Pty>,
     launched_pid: Option<u32>,
+    telemetry: stax_telemetry::TelemetryRegistry,
 ) -> eyre::Result<()> {
     let recording_start = Instant::now();
     let run_id_raw = run_id.0;
@@ -261,15 +266,19 @@ async fn run_recording(
 
     let phase_start = Instant::now();
     let (_server_client, mut commands, _server_debug_registration) =
-        register_with_server(server_socket, run_id.0, pid).await?;
+        register_with_server(server_socket, run_id.0, pid, telemetry.clone()).await?;
     tracing::info!(
         run_id = run_id.0,
         elapsed = ?phase_start.elapsed(),
         "shade registered with server"
     );
     let phase_start = Instant::now();
-    let (ingest_sink, forwarder) =
-        stax_core::ingest_sink::connect_to_existing_run(server_socket, run_id).await?;
+    let (ingest_sink, forwarder) = stax_core::ingest_sink::connect_to_existing_run_with_telemetry(
+        server_socket,
+        run_id,
+        Some(telemetry.clone()),
+    )
+    .await?;
     tracing::info!(
         run_id = run_id.0,
         elapsed = ?phase_start.elapsed(),
@@ -277,7 +286,9 @@ async fn run_recording(
     );
     let phase_start = Instant::now();
     let terminal_pump = match terminal {
-        Some(pty) => Some(start_terminal_pump(server_socket, run_id, pty).await?),
+        Some(pty) => {
+            Some(start_terminal_pump(server_socket, run_id, pty, telemetry.clone()).await?)
+        }
         None => None,
     };
     tracing::info!(
@@ -303,6 +314,7 @@ async fn run_recording(
         pid,
         frequency_hz: cli.frequency,
         duration: cli.time_limit.map(Duration::from_secs),
+        telemetry: Some(telemetry.clone()),
         ..Default::default()
     };
     let drive_pid = opts.pid;
@@ -796,9 +808,15 @@ async fn start_terminal_pump(
     socket: &str,
     run_id: stax_live_proto::RunId,
     mut pty: Pty,
+    telemetry: stax_telemetry::TelemetryRegistry,
 ) -> eyre::Result<TerminalPump> {
     let url = format!("local://{socket}");
-    let client: TerminalBrokerClient = vox::connect(&url).await?;
+    let client: TerminalBrokerClient = vox::connect(&url)
+        .observer(
+            stax_vox_observe::VoxObserverLogger::new("stax-shade", "terminal")
+                .with_telemetry(telemetry),
+        )
+        .await?;
     let debug_registration = stax_vox_observe::register_global_caller(
         "stax-shade",
         "terminal",
@@ -949,13 +967,19 @@ async fn register_with_server(
     socket: &str,
     run_id: u64,
     target_pid: u32,
+    telemetry: stax_telemetry::TelemetryRegistry,
 ) -> eyre::Result<(
     ShadeRegistryClient,
     vox::Rx<ShadeCommand>,
     stax_vox_observe::VoxDebugRegistration,
 )> {
     let url = format!("local://{socket}");
-    let client: ShadeRegistryClient = vox::connect(&url).await?;
+    let client: ShadeRegistryClient = vox::connect(&url)
+        .observer(
+            stax_vox_observe::VoxObserverLogger::new("stax-shade", "shade-registry")
+                .with_telemetry(telemetry),
+        )
+        .await?;
     let debug_registration = stax_vox_observe::register_global_caller(
         "stax-shade",
         "shade-registry",

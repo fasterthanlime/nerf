@@ -3,12 +3,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use stax_telemetry::{CounterHandle, GaugeHandle, HistogramHandle, TelemetryRegistry};
+use stax_telemetry::{
+    CounterHandle, GaugeHandle, HistogramHandle, HistogramSnapshot, TelemetryRegistry,
+    TelemetrySnapshot,
+};
 
 const SLOW_CHANNEL_SEND: Duration = Duration::from_millis(10);
 const SLOW_REQUEST: Duration = Duration::from_millis(10);
 
 static GLOBAL_DEBUG_REGISTRY: OnceLock<VoxDebugRegistry> = OnceLock::new();
+static GLOBAL_TELEMETRY_REGISTRY: OnceLock<TelemetryDebugRegistry> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct VoxDebugRegistry {
@@ -21,6 +25,16 @@ struct VoxDebugRegistryInner {
 }
 
 #[derive(Clone)]
+pub struct TelemetryDebugRegistry {
+    inner: Arc<TelemetryDebugRegistryInner>,
+}
+
+struct TelemetryDebugRegistryInner {
+    next_id: AtomicU64,
+    entries: Mutex<Vec<TelemetryDebugEntry>>,
+}
+
+#[derive(Clone)]
 struct VoxDebugEntry {
     id: u64,
     component: &'static str,
@@ -29,9 +43,22 @@ struct VoxDebugEntry {
     caller: vox::Caller,
 }
 
+#[derive(Clone)]
+struct TelemetryDebugEntry {
+    id: u64,
+    component: &'static str,
+    role: &'static str,
+    registry: TelemetryRegistry,
+}
+
 pub struct VoxDebugRegistration {
     id: u64,
     inner: Weak<VoxDebugRegistryInner>,
+}
+
+pub struct TelemetryDebugRegistration {
+    id: u64,
+    inner: Weak<TelemetryDebugRegistryInner>,
 }
 
 #[derive(Clone)]
@@ -84,6 +111,10 @@ pub fn global_debug_registry() -> &'static VoxDebugRegistry {
     GLOBAL_DEBUG_REGISTRY.get_or_init(VoxDebugRegistry::new)
 }
 
+pub fn global_telemetry_registry() -> &'static TelemetryDebugRegistry {
+    GLOBAL_TELEMETRY_REGISTRY.get_or_init(TelemetryDebugRegistry::new)
+}
+
 pub fn register_global_caller(
     component: &'static str,
     surface: &'static str,
@@ -91,6 +122,14 @@ pub fn register_global_caller(
     caller: &vox::Caller,
 ) -> VoxDebugRegistration {
     global_debug_registry().register_caller(component, surface, role, caller)
+}
+
+pub fn register_global_telemetry(
+    component: &'static str,
+    role: &'static str,
+    registry: TelemetryRegistry,
+) -> TelemetryDebugRegistration {
+    global_telemetry_registry().register(component, role, registry)
 }
 
 #[must_use]
@@ -166,6 +205,11 @@ impl VoxDebugRegistry {
         }
     }
 
+    pub fn dump_all(&self, process_name: &'static str, reason: &'static str) {
+        global_telemetry_registry().dump_telemetry_snapshots(process_name, reason);
+        self.dump_debug_snapshots(process_name, reason);
+    }
+
     #[must_use]
     pub fn install_sigusr1_dump(
         &self,
@@ -180,7 +224,7 @@ impl VoxDebugRegistry {
                 ) {
                     Ok(mut signal) => Some(handle.spawn(async move {
                         while signal.recv().await.is_some() {
-                            registry.dump_debug_snapshots(process_name, "SIGUSR1");
+                            registry.dump_all(process_name, "SIGUSR1");
                         }
                     })),
                     Err(error) => {
@@ -226,7 +270,7 @@ impl VoxDebugRegistry {
                             }
                         };
                         while signal.recv().await.is_some() {
-                            registry.dump_debug_snapshots(process_name, "SIGUSR1");
+                            registry.dump_all(process_name, "SIGUSR1");
                         }
                     });
                 });
@@ -240,24 +284,85 @@ impl VoxDebugRegistry {
     }
 }
 
+impl TelemetryDebugRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(TelemetryDebugRegistryInner {
+                next_id: AtomicU64::new(1),
+                entries: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    pub fn register(
+        &self,
+        component: &'static str,
+        role: &'static str,
+        registry: TelemetryRegistry,
+    ) -> TelemetryDebugRegistration {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .entries
+            .lock()
+            .expect("telemetry debug registry mutex poisoned")
+            .push(TelemetryDebugEntry {
+                id,
+                component,
+                role,
+                registry,
+            });
+        TelemetryDebugRegistration {
+            id,
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub fn dump_telemetry_snapshots(&self, process_name: &'static str, reason: &'static str) {
+        let entries = self
+            .inner
+            .entries
+            .lock()
+            .expect("telemetry debug registry mutex poisoned")
+            .clone();
+        tracing::info!(
+            process = process_name,
+            reason,
+            handles = entries.len(),
+            "dumping registered telemetry snapshots"
+        );
+        for entry in entries {
+            let snapshot = entry.registry.snapshot();
+            let formatted = format_telemetry_snapshot(&snapshot);
+            tracing::info!(
+                process = process_name,
+                reason,
+                component = entry.component,
+                role = entry.role,
+                registration_id = entry.id,
+                "\n{formatted}"
+            );
+        }
+    }
+}
+
 fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
     let now = Instant::now();
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Vox Debug Snapshot\nconnections: {}",
+        "# Vox Debug Snapshot\n\n- connections: {}",
         snapshot.connections.len()
     );
 
     for connection in &snapshot.connections {
         let _ = writeln!(
             out,
-            "\n## connection {:?} · {:?} · driver={:?}",
+            "\n## Connection {:?}\n\n- state: {:?}\n- driver: {:?}",
             connection.connection_id, connection.state, connection.driver_task_status
         );
         let _ = writeln!(
             out,
-            "- endpoint={} surface={} component={} close_reason={}",
+            "- endpoint: {}\n- surface: {}\n- component: {}\n- close_reason: {}",
             display_opt_debug(&connection.endpoint),
             display_opt_debug(&connection.surface),
             display_opt_debug(&connection.component),
@@ -265,7 +370,7 @@ fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
         );
         let _ = writeln!(
             out,
-            "- queues: outbound={}/{} local_control={}/{}",
+            "- queues: outbound={}/{} · local_control={}/{}",
             display_opt_usize(connection.outbound_queue_depth),
             display_opt_usize(connection.outbound_queue_capacity),
             display_opt_usize(connection.local_control_queue_depth),
@@ -273,7 +378,7 @@ fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
         );
         let _ = writeln!(
             out,
-            "- last: inbound={} outbound={} progress={}",
+            "- last: inbound={} · outbound={} · progress={}",
             instant_age(connection.last_inbound_message_at, now),
             instant_age(connection.last_outbound_message_at, now),
             instant_age(connection.last_progress_at, now)
@@ -282,14 +387,14 @@ fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
         if !connection.requests.is_empty() {
             let _ = writeln!(
                 out,
-                "- requests: {} outstanding={}",
+                "\n### Requests\n\n- outstanding: {}\n- tracked: {}",
+                connection.outstanding_requests,
                 connection.requests.len(),
-                connection.outstanding_requests
             );
             for request in &connection.requests {
                 let _ = writeln!(
                     out,
-                    "  - {:?} {:?} age={} method={}::{} method_id={:?} response_sender_blocked={} associated_channels={:?}",
+                    "\n#### {:?}\n\n- state: {:?}\n- age: {}\n- method: {}::{}\n- method_id: {:?}\n- response_sender_blocked: {}\n- associated_channels: {}",
                     request.request_id,
                     request.state,
                     format_duration(request.age),
@@ -297,23 +402,29 @@ fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
                     request.method.unwrap_or("?"),
                     request.method_id,
                     display_opt_bool(request.response_sender_blocked),
-                    request.associated_channels
+                    format_channel_ids(&request.associated_channels)
                 );
             }
         }
 
         if !connection.open_channels.is_empty() {
-            let _ = writeln!(out, "- channels: {}", connection.open_channels.len());
+            let _ = writeln!(
+                out,
+                "\n### Channels\n\n- open: {}",
+                connection.open_channels.len()
+            );
             for channel in &connection.open_channels {
-                let debug = channel_debug_label(channel.debug);
                 let _ = writeln!(
                     out,
-                    "  - {:?}/{:?} {:?} {}",
-                    channel.connection_id, channel.channel_id, channel.direction, debug
+                    "\n#### {:?}/{:?} · {:?}\n\n{}",
+                    channel.connection_id,
+                    channel.channel_id,
+                    channel.direction,
+                    format_channel_debug_block(channel.debug)
                 );
                 let _ = writeln!(
                     out,
-                    "    credit: initial={} available={} permits={} pending_local_grant={} total_granted={} total_received={} last_granted={} last_received={}",
+                    "- credit:\n  - initial: {}\n  - available_send_credit: {}\n  - current_permit_count: {}\n  - pending_local_grant_credit: {}\n  - total_credit_granted: {}\n  - total_credit_received: {}\n  - last_credit_granted: {}\n  - last_credit_received: {}",
                     channel.initial_credit,
                     display_opt_u32(channel.available_send_credit),
                     display_opt_u32(channel.current_permit_count),
@@ -333,7 +444,7 @@ fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
                 );
                 let _ = writeln!(
                     out,
-                    "    rx: state={:?} queue={}/{} received={} consumed={} last_received={} last_consumed={}",
+                    "- receive:\n  - state: {:?}\n  - queue: {}/{}\n  - items_received: {}\n  - items_consumed: {}\n  - last_item_received: {}\n  - last_item_consumed: {}",
                     channel.receiver_state,
                     display_opt_usize(channel.inbound_queue_len),
                     display_opt_usize(channel.inbound_queue_capacity),
@@ -344,7 +455,7 @@ fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
                 );
                 let _ = writeln!(
                     out,
-                    "    tx: sent={} started={} completed={} waited_for_credit={} waiters={} zero_credit_blocked={} runtime_queue={}/{} last_sent={}",
+                    "- send:\n  - sent: {}\n  - sends_started: {}\n  - sends_completed: {}\n  - sends_waited_for_credit: {}\n  - send_waiters_count: {}\n  - zero_credit_with_blocked_senders: {}\n  - outbound_runtime_queue: {}/{}\n  - last_item_sent: {}",
                     channel.sent,
                     channel.sends_started,
                     channel.sends_completed,
@@ -357,7 +468,7 @@ fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
                 );
                 let _ = writeln!(
                     out,
-                    "    failures: try_full_credit={} try_full_runtime_queue={} closed={} reset={} dropped={} close_reason={} reset_reason={}",
+                    "- failures:\n  - try_send_full_credit: {}\n  - try_send_full_runtime_queue: {}\n  - closed: {}\n  - reset: {}\n  - dropped: {}\n  - close_reason: {}\n  - reset_reason: {}",
                     channel.try_send_full_credit,
                     channel.try_send_full_runtime_queue,
                     channel.closed,
@@ -373,22 +484,151 @@ fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
     out
 }
 
-fn channel_debug_label(debug: Option<vox::ChannelDebugContext>) -> String {
+fn format_channel_debug_block(debug: Option<vox::ChannelDebugContext>) -> String {
     let Some(debug) = debug else {
-        return "debug=?".to_owned();
+        return "- debug: none".to_owned();
     };
-    let loc = debug
-        .source_location
-        .map(|loc| format!("{}:{}:{}", loc.file, loc.line, loc.column))
-        .unwrap_or_else(|| "?".to_owned());
+    format!(
+        "- debug:\n  - type: {}\n  - label: {}\n  - service: {}\n  - method: {}\n  - source: {}",
+        display_opt_str(debug.type_name),
+        display_opt_str(debug.label),
+        display_opt_str(debug.service),
+        display_opt_str(debug.method),
+        format_source_location(debug.source_location)
+    )
+}
+
+fn format_channel_debug_inline(debug: Option<vox::ChannelDebugContext>) -> String {
+    let Some(debug) = debug else {
+        return "debug=none".to_owned();
+    };
     format!(
         "type={} label={} service={} method={} source={}",
-        debug.type_name.unwrap_or("?"),
-        debug.label.unwrap_or("?"),
-        debug.service.unwrap_or("?"),
-        debug.method.unwrap_or("?"),
-        loc
+        display_opt_str(debug.type_name),
+        display_opt_str(debug.label),
+        display_opt_str(debug.service),
+        display_opt_str(debug.method),
+        format_source_location(debug.source_location)
     )
+}
+
+fn display_opt_str(value: Option<&'static str>) -> &'static str {
+    value.unwrap_or("-")
+}
+
+fn format_source_location(location: Option<vox::SourceLocation>) -> String {
+    location
+        .map(|loc| format!("{}:{}:{}", loc.file, loc.line, loc.column))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_channel_ids(ids: &[vox::ChannelId]) -> String {
+    if ids.is_empty() {
+        return "[]".to_owned();
+    }
+    let mut out = String::from("[");
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{id:?}");
+    }
+    out.push(']');
+    out
+}
+
+fn format_telemetry_snapshot(snapshot: &TelemetrySnapshot) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# Telemetry Snapshot\n\n- component: {}\n- generated_at_unix_ns: {}",
+        snapshot.component, snapshot.generated_at_unix_ns
+    );
+
+    if !snapshot.phases.is_empty() {
+        let _ = writeln!(out, "\n## Phases");
+        for phase in &snapshot.phases {
+            let _ = writeln!(
+                out,
+                "\n### `{}`\n\n- state: {}\n- elapsed: {}\n- entered_at_unix_ns: {}\n- detail: {}",
+                phase.name,
+                phase.state,
+                format_duration(Duration::from_nanos(phase.elapsed_ns)),
+                phase.entered_at_unix_ns,
+                empty_as_dash(&phase.detail)
+            );
+        }
+    }
+
+    if !snapshot.gauges.is_empty() {
+        let _ = writeln!(out, "\n## Gauges");
+        for gauge in &snapshot.gauges {
+            let _ = writeln!(out, "- `{}`: {}", gauge.name, gauge.value);
+        }
+    }
+
+    if !snapshot.counters.is_empty() {
+        let _ = writeln!(out, "\n## Counters");
+        for counter in &snapshot.counters {
+            let _ = writeln!(out, "- `{}`: {}", counter.name, counter.value);
+        }
+    }
+
+    if !snapshot.histograms.is_empty() {
+        let _ = writeln!(out, "\n## Histograms");
+        for histogram in &snapshot.histograms {
+            format_histogram(&mut out, histogram);
+        }
+    }
+
+    if !snapshot.recent_events.is_empty() {
+        let _ = writeln!(out, "\n## Recent Events");
+        for event in &snapshot.recent_events {
+            let _ = writeln!(
+                out,
+                "- `{}` `{}` {}",
+                event.at_unix_ns,
+                event.name,
+                empty_as_dash(&event.detail)
+            );
+        }
+    }
+
+    out
+}
+
+fn format_histogram(out: &mut String, histogram: &HistogramSnapshot) {
+    let avg = if histogram.count == 0 {
+        0
+    } else {
+        histogram.sum / histogram.count
+    };
+    let _ = writeln!(
+        out,
+        "\n### `{}`\n\n- count: {}\n- avg: {}\n- max: {}\n- overflow: {}",
+        histogram.name,
+        histogram.count,
+        format_duration(Duration::from_nanos(avg)),
+        format_duration(Duration::from_nanos(histogram.max)),
+        histogram.overflow
+    );
+    if histogram.buckets.iter().any(|bucket| bucket.count != 0) {
+        let _ = writeln!(out, "- buckets:");
+        for bucket in &histogram.buckets {
+            if bucket.count != 0 {
+                let _ = writeln!(
+                    out,
+                    "  - <= {}: {}",
+                    format_duration(Duration::from_nanos(bucket.le)),
+                    bucket.count
+                );
+            }
+        }
+    }
+}
+
+fn empty_as_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
 }
 
 fn instant_age(instant: Option<Instant>, now: Instant) -> String {
@@ -462,6 +702,12 @@ impl Default for VoxDebugRegistry {
     }
 }
 
+impl Default for TelemetryDebugRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for VoxDebugRegistration {
     fn drop(&mut self) {
         let Some(inner) = self.inner.upgrade() else {
@@ -471,6 +717,19 @@ impl Drop for VoxDebugRegistration {
             .entries
             .lock()
             .expect("vox debug registry mutex poisoned")
+            .retain(|entry| entry.id != self.id);
+    }
+}
+
+impl Drop for TelemetryDebugRegistration {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        inner
+            .entries
+            .lock()
+            .expect("telemetry debug registry mutex poisoned")
             .retain(|entry| entry.id != self.id);
     }
 }
@@ -698,8 +957,11 @@ impl VoxObserverTelemetry {
 
 fn channel_detail(surface: &'static str, channel: vox::ChannelEventContext) -> String {
     format!(
-        "surface={} connection_id={:?} channel_id={:?} debug={:?}",
-        surface, channel.connection_id, channel.channel_id, channel.debug
+        "surface={} connection_id={:?} channel_id={:?} {}",
+        surface,
+        channel.connection_id,
+        channel.channel_id,
+        format_channel_debug_inline(channel.debug)
     )
 }
 

@@ -31,7 +31,7 @@ use tracing::{info, warn};
 /// User-facing options. Mirrors the shape of
 /// `stax_mac_kperf::RecordOptions` so plumbing through the existing
 /// CLI is mechanical.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RemoteOptions {
     /// `local://` URL or path of the daemon socket. Either
     /// `local:///var/run/staxd.sock` or just `/var/run/staxd.sock`
@@ -47,6 +47,22 @@ pub struct RemoteOptions {
     pub duration: Option<Duration>,
     /// kdebug ringbuffer size in records. Mirrors the in-process default.
     pub buf_records: u32,
+    /// Optional process-wide telemetry registry to receive Vox transport
+    /// counters for the staxd records stream.
+    pub telemetry: Option<stax_telemetry::TelemetryRegistry>,
+}
+
+impl std::fmt::Debug for RemoteOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteOptions")
+            .field("daemon_socket", &self.daemon_socket)
+            .field("pid", &self.pid)
+            .field("frequency_hz", &self.frequency_hz)
+            .field("duration", &self.duration)
+            .field("buf_records", &self.buf_records)
+            .field("telemetry", &self.telemetry.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -71,6 +87,7 @@ impl Default for RemoteOptions {
             frequency_hz: 1000,
             duration: None,
             buf_records: 1_000_000,
+            telemetry: None,
         }
     }
 }
@@ -140,12 +157,15 @@ where
     );
     let phase_start = Instant::now();
     info!("staxd-client: connecting to {url} channel_capacity={STAXD_RECORD_CHANNEL_CAPACITY}");
+    let mut observer = stax_vox_observe::VoxObserverLogger::new("staxd-client", "staxd-records")
+        .with_pid(opts.pid);
+    if let Some(telemetry) = opts.telemetry.clone() {
+        observer = observer.with_telemetry(telemetry);
+    }
+
     let client: StaxdClient = match vox::connect(&url)
         .channel_capacity(STAXD_RECORD_CHANNEL_CAPACITY)
-        .observer(
-            stax_vox_observe::VoxObserverLogger::new("staxd-client", "staxd-records")
-                .with_pid(opts.pid),
-        )
+        .observer(observer)
         .await
     {
         Ok(c) => c,

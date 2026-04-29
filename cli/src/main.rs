@@ -756,14 +756,9 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
 
     let t = &update.timing;
     if t.samples > 0 {
-        println!("\nprobe timing breakdown (avg / max):");
+        println!("\nprobe timing breakdown (avg / max, causal path):");
         println!(
-            "  kperf→enqueue      {:>9} / {:>9}",
-            fmt_ns(t.avg_kperf_to_enqueue_ns),
-            fmt_ns(t.max_kperf_to_enqueue_ns)
-        );
-        println!(
-            "  kperf→staxd read   {:>9} / {:>9}",
+            "  kernel buffer wait {:>9} / {:>9}  (kperf_ts → staxd read)",
             fmt_ns(t.avg_kperf_to_staxd_read_ns),
             fmt_ns(t.max_kperf_to_staxd_read_ns)
         );
@@ -787,6 +782,12 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
             fmt_ns(t.avg_client_recv_to_enqueue_ns),
             fmt_ns(t.max_client_recv_to_enqueue_ns)
         );
+        println!(
+            "  end-to-end enqueue {:>9} / {:>9}  (kperf_ts → enqueue)",
+            fmt_ns(t.avg_kperf_to_enqueue_ns),
+            fmt_ns(t.max_kperf_to_enqueue_ns)
+        );
+        println!("  worker path:");
         println!(
             "  queue wait         {:>9} / {:>9}",
             fmt_ns(t.avg_queue_wait_ns),
@@ -874,19 +875,34 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
             entry.used_framehop,
         );
         println!(
-            "    timing: kperf→enqueue={} kperf→staxd={} staxd-read={} drain→send={} staxd→client={} client→enqueue={} queue={} lookup={} suspend+state={} resume={} walk={} total={} coalesced={} batch={}",
-            fmt_ns(entry.timing.kperf_to_enqueue_ns),
+            "    ticks: kperf={} staxd_read={} staxd_drained={} staxd_send={} client_recv={} enqueue={} worker={} lookup_done={} state_done={} resume_done={} walk_done={}",
+            entry.timing.kperf_ts_ticks,
+            entry.timing.staxd_read_started_ticks,
+            entry.timing.staxd_drained_ticks,
+            entry.timing.staxd_send_started_ticks,
+            entry.timing.client_received_ticks,
+            entry.timing.enqueued_ticks,
+            entry.timing.worker_started_ticks,
+            entry.timing.thread_lookup_done_ticks,
+            entry.timing.state_done_ticks,
+            entry.timing.resume_done_ticks,
+            entry.timing.walk_done_ticks,
+        );
+        println!(
+            "    path: kernel_wait={} staxd_read={} drain→send={} staxd→client={} client→enqueue={} end_to_end_enqueue={} queue={} lookup={} suspend+state={} resume={} walk={} worker_total={} kperf→state={} coalesced={} batch={}",
             fmt_ns(entry.timing.kperf_to_staxd_read_ns),
             fmt_ns(entry.timing.staxd_read_ns),
             fmt_ns(entry.timing.staxd_drain_to_send_ns),
             fmt_ns(entry.timing.staxd_send_to_client_recv_ns),
             fmt_ns(entry.timing.client_recv_to_enqueue_ns),
+            fmt_ns(entry.timing.kperf_to_enqueue_ns),
             fmt_ns(entry.timing.queue_wait_ns),
             fmt_ns(entry.timing.lookup_ns),
             fmt_ns(entry.timing.suspend_state_ns),
             fmt_ns(entry.timing.resume_ns),
             fmt_ns(entry.timing.walk_ns),
             fmt_ns(entry.timing.probe_total_ns),
+            fmt_ns(entry.drift_ns.unsigned_abs()),
             entry.queue.coalesced_requests,
             entry.queue.worker_batch_len,
         );

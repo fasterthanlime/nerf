@@ -47,6 +47,9 @@ const STAXD_RECORD_CHANNEL_CAPACITY: u32 = 64;
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     init_logging();
+    let telemetry = stax_telemetry::TelemetryRegistry::new("staxd");
+    let _telemetry_registration =
+        stax_vox_observe::register_global_telemetry("staxd", "daemon", telemetry.clone());
     let _vox_sigusr1_dump = stax_vox_observe::install_global_sigusr1_dump("staxd");
 
     let socket_path = parse_socket_arg();
@@ -91,11 +94,15 @@ async fn main() -> Result<()> {
                 }
             };
             let server = server.clone();
+            let telemetry = telemetry.clone();
             tokio::spawn(async move {
                 let dispatcher = StaxdDispatcher::new(server);
                 let result = vox::acceptor_on(link)
                     .channel_capacity(STAXD_RECORD_CHANNEL_CAPACITY)
-                    .observer(stax_vox_observe::VoxObserverLogger::new("staxd", "local"))
+                    .observer(
+                        stax_vox_observe::VoxObserverLogger::new("staxd", "staxd-records")
+                            .with_telemetry(telemetry.clone()),
+                    )
                     .non_resumable()
                     // Detect dead peers without flagging legit ones.
                     // The recorder fires a giant pile of synchronous

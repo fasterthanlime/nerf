@@ -719,6 +719,17 @@ fn elapsed_ticks_to_ns(later: u64, earlier: u64) -> u64 {
 
 fn probe_timing_breakdown(probe: &ProbeResultRecord) -> ProbeTimingBreakdown {
     ProbeTimingBreakdown {
+        kperf_ts_ticks: probe.timing.kperf_ts,
+        staxd_read_started_ticks: probe.timing.staxd_read_started,
+        staxd_drained_ticks: probe.timing.staxd_drained,
+        staxd_send_started_ticks: probe.timing.staxd_send_started,
+        client_received_ticks: probe.timing.client_received,
+        enqueued_ticks: probe.timing.enqueued,
+        worker_started_ticks: probe.timing.worker_started,
+        thread_lookup_done_ticks: probe.timing.thread_lookup_done,
+        state_done_ticks: probe.timing.state_done,
+        resume_done_ticks: probe.timing.resume_done,
+        walk_done_ticks: probe.timing.walk_done,
         kperf_to_enqueue_ns: elapsed_ticks_to_ns(probe.timing.enqueued, probe.timing.kperf_ts),
         kperf_to_staxd_read_ns: elapsed_ticks_to_ns(
             probe.timing.staxd_read_started,

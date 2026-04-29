@@ -10,6 +10,7 @@ import VoxRuntime
 public enum RunControlMethodId {
     public static let status: UInt64 = 0x874da25beec8b931
     public static let listRuns: UInt64 = 0x660607fe04b64c9f
+    public static let diagnostics: UInt64 = 0x7552fdb2e206709a
     public static let startAttach: UInt64 = 0xd1fa0143fbbb5525
     public static let startLaunch: UInt64 = 0x153c5c16f3b393d4
     public static let waitActive: UInt64 = 0x0ab236833a4327de
@@ -31,6 +32,9 @@ public protocol RunControlCaller {
     ///  in-memory archive). Bounded by the server's eviction policy
     ///  (in-memory only for now; on-disk persistence is a follow-up).
     func listRuns() async throws -> [RunSummary]
+    ///  Point-in-time server diagnostics: current run plus stax-owned
+    ///  telemetry counters, phases, histograms, and recent events.
+    func diagnostics() async throws -> DiagnosticsSnapshot
     ///  Start a recording by attaching stax-shade to an existing pid.
     func startAttach(pid: UInt32, config: RunConfig, daemonSocket: String, timeLimitSecs: UInt64?) async throws -> Result<RunId, RunControlError>
     ///  Start a recording by launching a new process under stax-shade.
@@ -75,6 +79,26 @@ public final class RunControlClient: RunControlCaller, Sendable {
         let response = try await connection.call(methodId: 0x660607fe04b64c9f, metadata: [], payload: payload, retry: .volatile, timeout: timeout, prepareRetry: nil, finalizeChannels: nil, schemaInfo: schemaInfo)
         return try decodeInfallibleResponse(response) { buf in
             let result = try decodeVec(from: &buf, decoder: { buf in try decodeRunSummary(from: &buf) })
+            return result
+        }
+    }
+
+    public func diagnostics() async throws -> DiagnosticsSnapshot {
+        let payload: [UInt8] = []
+        let schemaInfo = ClientSchemaInfo(methodInfo: runControl_method_schemas[0x7552fdb2e206709a]!, schemaRegistry: runControl_schema_registry)
+        let response = try await connection.call(methodId: 0x7552fdb2e206709a, metadata: [], payload: payload, retry: .volatile, timeout: timeout, prepareRetry: nil, finalizeChannels: nil, schemaInfo: schemaInfo)
+        return try decodeInfallibleResponse(response) { buf in
+            let _result_serverStartedAtUnixNs = try decodeVarint(from: &buf)
+            let _result_active = try decodeVec(from: &buf, decoder: { buf in try decodeRunSummary(from: &buf) })
+            let __result_telemetry_component = try decodeString(from: &buf)
+            let __result_telemetry_generatedAtUnixNs = try decodeVarint(from: &buf)
+            let __result_telemetry_counters = try decodeVec(from: &buf, decoder: { buf in try decodeCounterSnapshot(from: &buf) })
+            let __result_telemetry_gauges = try decodeVec(from: &buf, decoder: { buf in try decodeGaugeSnapshot(from: &buf) })
+            let __result_telemetry_histograms = try decodeVec(from: &buf, decoder: { buf in try decodeHistogramSnapshot(from: &buf) })
+            let __result_telemetry_phases = try decodeVec(from: &buf, decoder: { buf in try decodePhaseSnapshot(from: &buf) })
+            let __result_telemetry_recentEvents = try decodeVec(from: &buf, decoder: { buf in try decodeRecentEventSnapshot(from: &buf) })
+            let _result_telemetry = TelemetrySnapshot(component: __result_telemetry_component, generatedAtUnixNs: __result_telemetry_generatedAtUnixNs, counters: __result_telemetry_counters, gauges: __result_telemetry_gauges, histograms: __result_telemetry_histograms, phases: __result_telemetry_phases, recentEvents: __result_telemetry_recentEvents)
+            let result = DiagnosticsSnapshot(serverStartedAtUnixNs: _result_serverStartedAtUnixNs, active: _result_active, telemetry: _result_telemetry)
             return result
         }
     }
@@ -309,19 +333,25 @@ extension RunControlClient: ExpectedRootClient {
 /// Global schema registry containing all schemas for this service.
 nonisolated(unsafe) public let runControl_schema_registry: [UInt64: Schema] = [
     0x0a96b404b4d79d67: Schema(id: 0x0a96b404b4d79d67, typeParams: ["T"], kind: .list(element: .var(name: "T"))),
+    0x0bf06be9dfc2b38a: Schema(id: 0x0bf06be9dfc2b38a, typeParams: [], kind: .struct(name: "GaugeSnapshot", fields: [FieldSchema(name: "name", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "value", typeRef: .concrete(0xc6eb8c46f1e17fba), required: true)])),
+    0x0e957287fe0fa537: Schema(id: 0x0e957287fe0fa537, typeParams: [], kind: .struct(name: "DiagnosticsSnapshot", fields: [FieldSchema(name: "server_started_at_unix_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "active", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa938a91823178fd5)]), required: true), FieldSchema(name: "telemetry", typeRef: .concrete(0x8f20ae08d9ed6222), required: true)])),
     0x178367a87f66fb46: Schema(id: 0x178367a87f66fb46, typeParams: [], kind: .primitive(.bool)),
     0x1be6c8d0625ea876: Schema(id: 0x1be6c8d0625ea876, typeParams: [], kind: .primitive(.u16)),
     0x22ef152b3afb1613: Schema(id: 0x22ef152b3afb1613, typeParams: [], kind: .enum(name: "WaitOutcome", variants: [VariantSchema(name: "ConditionMet", index: 0, payload: .struct(fields: [FieldSchema(name: "summary", typeRef: .concrete(0xa938a91823178fd5), required: true)])), VariantSchema(name: "Stopped", index: 1, payload: .struct(fields: [FieldSchema(name: "summary", typeRef: .concrete(0xa938a91823178fd5), required: true)])), VariantSchema(name: "TimedOut", index: 2, payload: .struct(fields: [FieldSchema(name: "summary", typeRef: .concrete(0xa938a91823178fd5), required: true)])), VariantSchema(name: "NoActiveRun", index: 3, payload: .unit)])),
+    0x25a99f6586249222: Schema(id: 0x25a99f6586249222, typeParams: [], kind: .struct(name: "PhaseSnapshot", fields: [FieldSchema(name: "name", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "state", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "detail", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "entered_at_unix_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "elapsed_ns", typeRef: .concrete(0xd9356298b81639ac), required: true)])),
     0x281c5be4f2ee63b4: Schema(id: 0x281c5be4f2ee63b4, typeParams: [], kind: .primitive(.u32)),
     0x2c8d54f2314d0f20: Schema(id: 0x2c8d54f2314d0f20, typeParams: [], kind: .primitive(.u8)),
     0x305469155a65a7bd: Schema(id: 0x305469155a65a7bd, typeParams: [], kind: .struct(name: "LaunchRequest", fields: [FieldSchema(name: "command", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x6d7dce914ee150e8)]), required: true), FieldSchema(name: "cwd", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "env", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x9977ddee802cdd4c)]), required: true), FieldSchema(name: "config", typeRef: .concrete(0x9c002a4450cb58dc), required: true), FieldSchema(name: "daemon_socket", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "time_limit_secs", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0xd9356298b81639ac)]), required: true), FieldSchema(name: "terminal_size", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0xb941cd1d6da669df)]), required: true)])),
+    0x35d210172af27f64: Schema(id: 0x35d210172af27f64, typeParams: [], kind: .struct(name: "HistogramBucketSnapshot", fields: [FieldSchema(name: "le", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "count", typeRef: .concrete(0xd9356298b81639ac), required: true)])),
     0x361f4536eee9f991: Schema(id: 0x361f4536eee9f991, typeParams: [], kind: .primitive(.i32)),
     0x42046de663beeef0: Schema(id: 0x42046de663beeef0, typeParams: ["T", "E"], kind: .enum(name: "Result", variants: [VariantSchema(name: "Ok", index: 0, payload: .newtype(typeRef: .var(name: "T"))), VariantSchema(name: "Err", index: 1, payload: .newtype(typeRef: .var(name: "E")))])),
     0x4cf4b2aeb98a1939: Schema(id: 0x4cf4b2aeb98a1939, typeParams: ["E"], kind: .enum(name: "VoxError", variants: [VariantSchema(name: "User", index: 0, payload: .newtype(typeRef: .var(name: "E"))), VariantSchema(name: "UnknownMethod", index: 1, payload: .unit), VariantSchema(name: "InvalidPayload", index: 2, payload: .newtype(typeRef: .concrete(0x6d7dce914ee150e8))), VariantSchema(name: "Cancelled", index: 3, payload: .unit), VariantSchema(name: "ConnectionClosed", index: 4, payload: .unit), VariantSchema(name: "SessionShutdown", index: 5, payload: .unit), VariantSchema(name: "SendFailed", index: 6, payload: .unit), VariantSchema(name: "Indeterminate", index: 7, payload: .unit)])),
+    0x5330c1aff3e803ef: Schema(id: 0x5330c1aff3e803ef, typeParams: [], kind: .struct(name: "HistogramSnapshot", fields: [FieldSchema(name: "name", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "count", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "sum", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "max", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "buckets", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x35d210172af27f64)]), required: true), FieldSchema(name: "overflow", typeRef: .concrete(0xd9356298b81639ac), required: true)])),
     0x5db70a394660f3e6: Schema(id: 0x5db70a394660f3e6, typeParams: [], kind: .primitive(.never)),
     0x6d7dce914ee150e8: Schema(id: 0x6d7dce914ee150e8, typeParams: [], kind: .primitive(.string)),
     0x7959968283e55af0: Schema(id: 0x7959968283e55af0, typeParams: [], kind: .struct(name: "ServerStatus", fields: [FieldSchema(name: "server_started_at_unix_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "active", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa938a91823178fd5)]), required: true)])),
     0x797416a1cb38d4ab: Schema(id: 0x797416a1cb38d4ab, typeParams: [], kind: .enum(name: "TerminalInput", variants: [VariantSchema(name: "Bytes", index: 0, payload: .struct(fields: [FieldSchema(name: "data", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x2c8d54f2314d0f20)]), required: true)])), VariantSchema(name: "Resize", index: 1, payload: .struct(fields: [FieldSchema(name: "size", typeRef: .concrete(0xb941cd1d6da669df), required: true)])), VariantSchema(name: "Close", index: 2, payload: .unit)])),
+    0x8f20ae08d9ed6222: Schema(id: 0x8f20ae08d9ed6222, typeParams: [], kind: .struct(name: "TelemetrySnapshot", fields: [FieldSchema(name: "component", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "generated_at_unix_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "counters", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xf3feeff1f2d83e69)]), required: true), FieldSchema(name: "gauges", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x0bf06be9dfc2b38a)]), required: true), FieldSchema(name: "histograms", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x5330c1aff3e803ef)]), required: true), FieldSchema(name: "phases", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x25a99f6586249222)]), required: true), FieldSchema(name: "recent_events", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xb5210d4e956c1ab9)]), required: true)])),
     0x8fbc99220193571b: Schema(id: 0x8fbc99220193571b, typeParams: [], kind: .enum(name: "WaitCondition", variants: [VariantSchema(name: "UntilStopped", index: 0, payload: .unit), VariantSchema(name: "ForSamples", index: 1, payload: .struct(fields: [FieldSchema(name: "count", typeRef: .concrete(0xd9356298b81639ac), required: true)])), VariantSchema(name: "ForSeconds", index: 2, payload: .struct(fields: [FieldSchema(name: "seconds", typeRef: .concrete(0xd9356298b81639ac), required: true)])), VariantSchema(name: "UntilSymbolSeen", index: 3, payload: .struct(fields: [FieldSchema(name: "needle", typeRef: .concrete(0x6d7dce914ee150e8), required: true)]))])),
     0x915c6fb5b64f270b: Schema(id: 0x915c6fb5b64f270b, typeParams: ["T0", "T1", "T2", "T3"], kind: .tuple(elements: [.var(name: "T0"), .var(name: "T1"), .var(name: "T2"), .var(name: "T3")])),
     0x967a48ac345e2f5e: Schema(id: 0x967a48ac345e2f5e, typeParams: ["T"], kind: .channel(direction: .rx, element: .var(name: "T"))),
@@ -330,15 +360,18 @@ nonisolated(unsafe) public let runControl_schema_registry: [UInt64: Schema] = [
     0x9fb0b239b7b475dd: Schema(id: 0x9fb0b239b7b475dd, typeParams: [], kind: .enum(name: "TerminalOutput", variants: [VariantSchema(name: "Bytes", index: 0, payload: .struct(fields: [FieldSchema(name: "data", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x2c8d54f2314d0f20)]), required: true)])), VariantSchema(name: "ExitStatus", index: 1, payload: .struct(fields: [FieldSchema(name: "code", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x361f4536eee9f991)]), required: true), FieldSchema(name: "signal", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x361f4536eee9f991)]), required: true)])), VariantSchema(name: "Error", index: 2, payload: .struct(fields: [FieldSchema(name: "message", typeRef: .concrete(0x6d7dce914ee150e8), required: true)]))])),
     0xa938a91823178fd5: Schema(id: 0xa938a91823178fd5, typeParams: [], kind: .struct(name: "RunSummary", fields: [FieldSchema(name: "id", typeRef: .concrete(0xde69b13dbe16811b), required: true), FieldSchema(name: "state", typeRef: .concrete(0xee0f06d5e8720d1f), required: true), FieldSchema(name: "stop_reason", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0xd93d51583a6b18d0)]), required: true), FieldSchema(name: "started_at_unix_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "stopped_at_unix_ns", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0xd9356298b81639ac)]), required: true), FieldSchema(name: "target_pid", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x281c5be4f2ee63b4)]), required: true), FieldSchema(name: "label", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "pet_samples", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "off_cpu_intervals", typeRef: .concrete(0xd9356298b81639ac), required: true)])),
     0xaa510ab07d34f141: Schema(id: 0xaa510ab07d34f141, typeParams: ["T0", "T1", "T2"], kind: .tuple(elements: [.var(name: "T0"), .var(name: "T1"), .var(name: "T2")])),
+    0xb5210d4e956c1ab9: Schema(id: 0xb5210d4e956c1ab9, typeParams: [], kind: .struct(name: "RecentEventSnapshot", fields: [FieldSchema(name: "at_unix_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "name", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "detail", typeRef: .concrete(0x6d7dce914ee150e8), required: true)])),
     0xb941cd1d6da669df: Schema(id: 0xb941cd1d6da669df, typeParams: [], kind: .struct(name: "TerminalSize", fields: [FieldSchema(name: "rows", typeRef: .concrete(0x1be6c8d0625ea876), required: true), FieldSchema(name: "cols", typeRef: .concrete(0x1be6c8d0625ea876), required: true)])),
     0xba0496aa8cee7a4c: Schema(id: 0xba0496aa8cee7a4c, typeParams: ["T0", "T1"], kind: .tuple(elements: [.var(name: "T0"), .var(name: "T1")])),
     0xbc5c33249a2dc720: Schema(id: 0xbc5c33249a2dc720, typeParams: [], kind: .primitive(.unit)),
+    0xc6eb8c46f1e17fba: Schema(id: 0xc6eb8c46f1e17fba, typeParams: [], kind: .primitive(.i64)),
     0xc886545a493d06eb: Schema(id: 0xc886545a493d06eb, typeParams: ["T"], kind: .channel(direction: .tx, element: .var(name: "T"))),
     0xd9356298b81639ac: Schema(id: 0xd9356298b81639ac, typeParams: [], kind: .primitive(.u64)),
     0xd93d51583a6b18d0: Schema(id: 0xd93d51583a6b18d0, typeParams: [], kind: .enum(name: "StopReason", variants: [VariantSchema(name: "TargetExited", index: 0, payload: .unit), VariantSchema(name: "TimeLimit", index: 1, payload: .unit), VariantSchema(name: "UserStop", index: 2, payload: .unit), VariantSchema(name: "RecorderError", index: 3, payload: .struct(fields: [FieldSchema(name: "message", typeRef: .concrete(0x6d7dce914ee150e8), required: true)]))])),
     0xdcafd4de6b7969bb: Schema(id: 0xdcafd4de6b7969bb, typeParams: ["T"], kind: .option(element: .var(name: "T"))),
     0xde69b13dbe16811b: Schema(id: 0xde69b13dbe16811b, typeParams: [], kind: .tuple(elements: [.concrete(0xd9356298b81639ac)])),
     0xee0f06d5e8720d1f: Schema(id: 0xee0f06d5e8720d1f, typeParams: [], kind: .enum(name: "RunState", variants: [VariantSchema(name: "Recording", index: 0, payload: .unit), VariantSchema(name: "Stopped", index: 1, payload: .unit)])),
+    0xf3feeff1f2d83e69: Schema(id: 0xf3feeff1f2d83e69, typeParams: [], kind: .struct(name: "CounterSnapshot", fields: [FieldSchema(name: "name", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "value", typeRef: .concrete(0xd9356298b81639ac), required: true)])),
     0xffd5a98ac5bd6a87: Schema(id: 0xffd5a98ac5bd6a87, typeParams: [], kind: .enum(name: "RunControlError", variants: [VariantSchema(name: "NoActiveRun", index: 0, payload: .unit), VariantSchema(name: "AlreadyActive", index: 1, payload: .unit), VariantSchema(name: "SpawnFailed", index: 2, payload: .struct(fields: [FieldSchema(name: "detail", typeRef: .concrete(0x6d7dce914ee150e8), required: true)])), VariantSchema(name: "Internal", index: 3, payload: .struct(fields: [FieldSchema(name: "message", typeRef: .concrete(0x6d7dce914ee150e8), required: true)]))])),
 ]
 
@@ -355,6 +388,12 @@ nonisolated(unsafe) public let runControl_method_schemas: [UInt64: MethodSchemaI
         argsRoot: .concrete(0xbc5c33249a2dc720),
         responseSchemaIds: [0x178367a87f66fb46, 0x281c5be4f2ee63b4, 0x42046de663beeef0, 0x5db70a394660f3e6, 0x6d7dce914ee150e8, 0x4cf4b2aeb98a1939, 0xd9356298b81639ac, 0xde69b13dbe16811b, 0xee0f06d5e8720d1f, 0xd93d51583a6b18d0, 0xdcafd4de6b7969bb, 0xa938a91823178fd5, 0x0a96b404b4d79d67],
         responseRoot: .generic(0x42046de663beeef0, args: [.generic(0x0a96b404b4d79d67, args: [.concrete(0xa938a91823178fd5)]), .generic(0x4cf4b2aeb98a1939, args: [.concrete(0x5db70a394660f3e6)])])
+    ),
+    0x7552fdb2e206709a: MethodSchemaInfo(
+        argsSchemaIds: [0xbc5c33249a2dc720],
+        argsRoot: .concrete(0xbc5c33249a2dc720),
+        responseSchemaIds: [0x178367a87f66fb46, 0x281c5be4f2ee63b4, 0x42046de663beeef0, 0x5db70a394660f3e6, 0x6d7dce914ee150e8, 0x4cf4b2aeb98a1939, 0xd9356298b81639ac, 0xde69b13dbe16811b, 0xee0f06d5e8720d1f, 0xd93d51583a6b18d0, 0xdcafd4de6b7969bb, 0xa938a91823178fd5, 0x0a96b404b4d79d67, 0xf3feeff1f2d83e69, 0xc6eb8c46f1e17fba, 0x0bf06be9dfc2b38a, 0x35d210172af27f64, 0x5330c1aff3e803ef, 0x25a99f6586249222, 0xb5210d4e956c1ab9, 0x8f20ae08d9ed6222, 0x0e957287fe0fa537],
+        responseRoot: .generic(0x42046de663beeef0, args: [.concrete(0x0e957287fe0fa537), .generic(0x4cf4b2aeb98a1939, args: [.concrete(0x5db70a394660f3e6)])])
     ),
     0xd1fa0143fbbb5525: MethodSchemaInfo(
         argsSchemaIds: [0x281c5be4f2ee63b4, 0x6d7dce914ee150e8, 0x178367a87f66fb46, 0x9c002a4450cb58dc, 0xd9356298b81639ac, 0xdcafd4de6b7969bb, 0x915c6fb5b64f270b],

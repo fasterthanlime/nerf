@@ -265,13 +265,26 @@ pub async fn connect_and_register(
     IngestSink,
     tokio::task::JoinHandle<()>,
 )> {
+    connect_and_register_with_telemetry(server_socket, config, None).await
+}
+
+pub async fn connect_and_register_with_telemetry(
+    server_socket: &str,
+    config: stax_live_proto::RunConfig,
+    telemetry: Option<stax_telemetry::TelemetryRegistry>,
+) -> eyre::Result<(
+    stax_live_proto::RunId,
+    IngestSink,
+    tokio::task::JoinHandle<()>,
+)> {
     let url = format!("local://{server_socket}");
+    let mut observer = stax_vox_observe::VoxObserverLogger::new("ingest-sink", "start_run");
+    if let Some(telemetry) = telemetry {
+        observer = observer.with_telemetry(telemetry);
+    }
     let client: RunIngestClient = vox::connect(&url)
         .channel_capacity(INGEST_CHANNEL_CAPACITY)
-        .observer(stax_vox_observe::VoxObserverLogger::new(
-            "ingest-sink",
-            "start_run",
-        ))
+        .observer(observer)
         .await?;
     let client = client.with_middleware(vox::ClientLogging::default());
 
@@ -313,13 +326,22 @@ pub async fn connect_to_existing_run(
     server_socket: &str,
     run_id: stax_live_proto::RunId,
 ) -> eyre::Result<(IngestSink, tokio::task::JoinHandle<()>)> {
+    connect_to_existing_run_with_telemetry(server_socket, run_id, None).await
+}
+
+pub async fn connect_to_existing_run_with_telemetry(
+    server_socket: &str,
+    run_id: stax_live_proto::RunId,
+    telemetry: Option<stax_telemetry::TelemetryRegistry>,
+) -> eyre::Result<(IngestSink, tokio::task::JoinHandle<()>)> {
     let url = format!("local://{server_socket}");
+    let mut observer = stax_vox_observe::VoxObserverLogger::new("ingest-sink", "attach_run");
+    if let Some(telemetry) = telemetry {
+        observer = observer.with_telemetry(telemetry);
+    }
     let client: RunIngestClient = vox::connect(&url)
         .channel_capacity(INGEST_CHANNEL_CAPACITY)
-        .observer(stax_vox_observe::VoxObserverLogger::new(
-            "ingest-sink",
-            "attach_run",
-        ))
+        .observer(observer)
         .await?;
     let client = client.with_middleware(vox::ClientLogging::default());
 

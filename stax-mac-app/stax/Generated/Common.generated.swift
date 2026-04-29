@@ -522,6 +522,17 @@ public struct ProbeDiffThread: Codable, Sendable {
 }
 
 public struct ProbeTimingBreakdown: Codable, Sendable {
+    public var kperfTsTicks: UInt64
+    public var staxdReadStartedTicks: UInt64
+    public var staxdDrainedTicks: UInt64
+    public var staxdSendStartedTicks: UInt64
+    public var clientReceivedTicks: UInt64
+    public var enqueuedTicks: UInt64
+    public var workerStartedTicks: UInt64
+    public var threadLookupDoneTicks: UInt64
+    public var stateDoneTicks: UInt64
+    public var resumeDoneTicks: UInt64
+    public var walkDoneTicks: UInt64
     public var kperfToEnqueueNs: UInt64
     public var kperfToStaxdReadNs: UInt64
     public var staxdReadNs: UInt64
@@ -535,7 +546,18 @@ public struct ProbeTimingBreakdown: Codable, Sendable {
     public var walkNs: UInt64
     public var probeTotalNs: UInt64
 
-    nonisolated public init(kperfToEnqueueNs: UInt64, kperfToStaxdReadNs: UInt64, staxdReadNs: UInt64, staxdDrainToSendNs: UInt64, staxdSendToClientRecvNs: UInt64, clientRecvToEnqueueNs: UInt64, queueWaitNs: UInt64, lookupNs: UInt64, suspendStateNs: UInt64, resumeNs: UInt64, walkNs: UInt64, probeTotalNs: UInt64) {
+    nonisolated public init(kperfTsTicks: UInt64, staxdReadStartedTicks: UInt64, staxdDrainedTicks: UInt64, staxdSendStartedTicks: UInt64, clientReceivedTicks: UInt64, enqueuedTicks: UInt64, workerStartedTicks: UInt64, threadLookupDoneTicks: UInt64, stateDoneTicks: UInt64, resumeDoneTicks: UInt64, walkDoneTicks: UInt64, kperfToEnqueueNs: UInt64, kperfToStaxdReadNs: UInt64, staxdReadNs: UInt64, staxdDrainToSendNs: UInt64, staxdSendToClientRecvNs: UInt64, clientRecvToEnqueueNs: UInt64, queueWaitNs: UInt64, lookupNs: UInt64, suspendStateNs: UInt64, resumeNs: UInt64, walkNs: UInt64, probeTotalNs: UInt64) {
+        self.kperfTsTicks = kperfTsTicks
+        self.staxdReadStartedTicks = staxdReadStartedTicks
+        self.staxdDrainedTicks = staxdDrainedTicks
+        self.staxdSendStartedTicks = staxdSendStartedTicks
+        self.clientReceivedTicks = clientReceivedTicks
+        self.enqueuedTicks = enqueuedTicks
+        self.workerStartedTicks = workerStartedTicks
+        self.threadLookupDoneTicks = threadLookupDoneTicks
+        self.stateDoneTicks = stateDoneTicks
+        self.resumeDoneTicks = resumeDoneTicks
+        self.walkDoneTicks = walkDoneTicks
         self.kperfToEnqueueNs = kperfToEnqueueNs
         self.kperfToStaxdReadNs = kperfToStaxdReadNs
         self.staxdReadNs = staxdReadNs
@@ -698,6 +720,114 @@ public struct ServerStatus: Codable, Sendable {
     nonisolated public init(serverStartedAtUnixNs: UInt64, active: [RunSummary]) {
         self.serverStartedAtUnixNs = serverStartedAtUnixNs
         self.active = active
+    }
+}
+
+public struct CounterSnapshot: Codable, Sendable {
+    public var name: String
+    public var value: UInt64
+
+    nonisolated public init(name: String, value: UInt64) {
+        self.name = name
+        self.value = value
+    }
+}
+
+public struct GaugeSnapshot: Codable, Sendable {
+    public var name: String
+    public var value: Int64
+
+    nonisolated public init(name: String, value: Int64) {
+        self.name = name
+        self.value = value
+    }
+}
+
+public struct HistogramBucketSnapshot: Codable, Sendable {
+    public var le: UInt64
+    public var count: UInt64
+
+    nonisolated public init(le: UInt64, count: UInt64) {
+        self.le = le
+        self.count = count
+    }
+}
+
+public struct HistogramSnapshot: Codable, Sendable {
+    public var name: String
+    public var count: UInt64
+    public var sum: UInt64
+    public var max: UInt64
+    public var buckets: [HistogramBucketSnapshot]
+    public var overflow: UInt64
+
+    nonisolated public init(name: String, count: UInt64, sum: UInt64, max: UInt64, buckets: [HistogramBucketSnapshot], overflow: UInt64) {
+        self.name = name
+        self.count = count
+        self.sum = sum
+        self.max = max
+        self.buckets = buckets
+        self.overflow = overflow
+    }
+}
+
+public struct PhaseSnapshot: Codable, Sendable {
+    public var name: String
+    public var state: String
+    public var detail: String
+    public var enteredAtUnixNs: UInt64
+    public var elapsedNs: UInt64
+
+    nonisolated public init(name: String, state: String, detail: String, enteredAtUnixNs: UInt64, elapsedNs: UInt64) {
+        self.name = name
+        self.state = state
+        self.detail = detail
+        self.enteredAtUnixNs = enteredAtUnixNs
+        self.elapsedNs = elapsedNs
+    }
+}
+
+public struct RecentEventSnapshot: Codable, Sendable {
+    public var atUnixNs: UInt64
+    public var name: String
+    public var detail: String
+
+    nonisolated public init(atUnixNs: UInt64, name: String, detail: String) {
+        self.atUnixNs = atUnixNs
+        self.name = name
+        self.detail = detail
+    }
+}
+
+public struct TelemetrySnapshot: Codable, Sendable {
+    public var component: String
+    public var generatedAtUnixNs: UInt64
+    public var counters: [CounterSnapshot]
+    public var gauges: [GaugeSnapshot]
+    public var histograms: [HistogramSnapshot]
+    public var phases: [PhaseSnapshot]
+    public var recentEvents: [RecentEventSnapshot]
+
+    nonisolated public init(component: String, generatedAtUnixNs: UInt64, counters: [CounterSnapshot], gauges: [GaugeSnapshot], histograms: [HistogramSnapshot], phases: [PhaseSnapshot], recentEvents: [RecentEventSnapshot]) {
+        self.component = component
+        self.generatedAtUnixNs = generatedAtUnixNs
+        self.counters = counters
+        self.gauges = gauges
+        self.histograms = histograms
+        self.phases = phases
+        self.recentEvents = recentEvents
+    }
+}
+
+public struct DiagnosticsSnapshot: Codable, Sendable {
+    public var serverStartedAtUnixNs: UInt64
+    public var active: [RunSummary]
+    public var telemetry: TelemetrySnapshot
+
+    nonisolated public init(serverStartedAtUnixNs: UInt64, active: [RunSummary], telemetry: TelemetrySnapshot) {
+        self.serverStartedAtUnixNs = serverStartedAtUnixNs
+        self.active = active
+        self.telemetry = telemetry
     }
 }
 
@@ -1261,6 +1391,17 @@ nonisolated internal func encodeProbeDiffThread(_ value: ProbeDiffThread, into b
 }
 
 nonisolated internal func encodeProbeTimingBreakdown(_ value: ProbeTimingBreakdown, into buffer: inout ByteBuffer) {
+    encodeVarint(value.kperfTsTicks, into: &buffer)
+    encodeVarint(value.staxdReadStartedTicks, into: &buffer)
+    encodeVarint(value.staxdDrainedTicks, into: &buffer)
+    encodeVarint(value.staxdSendStartedTicks, into: &buffer)
+    encodeVarint(value.clientReceivedTicks, into: &buffer)
+    encodeVarint(value.enqueuedTicks, into: &buffer)
+    encodeVarint(value.workerStartedTicks, into: &buffer)
+    encodeVarint(value.threadLookupDoneTicks, into: &buffer)
+    encodeVarint(value.stateDoneTicks, into: &buffer)
+    encodeVarint(value.resumeDoneTicks, into: &buffer)
+    encodeVarint(value.walkDoneTicks, into: &buffer)
     encodeVarint(value.kperfToEnqueueNs, into: &buffer)
     encodeVarint(value.kperfToStaxdReadNs, into: &buffer)
     encodeVarint(value.staxdReadNs, into: &buffer)
@@ -1365,6 +1506,60 @@ nonisolated internal func encodeRunSummary(_ value: RunSummary, into buffer: ino
 nonisolated internal func encodeServerStatus(_ value: ServerStatus, into buffer: inout ByteBuffer) {
     encodeVarint(value.serverStartedAtUnixNs, into: &buffer)
     encodeVec(value.active, into: &buffer, encoder: { val, buf in encodeRunSummary(val, into: &buf) })
+}
+
+nonisolated internal func encodeCounterSnapshot(_ value: CounterSnapshot, into buffer: inout ByteBuffer) {
+    encodeString(value.name, into: &buffer)
+    encodeVarint(value.value, into: &buffer)
+}
+
+nonisolated internal func encodeGaugeSnapshot(_ value: GaugeSnapshot, into buffer: inout ByteBuffer) {
+    encodeString(value.name, into: &buffer)
+    encodeI64(value.value, into: &buffer)
+}
+
+nonisolated internal func encodeHistogramBucketSnapshot(_ value: HistogramBucketSnapshot, into buffer: inout ByteBuffer) {
+    encodeVarint(value.le, into: &buffer)
+    encodeVarint(value.count, into: &buffer)
+}
+
+nonisolated internal func encodeHistogramSnapshot(_ value: HistogramSnapshot, into buffer: inout ByteBuffer) {
+    encodeString(value.name, into: &buffer)
+    encodeVarint(value.count, into: &buffer)
+    encodeVarint(value.sum, into: &buffer)
+    encodeVarint(value.max, into: &buffer)
+    encodeVec(value.buckets, into: &buffer, encoder: { val, buf in encodeHistogramBucketSnapshot(val, into: &buf) })
+    encodeVarint(value.overflow, into: &buffer)
+}
+
+nonisolated internal func encodePhaseSnapshot(_ value: PhaseSnapshot, into buffer: inout ByteBuffer) {
+    encodeString(value.name, into: &buffer)
+    encodeString(value.state, into: &buffer)
+    encodeString(value.detail, into: &buffer)
+    encodeVarint(value.enteredAtUnixNs, into: &buffer)
+    encodeVarint(value.elapsedNs, into: &buffer)
+}
+
+nonisolated internal func encodeRecentEventSnapshot(_ value: RecentEventSnapshot, into buffer: inout ByteBuffer) {
+    encodeVarint(value.atUnixNs, into: &buffer)
+    encodeString(value.name, into: &buffer)
+    encodeString(value.detail, into: &buffer)
+}
+
+nonisolated internal func encodeTelemetrySnapshot(_ value: TelemetrySnapshot, into buffer: inout ByteBuffer) {
+    encodeString(value.component, into: &buffer)
+    encodeVarint(value.generatedAtUnixNs, into: &buffer)
+    encodeVec(value.counters, into: &buffer, encoder: { val, buf in encodeCounterSnapshot(val, into: &buf) })
+    encodeVec(value.gauges, into: &buffer, encoder: { val, buf in encodeGaugeSnapshot(val, into: &buf) })
+    encodeVec(value.histograms, into: &buffer, encoder: { val, buf in encodeHistogramSnapshot(val, into: &buf) })
+    encodeVec(value.phases, into: &buffer, encoder: { val, buf in encodePhaseSnapshot(val, into: &buf) })
+    encodeVec(value.recentEvents, into: &buffer, encoder: { val, buf in encodeRecentEventSnapshot(val, into: &buf) })
+}
+
+nonisolated internal func encodeDiagnosticsSnapshot(_ value: DiagnosticsSnapshot, into buffer: inout ByteBuffer) {
+    encodeVarint(value.serverStartedAtUnixNs, into: &buffer)
+    encodeVec(value.active, into: &buffer, encoder: { val, buf in encodeRunSummary(val, into: &buf) })
+    encodeTelemetrySnapshot(value.telemetry, into: &buffer)
 }
 
 nonisolated internal func encodeRunConfig(_ value: RunConfig, into buffer: inout ByteBuffer) {
@@ -1934,6 +2129,17 @@ nonisolated internal func decodeProbeDiffThread(from buffer: inout ByteBuffer) t
 }
 
 nonisolated internal func decodeProbeTimingBreakdown(from buffer: inout ByteBuffer) throws -> ProbeTimingBreakdown {
+    let _kperfTsTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _staxdReadStartedTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _staxdDrainedTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _staxdSendStartedTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _clientReceivedTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _enqueuedTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _workerStartedTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _threadLookupDoneTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _stateDoneTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _resumeDoneTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _walkDoneTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _kperfToEnqueueNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _kperfToStaxdReadNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _staxdReadNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
@@ -1946,7 +2152,7 @@ nonisolated internal func decodeProbeTimingBreakdown(from buffer: inout ByteBuff
     let _resumeNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _walkNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _probeTotalNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    return ProbeTimingBreakdown(kperfToEnqueueNs: _kperfToEnqueueNs, kperfToStaxdReadNs: _kperfToStaxdReadNs, staxdReadNs: _staxdReadNs, staxdDrainToSendNs: _staxdDrainToSendNs, staxdSendToClientRecvNs: _staxdSendToClientRecvNs, clientRecvToEnqueueNs: _clientRecvToEnqueueNs, queueWaitNs: _queueWaitNs, lookupNs: _lookupNs, suspendStateNs: _suspendStateNs, resumeNs: _resumeNs, walkNs: _walkNs, probeTotalNs: _probeTotalNs)
+    return ProbeTimingBreakdown(kperfTsTicks: _kperfTsTicks, staxdReadStartedTicks: _staxdReadStartedTicks, staxdDrainedTicks: _staxdDrainedTicks, staxdSendStartedTicks: _staxdSendStartedTicks, clientReceivedTicks: _clientReceivedTicks, enqueuedTicks: _enqueuedTicks, workerStartedTicks: _workerStartedTicks, threadLookupDoneTicks: _threadLookupDoneTicks, stateDoneTicks: _stateDoneTicks, resumeDoneTicks: _resumeDoneTicks, walkDoneTicks: _walkDoneTicks, kperfToEnqueueNs: _kperfToEnqueueNs, kperfToStaxdReadNs: _kperfToStaxdReadNs, staxdReadNs: _staxdReadNs, staxdDrainToSendNs: _staxdDrainToSendNs, staxdSendToClientRecvNs: _staxdSendToClientRecvNs, clientRecvToEnqueueNs: _clientRecvToEnqueueNs, queueWaitNs: _queueWaitNs, lookupNs: _lookupNs, suspendStateNs: _suspendStateNs, resumeNs: _resumeNs, walkNs: _walkNs, probeTotalNs: _probeTotalNs)
 }
 
 nonisolated internal func decodeProbeQueueStats(from buffer: inout ByteBuffer) throws -> ProbeQueueStats {
@@ -2056,6 +2262,68 @@ nonisolated internal func decodeServerStatus(from buffer: inout ByteBuffer) thro
     let _serverStartedAtUnixNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _active = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeRunSummary(from: &buf) }) })(&buffer)
     return ServerStatus(serverStartedAtUnixNs: _serverStartedAtUnixNs, active: _active)
+}
+
+nonisolated internal func decodeCounterSnapshot(from buffer: inout ByteBuffer) throws -> CounterSnapshot {
+    let _name = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _value = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    return CounterSnapshot(name: _name, value: _value)
+}
+
+nonisolated internal func decodeGaugeSnapshot(from buffer: inout ByteBuffer) throws -> GaugeSnapshot {
+    let _name = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _value = try ({ buf in try decodeI64(from: &buf) })(&buffer)
+    return GaugeSnapshot(name: _name, value: _value)
+}
+
+nonisolated internal func decodeHistogramBucketSnapshot(from buffer: inout ByteBuffer) throws -> HistogramBucketSnapshot {
+    let _le = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _count = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    return HistogramBucketSnapshot(le: _le, count: _count)
+}
+
+nonisolated internal func decodeHistogramSnapshot(from buffer: inout ByteBuffer) throws -> HistogramSnapshot {
+    let _name = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _count = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _sum = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _max = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _buckets = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeHistogramBucketSnapshot(from: &buf) }) })(&buffer)
+    let _overflow = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    return HistogramSnapshot(name: _name, count: _count, sum: _sum, max: _max, buckets: _buckets, overflow: _overflow)
+}
+
+nonisolated internal func decodePhaseSnapshot(from buffer: inout ByteBuffer) throws -> PhaseSnapshot {
+    let _name = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _state = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _detail = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _enteredAtUnixNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _elapsedNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    return PhaseSnapshot(name: _name, state: _state, detail: _detail, enteredAtUnixNs: _enteredAtUnixNs, elapsedNs: _elapsedNs)
+}
+
+nonisolated internal func decodeRecentEventSnapshot(from buffer: inout ByteBuffer) throws -> RecentEventSnapshot {
+    let _atUnixNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _name = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _detail = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    return RecentEventSnapshot(atUnixNs: _atUnixNs, name: _name, detail: _detail)
+}
+
+nonisolated internal func decodeTelemetrySnapshot(from buffer: inout ByteBuffer) throws -> TelemetrySnapshot {
+    let _component = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _generatedAtUnixNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _counters = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeCounterSnapshot(from: &buf) }) })(&buffer)
+    let _gauges = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeGaugeSnapshot(from: &buf) }) })(&buffer)
+    let _histograms = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeHistogramSnapshot(from: &buf) }) })(&buffer)
+    let _phases = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodePhaseSnapshot(from: &buf) }) })(&buffer)
+    let _recentEvents = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeRecentEventSnapshot(from: &buf) }) })(&buffer)
+    return TelemetrySnapshot(component: _component, generatedAtUnixNs: _generatedAtUnixNs, counters: _counters, gauges: _gauges, histograms: _histograms, phases: _phases, recentEvents: _recentEvents)
+}
+
+nonisolated internal func decodeDiagnosticsSnapshot(from buffer: inout ByteBuffer) throws -> DiagnosticsSnapshot {
+    let _serverStartedAtUnixNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _active = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeRunSummary(from: &buf) }) })(&buffer)
+    let _telemetry = try ({ buf in try decodeTelemetrySnapshot(from: &buf) })(&buffer)
+    return DiagnosticsSnapshot(serverStartedAtUnixNs: _serverStartedAtUnixNs, active: _active, telemetry: _telemetry)
 }
 
 nonisolated internal func decodeRunConfig(from buffer: inout ByteBuffer) throws -> RunConfig {
