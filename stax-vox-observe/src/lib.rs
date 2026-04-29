@@ -1,6 +1,7 @@
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use stax_telemetry::{CounterHandle, GaugeHandle, HistogramHandle, TelemetryRegistry};
 
@@ -151,6 +152,8 @@ impl VoxDebugRegistry {
             return;
         }
         for entry in entries {
+            let snapshot = entry.caller.debug_snapshot();
+            let formatted = format_debug_snapshot(&snapshot);
             tracing::info!(
                 process = process_name,
                 reason,
@@ -158,9 +161,8 @@ impl VoxDebugRegistry {
                 surface = entry.surface,
                 role = entry.role,
                 registration_id = entry.id,
-                "dumping vox debug snapshot"
+                "\n{formatted}"
             );
-            let _ = entry.caller.dump_debug_snapshot();
         }
     }
 
@@ -172,21 +174,63 @@ impl VoxDebugRegistry {
         #[cfg(unix)]
         {
             let registry = self.clone();
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
-                Ok(mut signal) => Some(tokio::spawn(async move {
-                    while signal.recv().await.is_some() {
-                        registry.dump_debug_snapshots(process_name, "SIGUSR1");
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                return match tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::user_defined1(),
+                ) {
+                    Ok(mut signal) => Some(handle.spawn(async move {
+                        while signal.recv().await.is_some() {
+                            registry.dump_debug_snapshots(process_name, "SIGUSR1");
+                        }
+                    })),
+                    Err(error) => {
+                        tracing::warn!(
+                            process = process_name,
+                            ?error,
+                            "failed to install SIGUSR1 vox debug dump handler"
+                        );
+                        None
                     }
-                })),
-                Err(error) => {
-                    tracing::warn!(
-                        process = process_name,
-                        ?error,
-                        "failed to install SIGUSR1 vox debug dump handler"
-                    );
-                    None
-                }
+                };
             }
+
+            let _ = std::thread::Builder::new()
+                .name(format!("{process_name}-vox-sigusr1"))
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            tracing::warn!(
+                                process = process_name,
+                                ?error,
+                                "failed to create SIGUSR1 vox debug dump runtime"
+                            );
+                            return;
+                        }
+                    };
+                    runtime.block_on(async move {
+                        let mut signal = match tokio::signal::unix::signal(
+                            tokio::signal::unix::SignalKind::user_defined1(),
+                        ) {
+                            Ok(signal) => signal,
+                            Err(error) => {
+                                tracing::warn!(
+                                    process = process_name,
+                                    ?error,
+                                    "failed to install SIGUSR1 vox debug dump handler"
+                                );
+                                return;
+                            }
+                        };
+                        while signal.recv().await.is_some() {
+                            registry.dump_debug_snapshots(process_name, "SIGUSR1");
+                        }
+                    });
+                });
+            None
         }
         #[cfg(not(unix))]
         {
@@ -194,6 +238,222 @@ impl VoxDebugRegistry {
             None
         }
     }
+}
+
+fn format_debug_snapshot(snapshot: &vox::VoxDebugSnapshot) -> String {
+    let now = Instant::now();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# Vox Debug Snapshot\nconnections: {}",
+        snapshot.connections.len()
+    );
+
+    for connection in &snapshot.connections {
+        let _ = writeln!(
+            out,
+            "\n## connection {:?} · {:?} · driver={:?}",
+            connection.connection_id, connection.state, connection.driver_task_status
+        );
+        let _ = writeln!(
+            out,
+            "- endpoint={} surface={} component={} close_reason={}",
+            display_opt_debug(&connection.endpoint),
+            display_opt_debug(&connection.surface),
+            display_opt_debug(&connection.component),
+            display_opt_debug(&connection.close_reason)
+        );
+        let _ = writeln!(
+            out,
+            "- queues: outbound={}/{} local_control={}/{}",
+            display_opt_usize(connection.outbound_queue_depth),
+            display_opt_usize(connection.outbound_queue_capacity),
+            display_opt_usize(connection.local_control_queue_depth),
+            display_opt_usize(connection.local_control_queue_capacity)
+        );
+        let _ = writeln!(
+            out,
+            "- last: inbound={} outbound={} progress={}",
+            instant_age(connection.last_inbound_message_at, now),
+            instant_age(connection.last_outbound_message_at, now),
+            instant_age(connection.last_progress_at, now)
+        );
+
+        if !connection.requests.is_empty() {
+            let _ = writeln!(
+                out,
+                "- requests: {} outstanding={}",
+                connection.requests.len(),
+                connection.outstanding_requests
+            );
+            for request in &connection.requests {
+                let _ = writeln!(
+                    out,
+                    "  - {:?} {:?} age={} method={}::{} method_id={:?} response_sender_blocked={} associated_channels={:?}",
+                    request.request_id,
+                    request.state,
+                    format_duration(request.age),
+                    request.service.unwrap_or("?"),
+                    request.method.unwrap_or("?"),
+                    request.method_id,
+                    display_opt_bool(request.response_sender_blocked),
+                    request.associated_channels
+                );
+            }
+        }
+
+        if !connection.open_channels.is_empty() {
+            let _ = writeln!(out, "- channels: {}", connection.open_channels.len());
+            for channel in &connection.open_channels {
+                let debug = channel_debug_label(channel.debug);
+                let _ = writeln!(
+                    out,
+                    "  - {:?}/{:?} {:?} {}",
+                    channel.connection_id, channel.channel_id, channel.direction, debug
+                );
+                let _ = writeln!(
+                    out,
+                    "    credit: initial={} available={} permits={} pending_local_grant={} total_granted={} total_received={} last_granted={} last_received={}",
+                    channel.initial_credit,
+                    display_opt_u32(channel.available_send_credit),
+                    display_opt_u32(channel.current_permit_count),
+                    channel.pending_local_grant_credit,
+                    channel.total_credit_granted,
+                    channel.total_credit_received,
+                    instant_age_with_amount(
+                        channel.last_credit_granted_at,
+                        channel.last_credit_granted_amount,
+                        now
+                    ),
+                    instant_age_with_amount(
+                        channel.last_credit_received_at,
+                        channel.last_credit_received_amount,
+                        now
+                    )
+                );
+                let _ = writeln!(
+                    out,
+                    "    rx: state={:?} queue={}/{} received={} consumed={} last_received={} last_consumed={}",
+                    channel.receiver_state,
+                    display_opt_usize(channel.inbound_queue_len),
+                    display_opt_usize(channel.inbound_queue_capacity),
+                    channel.items_received,
+                    channel.items_consumed,
+                    instant_age(channel.last_item_received_at, now),
+                    instant_age(channel.last_item_consumed_at, now)
+                );
+                let _ = writeln!(
+                    out,
+                    "    tx: sent={} started={} completed={} waited_for_credit={} waiters={} zero_credit_blocked={} runtime_queue={}/{} last_sent={}",
+                    channel.sent,
+                    channel.sends_started,
+                    channel.sends_completed,
+                    channel.sends_waited_for_credit,
+                    display_opt_usize(channel.send_waiters_count),
+                    channel.zero_credit_with_blocked_senders,
+                    display_opt_usize(channel.outbound_runtime_queue_len),
+                    display_opt_usize(channel.outbound_runtime_queue_capacity),
+                    instant_age(channel.last_item_sent_at, now)
+                );
+                let _ = writeln!(
+                    out,
+                    "    failures: try_full_credit={} try_full_runtime_queue={} closed={} reset={} dropped={} close_reason={} reset_reason={}",
+                    channel.try_send_full_credit,
+                    channel.try_send_full_runtime_queue,
+                    channel.closed,
+                    channel.reset,
+                    channel.dropped,
+                    display_opt_debug(&channel.close_reason),
+                    display_opt_debug(&channel.reset_reason)
+                );
+            }
+        }
+    }
+
+    out
+}
+
+fn channel_debug_label(debug: Option<vox::ChannelDebugContext>) -> String {
+    let Some(debug) = debug else {
+        return "debug=?".to_owned();
+    };
+    let loc = debug
+        .source_location
+        .map(|loc| format!("{}:{}:{}", loc.file, loc.line, loc.column))
+        .unwrap_or_else(|| "?".to_owned());
+    format!(
+        "type={} label={} service={} method={} source={}",
+        debug.type_name.unwrap_or("?"),
+        debug.label.unwrap_or("?"),
+        debug.service.unwrap_or("?"),
+        debug.method.unwrap_or("?"),
+        loc
+    )
+}
+
+fn instant_age(instant: Option<Instant>, now: Instant) -> String {
+    instant
+        .map(|instant| {
+            format!(
+                "{} ago",
+                format_duration(now.saturating_duration_since(instant))
+            )
+        })
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn instant_age_with_amount(instant: Option<Instant>, amount: Option<u32>, now: Instant) -> String {
+    match (instant, amount) {
+        (Some(instant), Some(amount)) => format!(
+            "{} ago (+{})",
+            format_duration(now.saturating_duration_since(instant)),
+            amount
+        ),
+        (Some(instant), None) => format!(
+            "{} ago",
+            format_duration(now.saturating_duration_since(instant))
+        ),
+        (None, Some(amount)) => format!("never (+{})", amount),
+        (None, None) => "-".to_owned(),
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let ns = duration.as_nanos();
+    if ns >= 1_000_000_000 {
+        format!("{:.3}s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.3}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.3}µs", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
+    }
+}
+
+fn display_opt_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn display_opt_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn display_opt_bool(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn display_opt_debug<T: std::fmt::Debug>(value: &Option<T>) -> String {
+    value
+        .as_ref()
+        .map(|value| format!("{value:?}"))
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 impl Default for VoxDebugRegistry {

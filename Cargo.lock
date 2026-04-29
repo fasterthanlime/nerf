@@ -2097,7 +2097,10 @@ dependencies = [
  "log",
  "stax-core",
  "stax-live-proto",
+ "stax-vox-observe",
  "tokio",
+ "tracing-oslog",
+ "tracing-subscriber",
  "vox",
 ]
 

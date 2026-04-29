@@ -29,6 +29,8 @@ fn main_impl() -> Result<(), Box<dyn Error>> {
     }
 
     env_logger::init();
+    init_tracing();
+    let _vox_sigusr1_dump = stax_vox_observe::install_global_sigusr1_dump("stax");
 
     let cli: Cli = args::Driver::new(
         args::builder::<Cli>()
@@ -65,6 +67,20 @@ fn main() {
         eprintln!("error: {error}");
         exit(1);
     }
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,stax=info,stax_vox_observe=info"));
+    let oslog = tracing_oslog::OsLogger::new("eu.bearcove.stax", "default");
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(oslog)
+        .try_init();
 }
 
 fn block_on_async<F: std::future::Future<Output = Result<(), Box<dyn Error>>>>(
@@ -112,6 +128,7 @@ fn stax_server_socket() -> Option<PathBuf> {
 async fn run_record_async(args: RecordArgs) -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: RunControlClient = vox::connect(&url).await?;
+    let _debug_registration = register_run_control_client("record", &client);
     let target = args.target()?;
     let label = args
         .command
@@ -398,9 +415,24 @@ fn require_server_socket() -> Result<String, Box<dyn Error>> {
     Ok(format!("local://{}", socket.display()))
 }
 
+fn register_run_control_client(
+    surface: &'static str,
+    client: &RunControlClient,
+) -> stax_vox_observe::VoxDebugRegistration {
+    stax_vox_observe::register_global_caller("stax", surface, "RunControl", &client.caller)
+}
+
+fn register_profiler_client(
+    surface: &'static str,
+    client: &ProfilerClient,
+) -> stax_vox_observe::VoxDebugRegistration {
+    stax_vox_observe::register_global_caller("stax", surface, "Profiler", &client.caller)
+}
+
 async fn run_status() -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: RunControlClient = vox::connect(&url).await?;
+    let _debug_registration = register_run_control_client("status", &client);
     let status = client.status().await.map_err(|e| format!("{e:?}"))?;
     print_server_status(&status);
     Ok(())
@@ -409,6 +441,7 @@ async fn run_status() -> Result<(), Box<dyn Error>> {
 async fn run_list() -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: RunControlClient = vox::connect(&url).await?;
+    let _debug_registration = register_run_control_client("list", &client);
     let runs = client.list_runs().await.map_err(|e| format!("{e:?}"))?;
     if runs.is_empty() {
         println!("(no runs)");
@@ -423,6 +456,7 @@ async fn run_list() -> Result<(), Box<dyn Error>> {
 async fn run_diagnose() -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: RunControlClient = vox::connect(&url).await?;
+    let _debug_registration = register_run_control_client("diagnose", &client);
     let snapshot = client.diagnostics().await.map_err(|e| format!("{e:?}"))?;
     print_diagnostics(&snapshot);
     Ok(())
@@ -443,6 +477,7 @@ async fn run_wait(args: WaitArgs) -> Result<(), Box<dyn Error>> {
 
     let url = require_server_socket()?;
     let client: RunControlClient = vox::connect(&url).await?;
+    let _debug_registration = register_run_control_client("wait", &client);
     let outcome = client
         .wait_active(condition, args.timeout_ms)
         .await
@@ -471,6 +506,7 @@ async fn run_wait(args: WaitArgs) -> Result<(), Box<dyn Error>> {
 async fn run_stop() -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: RunControlClient = vox::connect(&url).await?;
+    let _debug_registration = register_run_control_client("stop", &client);
     let result = client.stop_active().await;
     match result {
         Ok(summary) => {
@@ -493,6 +529,7 @@ async fn run_top(args: TopArgs) -> Result<(), Box<dyn Error>> {
         }
     };
     let client: ProfilerClient = vox::connect(&url).await?;
+    let _debug_registration = register_profiler_client("top", &client);
     let entries = client
         .top(
             args.limit,
@@ -528,6 +565,7 @@ async fn run_top(args: TopArgs) -> Result<(), Box<dyn Error>> {
 async fn run_annotate(args: AnnotateArgs) -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: ProfilerClient = vox::connect(&url).await?;
+    let _debug_registration = register_profiler_client("annotate", &client);
     let view_params = ViewParams {
         tid: args.tid,
         filter: LiveFilter {
@@ -574,6 +612,7 @@ async fn run_annotate(args: AnnotateArgs) -> Result<(), Box<dyn Error>> {
 async fn run_threads(args: ThreadsArgs) -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: ProfilerClient = vox::connect(&url).await?;
+    let _debug_registration = register_profiler_client("threads", &client);
     // subscribe_threads streams every ~250ms; take the first.
     let (tx, mut rx) = vox::channel();
     client
@@ -626,6 +665,7 @@ fn print_threads(update: &ThreadsUpdate, limit: u32) {
 async fn run_probe_diff(args: ProbeDiffArgs) -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: ProfilerClient = vox::connect(&url).await?;
+    let _debug_registration = register_profiler_client("probe-diff", &client);
     let (tx, mut rx) = vox::channel();
     client
         .subscribe_probe_diff(args.tid, tx)
@@ -935,6 +975,7 @@ fn dominant_off_cpu_reason(b: &OffCpuBreakdown) -> &'static str {
 async fn run_flame(args: FlameArgs) -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: ProfilerClient = vox::connect(&url).await?;
+    let _debug_registration = register_profiler_client("flame", &client);
     // subscribe_flamegraph streams updates every ~500ms; take the
     // first snapshot and drop the channel.
     let (tx, mut rx) = vox::channel();
