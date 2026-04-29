@@ -249,8 +249,21 @@ final class AppModel {
 
     /// Why a connection isn't live (or empty when everything's fine).
     var connectionStatus: String = "disconnected"
+    /// Per-stream update counters surfaced in the status bar so you
+    /// can see whether anything is actually flowing without scraping
+    /// the unified log.
+    var streamStats = StreamStats()
     private let service = ProfilerService()
     private var streamTasks: [Task<Void, Never>] = []
+
+    struct StreamStats: Hashable {
+        var threads: Int = 0
+        var top: Int = 0
+        var flamegraph: Int = 0
+        var timeline: Int = 0
+        var neighbors: Int = 0
+        var annotated: Int = 0
+    }
     /// Restartable subscriptions: cancel + relaunch every time
     /// `focusedFunctionId` changes. Both hold nil while the flame
     /// graph is the top pane.
@@ -268,19 +281,12 @@ final class AppModel {
         case .ready(let client):
             connectionStatus = "connected"
 
-            // Smoke-test the unary path on the way in. If this fails
-            // the streaming subscriptions won't work either, so we
-            // surface the failure up front.
-            do {
-                let total = try await client.totalOnCpuNs()
-                NSLog("stax: totalOnCpuNs = %llu", total)
-                self.onCPUTime = TimeInterval(total) / 1_000_000_000
-            } catch {
-                NSLog("stax: totalOnCpuNs failed: %@", "\(error)")
-                connectionStatus = "totalOnCpuNs failed"
-                return
-            }
-
+            // Spawn all streams concurrently. Don't gate them on a
+            // unary smoke-test — if any one stream is slow or hangs
+            // we want the others to keep flowing, and the visible
+            // streamStats counters tell us exactly which ones woke
+            // up. The unary `totalOnCpuNs` is a separate fire-and-
+            // forget below, just for one extra signal in the log.
             streamTasks.append(Task { [weak self] in
                 await self?.runThreadsSubscription(client: client)
             })
@@ -293,6 +299,19 @@ final class AppModel {
             streamTasks.append(Task { [weak self] in
                 await self?.runFlamegraphSubscription(client: client)
             })
+
+            Task { [weak self] in
+                guard let client = await self?.activeClient() else { return }
+                do {
+                    let total = try await client.totalOnCpuNs()
+                    NSLog("stax: totalOnCpuNs = %llu", total)
+                    await MainActor.run {
+                        self?.onCPUTime = TimeInterval(total) / 1_000_000_000
+                    }
+                } catch {
+                    NSLog("stax: totalOnCpuNs failed: %@", "\(error)")
+                }
+            }
         case .failed(let why):
             connectionStatus = why
         case .idle, .connecting:
@@ -324,6 +343,7 @@ final class AppModel {
             for try await update in rx {
                 count += 1
                 NSLog("stax: threads update #%d (%d threads)", count, update.threads.count)
+                self.streamStats.threads = count
                 self.threads = update.threads.map { wire in
                     ThreadInfo(
                         tid: Int(wire.tid),
@@ -377,6 +397,7 @@ final class AppModel {
                     update.entries.count,
                     update.totalOnCpuNs
                 )
+                self.streamStats.top = count
                 self.functions = update.entries.map { wire in
                     let name =
                         wire.functionName
@@ -434,6 +455,7 @@ final class AppModel {
                     update.strings.count,
                     update.root.children.count
                 )
+                self.streamStats.flamegraph = count
                 self.flamegraph = update
             }
             NSLog("stax: flamegraph stream ended")
@@ -474,12 +496,18 @@ final class AppModel {
                     update.buckets.count,
                     update.recordingDurationNs
                 )
+                self.streamStats.timeline = count
                 self.timeline = update
             }
             NSLog("stax: timeline stream ended")
         } catch {
             NSLog("stax: timeline stream error: %@", "\(error)")
         }
+    }
+
+    private func activeClient() -> ProfilerClient? {
+        if case .ready(let client) = service.state { return client }
+        return nil
     }
 
     private func model_tidFilterAsU32() -> UInt32? {
@@ -565,6 +593,7 @@ final class AppModel {
                     update.callersTree.children.count,
                     update.calleesTree.children.count
                 )
+                self.streamStats.neighbors += 1
                 self.neighbors = update
                 applyNeighbors(update)
             }
@@ -653,6 +682,7 @@ final class AppModel {
                     update.functionName,
                     update.lines.count
                 )
+                self.streamStats.annotated += 1
                 self.annotated = update
             }
         } catch {

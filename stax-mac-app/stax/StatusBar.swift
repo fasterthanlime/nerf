@@ -12,6 +12,12 @@ struct StatusBar: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+
+            Text(streamCountersText)
+                .font(.mono(.caption2))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+
             Spacer()
             Text(statsText)
                 .font(.mono(.callout))
@@ -21,6 +27,16 @@ struct StatusBar: View {
         .padding(.vertical, 6)
         .background(.bar)
         .overlay(alignment: .top) { Divider() }
+    }
+
+    /// Compact line of `stream:count` per active subscription. Lets
+    /// you see at a glance whether each stream has produced anything,
+    /// without grepping the unified log. Zeros mean "subscribed but
+    /// no update yet" — server has no data, hasn't ticked, or the
+    /// connection didn't actually route to that service.
+    private var streamCountersText: String {
+        let s = model.streamStats
+        return "thr:\(s.threads) top:\(s.top) flame:\(s.flamegraph) tl:\(s.timeline) nbr:\(s.neighbors) ann:\(s.annotated)"
     }
 
     private var connectionColor: Color {
