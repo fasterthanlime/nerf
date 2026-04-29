@@ -15,8 +15,14 @@ cargo xtask install
 ```
 
 …builds release binaries for `stax`, `staxd`, and `stax-server`, copies them
-to `~/.cargo/bin/`, ad-hoc codesigns `stax`, and **bootstraps `stax-server` as
-a per-user LaunchAgent** so it's running on login.
+to `~/.cargo/bin/`, codesigns them on macOS, and **bootstraps `stax-server`
+as a per-user LaunchAgent** so it's running on login.
+
+On macOS, `cargo xtask install` prefers `Developer ID Application` and then
+`Apple Development` identities from `security find-identity`. Override with
+`STAX_CODESIGN_IDENTITY=<identity-or-hash>`; set it to `-` only when you
+explicitly want ad-hoc signing. `stax-server` needs a real `B2N6FSRTPV`
+team signature for its app-group entitlement to avoid macOS app-data prompts.
 
 After that, one privileged step (the only `sudo` you'll ever do):
 
@@ -32,12 +38,19 @@ this point on, `stax record …` is unprivileged.
 | component     | privilege  | launchd kind      | socket                                     |
 |---------------|------------|-------------------|--------------------------------------------|
 | `staxd`       | root       | LaunchDaemon      | `/var/run/staxd.sock`                      |
-| `stax-server` | user       | LaunchAgent       | `$XDG_RUNTIME_DIR/stax-server.sock` or `/tmp/stax-server-$UID.sock` |
+| `stax-server` | user       | LaunchAgent       | `~/Library/Group Containers/B2N6FSRTPV.eu.bearcove.stax/stax-server.sock` |
 | `stax`        | user       | (CLI)             | (no socket)                                |
 
 `stax-server` also binds **`ws://127.0.0.1:8080`** for the web UI. Override
 with `STAX_SERVER_WS_BIND=host:port` (set in the LaunchAgent plist's
 `EnvironmentVariables` if you want it persistent).
+
+The app-group socket defaults to the stax macOS app group,
+`B2N6FSRTPV.eu.bearcove.stax`, because the sandboxed app consumes
+the local socket. Override both CLI and server with
+`STAX_APP_GROUP=<group-id>` if you intentionally use a different signed app
+group. If group-container creation fails, the server falls back to
+`$XDG_RUNTIME_DIR/stax-server.sock` or `/tmp/stax-server-$UID.sock`.
 
 ### Logs
 
@@ -333,8 +346,10 @@ directly. All three live in `stax-live-proto`:
 
 Connect with:
 
-- `local://$XDG_RUNTIME_DIR/stax-server.sock` (or `/tmp/stax-server-$UID.sock`),
-  for trusted local agents
+- `local://~/Library/Group Containers/B2N6FSRTPV.eu.bearcove.stax/stax-server.sock`,
+  for trusted local agents and the sandboxed stax macOS app
+- `local://$XDG_RUNTIME_DIR/stax-server.sock` or `/tmp/stax-server-$UID.sock`,
+  if the app-group socket fallback was used
 - `ws://127.0.0.1:8080`, for browser clients (TS bindings live in
   `frontend/src/generated/`)
 
@@ -352,6 +367,13 @@ Connect with:
 - **`stax record` says “stax-server unreachable”** — daemon's down.
   Recording proceeds but events go nowhere; no agent queries will work.
   Fix the daemon first.
+
+- **macOS asks whether `stax-server` can access another app's data** —
+  the installed server is probably ad-hoc signed or signed with the wrong
+  app group. Check `codesign -dv --verbose=4 ~/.cargo/bin/stax-server`:
+  it should show `TeamIdentifier=B2N6FSRTPV`, not `Signature=adhoc`.
+  Re-run `cargo xtask install` after confirming `security find-identity -v
+  -p codesigning` lists your Developer ID or Apple Development identity.
 
 - **`stax top` returns `(no samples yet — is a recording in progress?)`** —
   either no run is active, or the run hasn't ingested any PET samples yet

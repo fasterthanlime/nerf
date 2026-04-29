@@ -3,7 +3,7 @@
 //! Two modes, dispatched on euid at runtime:
 //!
 //!   * **non-root**: explain the current install path. `cargo xtask
-//!     install` builds, copies, ad-hoc-signs, and bootstraps the
+//!     install` builds, copies, codesigns, and bootstraps the
 //!     unprivileged server.
 //!
 //!   * **root** (`sudo stax setup`): install `staxd` as a
@@ -88,7 +88,7 @@ fn is_root() -> bool {
 // ---------------------------------------------------------------------------
 
 /// Non-root entry point: tell the user the modern install path.
-/// `cargo xtask install` handles build/copy/ad-hoc-sign for the
+/// `cargo xtask install` handles build/copy/codesign for the
 /// user binaries and bootstraps stax-server. Nothing to do here.
 fn codesign_self(_args: &args::SetupArgs) -> Result<(), Box<dyn Error>> {
     println!("`stax setup` (no sudo) is a no-op now.");
@@ -97,7 +97,7 @@ fn codesign_self(_args: &args::SetupArgs) -> Result<(), Box<dyn Error>> {
     println!();
     println!("    cargo xtask install");
     println!();
-    println!("…that ad-hoc signs copied binaries and bootstraps");
+    println!("…that codesigns copied binaries and bootstraps");
     println!("stax-server as a per-user LaunchAgent.");
     println!();
     println!("Then, one-time only, install the privileged daemon:");
@@ -142,7 +142,7 @@ Press Enter to continue, or Ctrl-C to cancel."#,
         .map_err(|err| format!("copying staxd to {}: {err}", BINARY_INSTALL_PATH))?;
     fs::set_permissions(BINARY_INSTALL_PATH, fs::Permissions::from_mode(0o755))?;
 
-    codesign_staxd_adhoc(BINARY_INSTALL_PATH)?;
+    ensure_staxd_codesigned(BINARY_INSTALL_PATH)?;
 
     println!(":: writing LaunchDaemon plist -> {}", PLIST_PATH);
     fs::write(PLIST_PATH, NPERFD_LAUNCHD_PLIST)
@@ -263,22 +263,81 @@ fn locate_staged_daemon() -> Result<PathBuf, Box<dyn Error>> {
     .into())
 }
 
-/// Ad-hoc codesign `staxd` at its final install path. Signing at
-/// one path and then copying to another invalidates the embedded
-/// signature on macOS, so sign in place at the final destination.
-fn codesign_staxd_adhoc(path: &str) -> Result<(), Box<dyn Error>> {
-    println!(":: codesigning {path} ad-hoc");
-    let status = Command::new("codesign")
-        .arg("--sign")
-        .arg("-")
-        .arg("--force")
-        .arg(path)
-        .status()?;
+/// Keep the real team signature produced by `cargo xtask install`
+/// when the copy preserved it. If not, sign with an available real
+/// identity. Use `STAX_CODESIGN_IDENTITY=-` only for explicit ad-hoc
+/// signing.
+fn ensure_staxd_codesigned(path: &str) -> Result<(), Box<dyn Error>> {
+    if has_team_signature(path) {
+        println!(":: preserving existing team signature on {path}");
+        return Ok(());
+    }
+
+    let identity = resolve_codesign_identity()?;
+
+    println!(":: codesigning {path} with identity={identity}");
+    let mut command = Command::new("codesign");
+    command.arg("--sign").arg(&identity).arg("--force");
+    if identity != "-" {
+        command.arg("--timestamp=none");
+    }
+    command.arg(path);
+
+    let status = command.status()?;
 
     if !status.success() {
         return Err(format!("codesign exited with {status}").into());
     }
     Ok(())
+}
+
+fn has_team_signature(path: &str) -> bool {
+    let Ok(output) = Command::new("codesign")
+        .args(["-dv", "--verbose=4", path])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    !stderr.contains("Signature=adhoc") && !stderr.contains("TeamIdentifier=not set")
+}
+
+fn resolve_codesign_identity() -> Result<String, Box<dyn Error>> {
+    if let Ok(identity) = env::var("STAX_CODESIGN_IDENTITY") {
+        if identity.trim().is_empty() {
+            return Err("STAX_CODESIGN_IDENTITY is set but empty".into());
+        }
+        return Ok(identity);
+    }
+
+    for prefix in ["Developer ID Application", "Apple Development"] {
+        if let Some(identity) = find_codesign_identity(prefix)? {
+            return Ok(identity);
+        }
+    }
+    Err(
+        "no Developer ID Application or Apple Development codesign identity found; \
+         rerun `cargo xtask install` as your normal user first, or set \
+         STAX_CODESIGN_IDENTITY=- only if you explicitly want ad-hoc signing"
+            .into(),
+    )
+}
+
+fn find_codesign_identity(prefix: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let output = Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().find_map(|line| {
+        let identity = line.split('"').nth(1)?;
+        identity.starts_with(prefix).then(|| identity.to_string())
+    }))
 }
 
 /// When invoked via `sudo`, $SUDO_USER carries the original username.

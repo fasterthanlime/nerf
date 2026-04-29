@@ -2,7 +2,7 @@
 //!
 //! Available subcommands:
 //!   - `install`        Build stax in release mode, copy to ~/.cargo/bin/,
-//!                      and (on macOS) ad-hoc codesign copied binaries.
+//!                      and (on macOS) codesign copied binaries.
 //!   - `build-daemon`   Build staxd in release mode and print the
 //!                      one-time `sudo cp` / `launchctl load` instructions
 //!                      for the LaunchDaemon plist.
@@ -74,6 +74,9 @@ fn install() -> Result<(), Box<dyn Error>> {
     println!(":: Building workspace (release)...");
     cargo_build_release_workspace(&workspace_root)?;
 
+    #[cfg(target_os = "macos")]
+    let codesign_identity = resolve_codesign_identity()?;
+
     for bin in [BIN_NAME, DAEMON_BIN, SERVER_BIN, SHADE_BIN] {
         let src = workspace_root.join("target").join("release").join(bin);
         if !src.exists() {
@@ -89,20 +92,16 @@ fn install() -> Result<(), Box<dyn Error>> {
 
         #[cfg(target_os = "macos")]
         {
-            // rustc ad-hoc-signs each binary it produces on Apple
-            // Silicon. fs::copy preserves the embedded signature
-            // *bytes* but the cdhash now matches a file at a
-            // different path/inode, and AMFI rejects it on launch
-            // (process gets SIGKILL'd before any code runs).
-            // Re-sign every binary at the destination. staxd is
-            // re-signed *again* by `stax setup` at its final
-            // /usr/local/bin install path.
+            // Re-sign every copied binary at the destination. Binaries
+            // that carry team-bound entitlements, such as app groups,
+            // must be signed by a real team identity; an ad-hoc
+            // signature embeds the XML but leaves TeamIdentifier unset.
             if bin == SHADE_BIN {
                 let entitlements = workspace_root
                     .join(SHADE_BIN)
                     .join("entitlements")
                     .join("eu.bearcove.stax-shade.debugger.plist");
-                codesign_adhoc_with_entitlements(&dst, &entitlements)?;
+                codesign_binary(&dst, Some(&entitlements), &codesign_identity)?;
             } else if bin == SERVER_BIN {
                 // App-group membership so the sandboxed Mac client
                 // can reach the unix socket inside
@@ -113,9 +112,9 @@ fn install() -> Result<(), Box<dyn Error>> {
                     .join(SERVER_BIN)
                     .join("entitlements")
                     .join("eu.bearcove.stax-server.plist");
-                codesign_adhoc_with_entitlements(&dst, &entitlements)?;
+                codesign_binary(&dst, Some(&entitlements), &codesign_identity)?;
             } else {
-                codesign_adhoc(&dst)?;
+                codesign_binary(&dst, None, &codesign_identity)?;
             }
         }
     }
@@ -223,40 +222,78 @@ fn home_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn codesign_adhoc(binary: &Path) -> Result<(), Box<dyn Error>> {
-    println!(":: Re-signing {} (ad-hoc)...", binary.display());
-    let status = Command::new("codesign")
-        .arg("--force")
-        .arg("--sign")
-        .arg("-")
-        .arg(binary)
-        .status()?;
-    if !status.success() {
-        return Err(format!("codesign exited with {status}").into());
+fn resolve_codesign_identity() -> Result<String, Box<dyn Error>> {
+    if let Ok(identity) = env::var("STAX_CODESIGN_IDENTITY") {
+        if identity.trim().is_empty() {
+            return Err("STAX_CODESIGN_IDENTITY is set but empty".into());
+        }
+        println!(":: Using codesign identity from STAX_CODESIGN_IDENTITY: {identity}");
+        return Ok(identity);
     }
-    Ok(())
+
+    for prefix in ["Developer ID Application", "Apple Development"] {
+        if let Some(identity) = find_codesign_identity(prefix)? {
+            println!(":: Using codesign identity: {identity}");
+            return Ok(identity);
+        }
+    }
+
+    Err(
+        "no Developer ID Application or Apple Development codesign identity found; \
+         set STAX_CODESIGN_IDENTITY=- only if you explicitly want ad-hoc signing"
+            .into(),
+    )
 }
 
 #[cfg(target_os = "macos")]
-fn codesign_adhoc_with_entitlements(
+fn find_codesign_identity(prefix: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let output = Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().find_map(|line| {
+        let identity = line.split('"').nth(1)?;
+        identity.starts_with(prefix).then(|| identity.to_string())
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn codesign_binary(
     binary: &Path,
-    entitlements: &Path,
+    entitlements: Option<&Path>,
+    identity: &str,
 ) -> Result<(), Box<dyn Error>> {
-    println!(
-        ":: Re-signing {} (ad-hoc, entitlements={})...",
-        binary.display(),
-        entitlements.display()
-    );
-    let status = Command::new("codesign")
-        .arg("--force")
-        .arg("--sign")
-        .arg("-")
-        .arg("--entitlements")
-        .arg(entitlements)
-        .arg(binary)
-        .status()?;
+    let mut command = Command::new("codesign");
+    command.arg("--force").arg("--sign").arg(identity);
+    if identity != "-" {
+        command.arg("--timestamp=none");
+    }
+    if let Some(entitlements) = entitlements {
+        command
+            .arg("--entitlements")
+            .arg(entitlements)
+            .arg("--generate-entitlement-der");
+    }
+    command.arg(binary);
+
+    match entitlements {
+        Some(entitlements) => println!(
+            ":: Re-signing {} (identity={identity}, entitlements={})...",
+            binary.display(),
+            entitlements.display()
+        ),
+        None => println!(
+            ":: Re-signing {} (identity={identity})...",
+            binary.display()
+        ),
+    }
+
+    let status = command.status()?;
     if !status.success() {
-        return Err(format!("codesign (with entitlements) exited with {status}").into());
+        return Err(format!("codesign exited with {status}").into());
     }
     Ok(())
 }

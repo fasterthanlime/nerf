@@ -237,11 +237,9 @@ fn cleanup_session_shade(server: &ServerState, slot: &ShadeSlot) {
 }
 
 /// macOS app-group container path for the stax-server socket. The
-/// sandboxed Mac client (eu.bearcove.stax) opts into this group via
-/// `com.apple.security.application-groups`; this gives both sides a
-/// shared filesystem location for the unix socket without poking
-/// holes through the sandbox to /tmp.
-const APP_GROUP: &str = "B2N6FSRTPV.eu.bearcove.stax";
+/// sandboxed stax macOS app uses this shared unix socket, so the
+/// default group must match the app's signed app-group entitlement.
+const DEFAULT_APP_GROUP: &str = "B2N6FSRTPV.eu.bearcove.stax";
 
 fn resolve_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("STAX_SERVER_SOCKET") {
@@ -260,10 +258,11 @@ fn resolve_socket_path() -> PathBuf {
 #[cfg(target_os = "macos")]
 fn group_container_socket() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
+    let app_group = std::env::var("STAX_APP_GROUP").unwrap_or_else(|_| DEFAULT_APP_GROUP.into());
     let dir = PathBuf::from(home)
         .join("Library")
         .join("Group Containers")
-        .join(APP_GROUP);
+        .join(app_group);
     // The container is a regular directory under the user's home;
     // the app-group entitlement merely *grants access* to sandboxed
     // peers. Non-sandboxed processes (us) can mkdir it freely.
