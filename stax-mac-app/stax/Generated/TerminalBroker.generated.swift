@@ -80,6 +80,10 @@ public final class TerminalBrokerClient: TerminalBrokerCaller, Sendable {
     }
 }
 
+extension TerminalBrokerClient: ExpectedRootClient {
+    public static let voxServiceName = "TerminalBroker"
+}
+
 // MARK: - TerminalBroker Schemas
 
 /// Global schema registry containing all schemas for this service.

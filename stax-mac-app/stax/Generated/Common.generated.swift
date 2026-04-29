@@ -501,6 +501,36 @@ public struct ProbeDiffThread: Codable, Sendable {
     }
 }
 
+public struct ProbeTimingBreakdown: Codable, Sendable {
+    public var kperfToEnqueueNs: UInt64
+    public var queueWaitNs: UInt64
+    public var lookupNs: UInt64
+    public var suspendStateNs: UInt64
+    public var resumeNs: UInt64
+    public var walkNs: UInt64
+    public var probeTotalNs: UInt64
+
+    nonisolated public init(kperfToEnqueueNs: UInt64, queueWaitNs: UInt64, lookupNs: UInt64, suspendStateNs: UInt64, resumeNs: UInt64, walkNs: UInt64, probeTotalNs: UInt64) {
+        self.kperfToEnqueueNs = kperfToEnqueueNs
+        self.queueWaitNs = queueWaitNs
+        self.lookupNs = lookupNs
+        self.suspendStateNs = suspendStateNs
+        self.resumeNs = resumeNs
+        self.walkNs = walkNs
+        self.probeTotalNs = probeTotalNs
+    }
+}
+
+public struct ProbeQueueStats: Codable, Sendable {
+    public var coalescedRequests: UInt64
+    public var workerBatchLen: UInt32
+
+    nonisolated public init(coalescedRequests: UInt64, workerBatchLen: UInt32) {
+        self.coalescedRequests = coalescedRequests
+        self.workerBatchLen = workerBatchLen
+    }
+}
+
 public struct ResolvedFrame: Codable, Sendable {
     public var address: UInt64
     public var display: String
@@ -519,15 +549,8 @@ public struct ProbeDiffEntry: Codable, Sendable {
     public var tid: UInt32
     public var timestampNs: UInt64
     public var driftNs: Int64
-    public var kperfToEnqueueNs: UInt64
-    public var queueWaitNs: UInt64
-    public var lookupNs: UInt64
-    public var suspendStateNs: UInt64
-    public var resumeNs: UInt64
-    public var walkNs: UInt64
-    public var probeTotalNs: UInt64
-    public var coalescedRequests: UInt64
-    public var workerBatchLen: UInt32
+    public var timing: ProbeTimingBreakdown
+    public var queue: ProbeQueueStats
     public var kperfStack: [ResolvedFrame]
     public var kperfKernelStack: [ResolvedFrame]
     public var probeStack: [ResolvedFrame]
@@ -537,19 +560,12 @@ public struct ProbeDiffEntry: Codable, Sendable {
     public var stitchable: Bool
     public var usedFramehop: Bool
 
-    nonisolated public init(tid: UInt32, timestampNs: UInt64, driftNs: Int64, kperfToEnqueueNs: UInt64, queueWaitNs: UInt64, lookupNs: UInt64, suspendStateNs: UInt64, resumeNs: UInt64, walkNs: UInt64, probeTotalNs: UInt64, coalescedRequests: UInt64, workerBatchLen: UInt32, kperfStack: [ResolvedFrame], kperfKernelStack: [ResolvedFrame], probeStack: [ResolvedFrame], stitchedStack: [ResolvedFrame], commonSuffix: UInt32, pcMatch: Bool, stitchable: Bool, usedFramehop: Bool) {
+    nonisolated public init(tid: UInt32, timestampNs: UInt64, driftNs: Int64, timing: ProbeTimingBreakdown, queue: ProbeQueueStats, kperfStack: [ResolvedFrame], kperfKernelStack: [ResolvedFrame], probeStack: [ResolvedFrame], stitchedStack: [ResolvedFrame], commonSuffix: UInt32, pcMatch: Bool, stitchable: Bool, usedFramehop: Bool) {
         self.tid = tid
         self.timestampNs = timestampNs
         self.driftNs = driftNs
-        self.kperfToEnqueueNs = kperfToEnqueueNs
-        self.queueWaitNs = queueWaitNs
-        self.lookupNs = lookupNs
-        self.suspendStateNs = suspendStateNs
-        self.resumeNs = resumeNs
-        self.walkNs = walkNs
-        self.probeTotalNs = probeTotalNs
-        self.coalescedRequests = coalescedRequests
-        self.workerBatchLen = workerBatchLen
+        self.timing = timing
+        self.queue = queue
         self.kperfStack = kperfStack
         self.kperfKernelStack = kperfKernelStack
         self.probeStack = probeStack
@@ -854,17 +870,30 @@ public struct WireWakeup: Codable, Sendable {
     }
 }
 
+public struct ProbeTiming: Codable, Sendable {
+    public var kperfTs: UInt64
+    public var enqueued: UInt64
+    public var workerStarted: UInt64
+    public var threadLookupDone: UInt64
+    public var stateDone: UInt64
+    public var resumeDone: UInt64
+    public var walkDone: UInt64
+
+    nonisolated public init(kperfTs: UInt64, enqueued: UInt64, workerStarted: UInt64, threadLookupDone: UInt64, stateDone: UInt64, resumeDone: UInt64, walkDone: UInt64) {
+        self.kperfTs = kperfTs
+        self.enqueued = enqueued
+        self.workerStarted = workerStarted
+        self.threadLookupDone = threadLookupDone
+        self.stateDone = stateDone
+        self.resumeDone = resumeDone
+        self.walkDone = walkDone
+    }
+}
+
 public struct WireProbeResult: Codable, Sendable {
     public var tid: UInt32
-    public var kperfTsNs: UInt64
-    public var probeEnqueuedNs: UInt64
-    public var probeStartedNs: UInt64
-    public var threadLookupDoneNs: UInt64
-    public var probeDoneNs: UInt64
-    public var resumeDoneNs: UInt64
-    public var walkDoneNs: UInt64
-    public var coalescedRequests: UInt64
-    public var workerBatchLen: UInt32
+    public var timing: ProbeTiming
+    public var queue: ProbeQueueStats
     public var machPc: UInt64
     public var machLr: UInt64
     public var machFp: UInt64
@@ -872,17 +901,10 @@ public struct WireProbeResult: Codable, Sendable {
     public var machWalked: [UInt64]
     public var usedFramehop: Bool
 
-    nonisolated public init(tid: UInt32, kperfTsNs: UInt64, probeEnqueuedNs: UInt64, probeStartedNs: UInt64, threadLookupDoneNs: UInt64, probeDoneNs: UInt64, resumeDoneNs: UInt64, walkDoneNs: UInt64, coalescedRequests: UInt64, workerBatchLen: UInt32, machPc: UInt64, machLr: UInt64, machFp: UInt64, machSp: UInt64, machWalked: [UInt64], usedFramehop: Bool) {
+    nonisolated public init(tid: UInt32, timing: ProbeTiming, queue: ProbeQueueStats, machPc: UInt64, machLr: UInt64, machFp: UInt64, machSp: UInt64, machWalked: [UInt64], usedFramehop: Bool) {
         self.tid = tid
-        self.kperfTsNs = kperfTsNs
-        self.probeEnqueuedNs = probeEnqueuedNs
-        self.probeStartedNs = probeStartedNs
-        self.threadLookupDoneNs = threadLookupDoneNs
-        self.probeDoneNs = probeDoneNs
-        self.resumeDoneNs = resumeDoneNs
-        self.walkDoneNs = walkDoneNs
-        self.coalescedRequests = coalescedRequests
-        self.workerBatchLen = workerBatchLen
+        self.timing = timing
+        self.queue = queue
         self.machPc = machPc
         self.machLr = machLr
         self.machFp = machFp
@@ -1190,6 +1212,21 @@ nonisolated internal func encodeProbeDiffThread(_ value: ProbeDiffThread, into b
     encodeOption(value.threadName, into: &buffer, encoder: { val, buf in encodeString(val, into: &buf) })
 }
 
+nonisolated internal func encodeProbeTimingBreakdown(_ value: ProbeTimingBreakdown, into buffer: inout ByteBuffer) {
+    encodeVarint(value.kperfToEnqueueNs, into: &buffer)
+    encodeVarint(value.queueWaitNs, into: &buffer)
+    encodeVarint(value.lookupNs, into: &buffer)
+    encodeVarint(value.suspendStateNs, into: &buffer)
+    encodeVarint(value.resumeNs, into: &buffer)
+    encodeVarint(value.walkNs, into: &buffer)
+    encodeVarint(value.probeTotalNs, into: &buffer)
+}
+
+nonisolated internal func encodeProbeQueueStats(_ value: ProbeQueueStats, into buffer: inout ByteBuffer) {
+    encodeVarint(value.coalescedRequests, into: &buffer)
+    encodeU32(value.workerBatchLen, into: &buffer)
+}
+
 nonisolated internal func encodeResolvedFrame(_ value: ResolvedFrame, into buffer: inout ByteBuffer) {
     encodeVarint(value.address, into: &buffer)
     encodeString(value.display, into: &buffer)
@@ -1201,15 +1238,8 @@ nonisolated internal func encodeProbeDiffEntry(_ value: ProbeDiffEntry, into buf
     encodeU32(value.tid, into: &buffer)
     encodeVarint(value.timestampNs, into: &buffer)
     encodeI64(value.driftNs, into: &buffer)
-    encodeVarint(value.kperfToEnqueueNs, into: &buffer)
-    encodeVarint(value.queueWaitNs, into: &buffer)
-    encodeVarint(value.lookupNs, into: &buffer)
-    encodeVarint(value.suspendStateNs, into: &buffer)
-    encodeVarint(value.resumeNs, into: &buffer)
-    encodeVarint(value.walkNs, into: &buffer)
-    encodeVarint(value.probeTotalNs, into: &buffer)
-    encodeVarint(value.coalescedRequests, into: &buffer)
-    encodeU32(value.workerBatchLen, into: &buffer)
+    encodeProbeTimingBreakdown(value.timing, into: &buffer)
+    encodeProbeQueueStats(value.queue, into: &buffer)
     encodeVec(value.kperfStack, into: &buffer, encoder: { val, buf in encodeResolvedFrame(val, into: &buf) })
     encodeVec(value.kperfKernelStack, into: &buffer, encoder: { val, buf in encodeResolvedFrame(val, into: &buf) })
     encodeVec(value.probeStack, into: &buffer, encoder: { val, buf in encodeResolvedFrame(val, into: &buf) })
@@ -1442,17 +1472,20 @@ nonisolated internal func encodeWireWakeup(_ value: WireWakeup, into buffer: ino
     encodeVec(value.wakerKernelStack, into: &buffer, encoder: { val, buf in encodeVarint(val, into: &buf) })
 }
 
+nonisolated internal func encodeProbeTiming(_ value: ProbeTiming, into buffer: inout ByteBuffer) {
+    encodeVarint(value.kperfTs, into: &buffer)
+    encodeVarint(value.enqueued, into: &buffer)
+    encodeVarint(value.workerStarted, into: &buffer)
+    encodeVarint(value.threadLookupDone, into: &buffer)
+    encodeVarint(value.stateDone, into: &buffer)
+    encodeVarint(value.resumeDone, into: &buffer)
+    encodeVarint(value.walkDone, into: &buffer)
+}
+
 nonisolated internal func encodeWireProbeResult(_ value: WireProbeResult, into buffer: inout ByteBuffer) {
     encodeU32(value.tid, into: &buffer)
-    encodeVarint(value.kperfTsNs, into: &buffer)
-    encodeVarint(value.probeEnqueuedNs, into: &buffer)
-    encodeVarint(value.probeStartedNs, into: &buffer)
-    encodeVarint(value.threadLookupDoneNs, into: &buffer)
-    encodeVarint(value.probeDoneNs, into: &buffer)
-    encodeVarint(value.resumeDoneNs, into: &buffer)
-    encodeVarint(value.walkDoneNs, into: &buffer)
-    encodeVarint(value.coalescedRequests, into: &buffer)
-    encodeU32(value.workerBatchLen, into: &buffer)
+    encodeProbeTiming(value.timing, into: &buffer)
+    encodeProbeQueueStats(value.queue, into: &buffer)
     encodeVarint(value.machPc, into: &buffer)
     encodeVarint(value.machLr, into: &buffer)
     encodeVarint(value.machFp, into: &buffer)
@@ -1833,6 +1866,23 @@ nonisolated internal func decodeProbeDiffThread(from buffer: inout ByteBuffer) t
     return ProbeDiffThread(tid: _tid, paired: _paired, pcMatch: _pcMatch, stitchable: _stitchable, avgCommonSuffix: _avgCommonSuffix, threadName: _threadName)
 }
 
+nonisolated internal func decodeProbeTimingBreakdown(from buffer: inout ByteBuffer) throws -> ProbeTimingBreakdown {
+    let _kperfToEnqueueNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _queueWaitNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _lookupNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _suspendStateNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _resumeNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _walkNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _probeTotalNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    return ProbeTimingBreakdown(kperfToEnqueueNs: _kperfToEnqueueNs, queueWaitNs: _queueWaitNs, lookupNs: _lookupNs, suspendStateNs: _suspendStateNs, resumeNs: _resumeNs, walkNs: _walkNs, probeTotalNs: _probeTotalNs)
+}
+
+nonisolated internal func decodeProbeQueueStats(from buffer: inout ByteBuffer) throws -> ProbeQueueStats {
+    let _coalescedRequests = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _workerBatchLen = try ({ buf in try decodeU32(from: &buf) })(&buffer)
+    return ProbeQueueStats(coalescedRequests: _coalescedRequests, workerBatchLen: _workerBatchLen)
+}
+
 nonisolated internal func decodeResolvedFrame(from buffer: inout ByteBuffer) throws -> ResolvedFrame {
     let _address = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _display = try ({ buf in try decodeString(from: &buf) })(&buffer)
@@ -1845,15 +1895,8 @@ nonisolated internal func decodeProbeDiffEntry(from buffer: inout ByteBuffer) th
     let _tid = try ({ buf in try decodeU32(from: &buf) })(&buffer)
     let _timestampNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _driftNs = try ({ buf in try decodeI64(from: &buf) })(&buffer)
-    let _kperfToEnqueueNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _queueWaitNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _lookupNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _suspendStateNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _resumeNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _walkNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _probeTotalNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _coalescedRequests = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _workerBatchLen = try ({ buf in try decodeU32(from: &buf) })(&buffer)
+    let _timing = try ({ buf in try decodeProbeTimingBreakdown(from: &buf) })(&buffer)
+    let _queue = try ({ buf in try decodeProbeQueueStats(from: &buf) })(&buffer)
     let _kperfStack = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeResolvedFrame(from: &buf) }) })(&buffer)
     let _kperfKernelStack = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeResolvedFrame(from: &buf) }) })(&buffer)
     let _probeStack = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeResolvedFrame(from: &buf) }) })(&buffer)
@@ -1862,7 +1905,7 @@ nonisolated internal func decodeProbeDiffEntry(from buffer: inout ByteBuffer) th
     let _pcMatch = try ({ buf in try decodeBool(from: &buf) })(&buffer)
     let _stitchable = try ({ buf in try decodeBool(from: &buf) })(&buffer)
     let _usedFramehop = try ({ buf in try decodeBool(from: &buf) })(&buffer)
-    return ProbeDiffEntry(tid: _tid, timestampNs: _timestampNs, driftNs: _driftNs, kperfToEnqueueNs: _kperfToEnqueueNs, queueWaitNs: _queueWaitNs, lookupNs: _lookupNs, suspendStateNs: _suspendStateNs, resumeNs: _resumeNs, walkNs: _walkNs, probeTotalNs: _probeTotalNs, coalescedRequests: _coalescedRequests, workerBatchLen: _workerBatchLen, kperfStack: _kperfStack, kperfKernelStack: _kperfKernelStack, probeStack: _probeStack, stitchedStack: _stitchedStack, commonSuffix: _commonSuffix, pcMatch: _pcMatch, stitchable: _stitchable, usedFramehop: _usedFramehop)
+    return ProbeDiffEntry(tid: _tid, timestampNs: _timestampNs, driftNs: _driftNs, timing: _timing, queue: _queue, kperfStack: _kperfStack, kperfKernelStack: _kperfKernelStack, probeStack: _probeStack, stitchedStack: _stitchedStack, commonSuffix: _commonSuffix, pcMatch: _pcMatch, stitchable: _stitchable, usedFramehop: _usedFramehop)
 }
 
 nonisolated internal func decodeProbeDiffUpdate(from buffer: inout ByteBuffer) throws -> ProbeDiffUpdate {
@@ -2137,24 +2180,28 @@ nonisolated internal func decodeWireWakeup(from buffer: inout ByteBuffer) throws
     return WireWakeup(timestampNs: _timestampNs, wakerTid: _wakerTid, wakeeTid: _wakeeTid, wakerUserStack: _wakerUserStack, wakerKernelStack: _wakerKernelStack)
 }
 
+nonisolated internal func decodeProbeTiming(from buffer: inout ByteBuffer) throws -> ProbeTiming {
+    let _kperfTs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _enqueued = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _workerStarted = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _threadLookupDone = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _stateDone = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _resumeDone = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _walkDone = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    return ProbeTiming(kperfTs: _kperfTs, enqueued: _enqueued, workerStarted: _workerStarted, threadLookupDone: _threadLookupDone, stateDone: _stateDone, resumeDone: _resumeDone, walkDone: _walkDone)
+}
+
 nonisolated internal func decodeWireProbeResult(from buffer: inout ByteBuffer) throws -> WireProbeResult {
     let _tid = try ({ buf in try decodeU32(from: &buf) })(&buffer)
-    let _kperfTsNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _probeEnqueuedNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _probeStartedNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _threadLookupDoneNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _probeDoneNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _resumeDoneNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _walkDoneNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _coalescedRequests = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _workerBatchLen = try ({ buf in try decodeU32(from: &buf) })(&buffer)
+    let _timing = try ({ buf in try decodeProbeTiming(from: &buf) })(&buffer)
+    let _queue = try ({ buf in try decodeProbeQueueStats(from: &buf) })(&buffer)
     let _machPc = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _machLr = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _machFp = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _machSp = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _machWalked = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeVarint(from: &buf) }) })(&buffer)
     let _usedFramehop = try ({ buf in try decodeBool(from: &buf) })(&buffer)
-    return WireProbeResult(tid: _tid, kperfTsNs: _kperfTsNs, probeEnqueuedNs: _probeEnqueuedNs, probeStartedNs: _probeStartedNs, threadLookupDoneNs: _threadLookupDoneNs, probeDoneNs: _probeDoneNs, resumeDoneNs: _resumeDoneNs, walkDoneNs: _walkDoneNs, coalescedRequests: _coalescedRequests, workerBatchLen: _workerBatchLen, machPc: _machPc, machLr: _machLr, machFp: _machFp, machSp: _machSp, machWalked: _machWalked, usedFramehop: _usedFramehop)
+    return WireProbeResult(tid: _tid, timing: _timing, queue: _queue, machPc: _machPc, machLr: _machLr, machFp: _machFp, machSp: _machSp, machWalked: _machWalked, usedFramehop: _usedFramehop)
 }
 
 nonisolated internal func decodeIngestEvent(from buffer: inout ByteBuffer) throws -> IngestEvent {

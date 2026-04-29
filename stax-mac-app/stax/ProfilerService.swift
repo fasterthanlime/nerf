@@ -30,6 +30,7 @@ final class ProfilerService {
             let connector = UnixConnector(path: path)
             let session = try await Session.initiator(
                 connector,
+                expecting: ProfilerClient.self,
                 dispatcher: NoopDispatcher(),
                 resumable: false
             )

@@ -300,6 +300,10 @@ public final class RunControlClient: RunControlCaller, Sendable {
     }
 }
 
+extension RunControlClient: ExpectedRootClient {
+    public static let voxServiceName = "RunControl"
+}
+
 // MARK: - RunControl Schemas
 
 /// Global schema registry containing all schemas for this service.
