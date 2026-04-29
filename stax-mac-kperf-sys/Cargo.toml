@@ -11,6 +11,7 @@ description = "Privileged-side macOS kperf/kdebug/kpc bindings for stax. Wraps A
 # - Apple's kperf/kperfdata private frameworks (loaded at runtime via dlopen).
 
 [target.'cfg(target_os = "macos")'.dependencies]
+facet = "0.46"
 libc = "0.2"
 log = "0.4"
 thiserror = "2"

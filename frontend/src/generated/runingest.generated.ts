@@ -114,6 +114,10 @@ export type IngestEvent =
   | { tag: 'Wakeup'; value: WireWakeup }
   | { tag: 'ProbeResult'; value: WireProbeResult };
 
+export interface IngestBatch {
+  events: IngestEvent[];
+}
+
 export interface RunId {
   0: bigint;
 }
@@ -126,13 +130,13 @@ export type RunIngestError =
 // Request/Response type aliases
 export type StartRunRequest = [
   RunConfig, // config
-  Rx<IngestEvent>, // events
+  Rx<IngestBatch>, // events
 ];
 export type StartRunResponse = { ok: true; value: RunId } | { ok: false; error: RunIngestError };
 
 export type AttachRunRequest = [
   RunId, // run_id
-  Rx<IngestEvent>, // events
+  Rx<IngestBatch>, // events
 ];
 export type AttachRunResponse = { ok: true; value: void } | { ok: false; error: RunIngestError };
 
@@ -164,14 +168,14 @@ export interface RunIngestCaller {
    * — callers should `RunControl::wait_active` or `stop_active`
    * before retrying.
    */
-  startRun(config: RunConfig, events: Rx<IngestEvent>): Promise<{ ok: true; value: RunId } | { ok: false; error: RunIngestError }>;
+  startRun(config: RunConfig, events: Rx<IngestBatch>): Promise<{ ok: true; value: RunId } | { ok: false; error: RunIngestError }>;
   /**
    * Attach an ingest channel to a run that was already created by
    * `RunControl::start_attach` / `start_launch`. This is the
    * server-orchestrated path: the server owns lifecycle and shade
    * owns recording + ingest.
    */
-  attachRun(runId: RunId, events: Rx<IngestEvent>): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }>;
+  attachRun(runId: RunId, events: Rx<IngestBatch>): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }>;
   /**
    * Reliable, request/response target attachment notification.
    * Channel sends are not a durability boundary; this method
@@ -208,7 +212,7 @@ export class RunIngestClient implements RunIngestCaller {
    * — callers should `RunControl::wait_active` or `stop_active`
    * before retrying.
    */
-  async startRun(config: RunConfig, events: Rx<IngestEvent>): Promise<{ ok: true; value: RunId } | { ok: false; error: RunIngestError }> {
+  async startRun(config: RunConfig, events: Rx<IngestBatch>): Promise<{ ok: true; value: RunId } | { ok: false; error: RunIngestError }> {
     const descriptor = runIngest_startRun_method;
     const sendSchemas = runIngest_descriptor.send_schemas;
     const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
@@ -247,7 +251,7 @@ export class RunIngestClient implements RunIngestCaller {
    * server-orchestrated path: the server owns lifecycle and shade
    * owns recording + ingest.
    */
-  async attachRun(runId: RunId, events: Rx<IngestEvent>): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }> {
+  async attachRun(runId: RunId, events: Rx<IngestBatch>): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }> {
     const descriptor = runIngest_attachRun_method;
     const sendSchemas = runIngest_descriptor.send_schemas;
     const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
@@ -370,8 +374,8 @@ export async function connectRunIngest(
 
 // Handler interface for RunIngest
 export interface RunIngestHandler {
-  startRun(config: RunConfig, events: Rx<IngestEvent>): Promise<{ ok: true; value: RunId } | { ok: false; error: RunIngestError }> | { ok: true; value: RunId } | { ok: false; error: RunIngestError };
-  attachRun(runId: RunId, events: Rx<IngestEvent>): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }> | { ok: true; value: void } | { ok: false; error: RunIngestError };
+  startRun(config: RunConfig, events: Rx<IngestBatch>): Promise<{ ok: true; value: RunId } | { ok: false; error: RunIngestError }> | { ok: true; value: RunId } | { ok: false; error: RunIngestError };
+  attachRun(runId: RunId, events: Rx<IngestBatch>): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }> | { ok: true; value: void } | { ok: false; error: RunIngestError };
   publishTargetAttached(runId: RunId, pid: number, taskPort: bigint): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }> | { ok: true; value: void } | { ok: false; error: RunIngestError };
   publishBinariesLoaded(runId: RunId, binaries: WireBinaryLoaded[]): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }> | { ok: true; value: void } | { ok: false; error: RunIngestError };
   publishBinariesUnloaded(runId: RunId, binaries: WireBinaryUnloaded[]): Promise<{ ok: true; value: void } | { ok: false; error: RunIngestError }> | { ok: true; value: void } | { ok: false; error: RunIngestError };
@@ -392,14 +396,14 @@ export class RunIngestDispatcher implements Dispatcher {
   async dispatch(_context: RequestContext, method: MethodDescriptor, args: unknown[], call: VoxCall): Promise<void> {
     if (method.id === 0xd593e77239d1f5c4n) {
       try {
-        const result = await this.handler.startRun(args[0] as RunConfig, args[1] as Rx<IngestEvent>);
+        const result = await this.handler.startRun(args[0] as RunConfig, args[1] as Rx<IngestBatch>);
         if (result.ok) call.reply(result.value); else call.replyErr(result.error);
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
       }
     } else if (method.id === 0xf3bae555f41cb749n) {
       try {
-        const result = await this.handler.attachRun(args[0] as RunId, args[1] as Rx<IngestEvent>);
+        const result = await this.handler.attachRun(args[0] as RunId, args[1] as Rx<IngestBatch>);
         if (result.ok) call.reply(result.value); else call.replyErr(result.error);
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
@@ -455,6 +459,7 @@ export const runIngest_send_schemas: import("@bearcove/vox-core").ServiceSendSch
     [0x34ae3055219d9613n, { id: 0x34ae3055219d9613n, type_params: [], kind: { tag: 'struct', name: 'ProbeQueueStats', fields: [{ name: 'coalesced_requests', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'worker_batch_len', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }] } }],
     [0xc2b382e63239944en, { id: 0xc2b382e63239944en, type_params: [], kind: { tag: 'struct', name: 'WireProbeResult', fields: [{ name: 'tid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'timing', type_ref: { tag: 'concrete', type_id: 0x1d80ded9f9c01f23n, args: [] }, required: true }, { name: 'queue', type_ref: { tag: 'concrete', type_id: 0x34ae3055219d9613n, args: [] }, required: true }, { name: 'mach_pc', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'mach_lr', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'mach_fp', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'mach_sp', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'mach_walked', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }] }, required: true }, { name: 'used_framehop', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }] } }],
     [0xbe38cdcd73121ca8n, { id: 0xbe38cdcd73121ca8n, type_params: [], kind: { tag: 'enum', name: 'IngestEvent', variants: [{ name: 'TargetAttached', index: 0, payload: { tag: 'struct', fields: [{ name: 'pid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'task_port', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }, { name: 'Sample', index: 1, payload: { tag: 'newtype', type_ref: { tag: 'concrete', type_id: 0x3cdfc405976d47d7n, args: [] } } }, { name: 'OnCpuInterval', index: 2, payload: { tag: 'newtype', type_ref: { tag: 'concrete', type_id: 0x64ceb9aa31fcf27bn, args: [] } } }, { name: 'OffCpuInterval', index: 3, payload: { tag: 'newtype', type_ref: { tag: 'concrete', type_id: 0x89d6e0da19957f03n, args: [] } } }, { name: 'BinaryLoaded', index: 4, payload: { tag: 'newtype', type_ref: { tag: 'concrete', type_id: 0x2be434e8c106fbccn, args: [] } } }, { name: 'BinaryUnloaded', index: 5, payload: { tag: 'newtype', type_ref: { tag: 'concrete', type_id: 0x2ddb871534582ed3n, args: [] } } }, { name: 'ThreadName', index: 6, payload: { tag: 'struct', fields: [{ name: 'pid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'tid', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }, { name: 'Wakeup', index: 7, payload: { tag: 'newtype', type_ref: { tag: 'concrete', type_id: 0xae54aaf655597171n, args: [] } } }, { name: 'ProbeResult', index: 8, payload: { tag: 'newtype', type_ref: { tag: 'concrete', type_id: 0xc2b382e63239944en, args: [] } } }] } }],
+    [0xdb87fac9380465c3n, { id: 0xdb87fac9380465c3n, type_params: [], kind: { tag: 'struct', name: 'IngestBatch', fields: [{ name: 'events', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xbe38cdcd73121ca8n, args: [] }] }, required: true }] } }],
     [0x967a48ac345e2f5en, { id: 0x967a48ac345e2f5en, type_params: ['T'], kind: { tag: 'channel', direction: 'rx', element: { tag: 'var', name: 'T' } } }],
     [0xba0496aa8cee7a4cn, { id: 0xba0496aa8cee7a4cn, type_params: ['T0', 'T1'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }] } }],
     [0xde69b13dbe16811bn, { id: 0xde69b13dbe16811bn, type_params: [], kind: { tag: 'tuple', elements: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }] } }],
@@ -466,8 +471,8 @@ export const runIngest_send_schemas: import("@bearcove/vox-core").ServiceSendSch
     [0x8506626f18d17a37n, { id: 0x8506626f18d17a37n, type_params: [], kind: { tag: 'struct', name: 'WireBinaryLoaded', fields: [{ name: 'path', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'base_avma', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'vmsize', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'text_svma', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'arch', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'is_executable', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'symbols', type_ref: { tag: 'concrete', type_id: 0xba8125876d6388b4n, args: [{ tag: 'concrete', type_id: 0xedc6991c01cb1b8cn, args: [] }] }, required: true }, { name: 'text_bytes', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xba8125876d6388b4n, args: [{ tag: 'concrete', type_id: 0x2c8d54f2314d0f20n, args: [] }] }] }, required: true }] } }],
   ]),
   methods: new Map<bigint, import("@bearcove/vox-core").MethodSendSchemas>([
-    [0xd593e77239d1f5c4n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x9c002a4450cb58dcn, args: [] }, { tag: 'concrete', type_id: 0x967a48ac345e2f5en, args: [{ tag: 'concrete', type_id: 0xbe38cdcd73121ca8n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xbbbcde238818d295n, args: [] }] }] } }],
-    [0xf3bae555f41cb749n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0x967a48ac345e2f5en, args: [{ tag: 'concrete', type_id: 0xbe38cdcd73121ca8n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xbbbcde238818d295n, args: [] }] }] } }],
+    [0xd593e77239d1f5c4n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x9c002a4450cb58dcn, args: [] }, { tag: 'concrete', type_id: 0x967a48ac345e2f5en, args: [{ tag: 'concrete', type_id: 0xdb87fac9380465c3n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xbbbcde238818d295n, args: [] }] }] } }],
+    [0xf3bae555f41cb749n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0x967a48ac345e2f5en, args: [{ tag: 'concrete', type_id: 0xdb87fac9380465c3n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xbbbcde238818d295n, args: [] }] }] } }],
     [0x410c94d0e9cd8b99n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xbbbcde238818d295n, args: [] }] }] } }],
     [0x8f1693afe2b812a8n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0xba8125876d6388b4n, args: [{ tag: 'concrete', type_id: 0x8506626f18d17a37n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xbbbcde238818d295n, args: [] }] }] } }],
     [0xa875ea4be0f4551dn, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xde69b13dbe16811bn, args: [] }, { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x2ddb871534582ed3n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0xbbbcde238818d295n, args: [] }] }] } }],

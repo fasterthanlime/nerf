@@ -17,20 +17,20 @@ public enum RunIngestMethodId {
 
 // MARK: - RunIngest Client
 
-///  Recorder → server ingest plane. Open one channel per run; close
-///  the channel to signal end-of-recording.
+///  Recorder → server ingest plane. Open one batch channel per run;
+///  close the channel to signal end-of-recording.
 public protocol RunIngestCaller {
     ///  Open a new run. Returns the assigned `RunId` and consumes the
     ///  `events` channel; the server treats channel-close as
     ///  end-of-recording. Errors if another run is currently active
     ///  — callers should `RunControl::wait_active` or `stop_active`
     ///  before retrying.
-    func startRun(config: RunConfig, events: UnboundRx<IngestEvent>) async throws -> Result<RunId, RunIngestError>
+    func startRun(config: RunConfig, events: UnboundRx<IngestBatch>) async throws -> Result<RunId, RunIngestError>
     ///  Attach an ingest channel to a run that was already created by
     ///  `RunControl::start_attach` / `start_launch`. This is the
     ///  server-orchestrated path: the server owns lifecycle and shade
     ///  owns recording + ingest.
-    func attachRun(runId: RunId, events: UnboundRx<IngestEvent>) async throws -> Result<Void, RunIngestError>
+    func attachRun(runId: RunId, events: UnboundRx<IngestBatch>) async throws -> Result<Void, RunIngestError>
     ///  Reliable, request/response target attachment notification.
     ///  Channel sends are not a durability boundary; this method
     ///  returns only after stax-server has applied the target state.
@@ -55,7 +55,7 @@ public final class RunIngestClient: RunIngestCaller, Sendable {
         self.timeout = timeout
     }
 
-    public func startRun(config: RunConfig, events: UnboundRx<IngestEvent>) async throws -> Result<RunId, RunIngestError> {
+    public func startRun(config: RunConfig, events: UnboundRx<IngestBatch>) async throws -> Result<RunId, RunIngestError> {
         let schemaInfo = ClientSchemaInfo(methodInfo: runIngest_method_schemas[0xd593e77239d1f5c4]!, schemaRegistry: runIngest_schema_registry)
         let prepareRetry: @Sendable () async -> PreparedRetryRequest = { [connection] in
             await bindChannels(
@@ -102,7 +102,7 @@ public final class RunIngestClient: RunIngestCaller, Sendable {
             })
     }
 
-    public func attachRun(runId: RunId, events: UnboundRx<IngestEvent>) async throws -> Result<Void, RunIngestError> {
+    public func attachRun(runId: RunId, events: UnboundRx<IngestBatch>) async throws -> Result<Void, RunIngestError> {
         let schemaInfo = ClientSchemaInfo(methodInfo: runIngest_method_schemas[0xf3bae555f41cb749]!, schemaRegistry: runIngest_schema_registry)
         let prepareRetry: @Sendable () async -> PreparedRetryRequest = { [connection] in
             await bindChannels(
@@ -282,6 +282,7 @@ nonisolated(unsafe) public let runIngest_schema_registry: [UInt64: Schema] = [
     0xbe38cdcd73121ca8: Schema(id: 0xbe38cdcd73121ca8, typeParams: [], kind: .enum(name: "IngestEvent", variants: [VariantSchema(name: "TargetAttached", index: 0, payload: .struct(fields: [FieldSchema(name: "pid", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "task_port", typeRef: .concrete(0xd9356298b81639ac), required: true)])), VariantSchema(name: "Sample", index: 1, payload: .newtype(typeRef: .concrete(0x3cdfc405976d47d7))), VariantSchema(name: "OnCpuInterval", index: 2, payload: .newtype(typeRef: .concrete(0x64ceb9aa31fcf27b))), VariantSchema(name: "OffCpuInterval", index: 3, payload: .newtype(typeRef: .concrete(0x89d6e0da19957f03))), VariantSchema(name: "BinaryLoaded", index: 4, payload: .newtype(typeRef: .concrete(0x2be434e8c106fbcc))), VariantSchema(name: "BinaryUnloaded", index: 5, payload: .newtype(typeRef: .concrete(0x2ddb871534582ed3))), VariantSchema(name: "ThreadName", index: 6, payload: .struct(fields: [FieldSchema(name: "pid", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "tid", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "name", typeRef: .concrete(0x6d7dce914ee150e8), required: true)])), VariantSchema(name: "Wakeup", index: 7, payload: .newtype(typeRef: .concrete(0xae54aaf655597171))), VariantSchema(name: "ProbeResult", index: 8, payload: .newtype(typeRef: .concrete(0xc2b382e63239944e)))])),
     0xc2b382e63239944e: Schema(id: 0xc2b382e63239944e, typeParams: [], kind: .struct(name: "WireProbeResult", fields: [FieldSchema(name: "tid", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "timing", typeRef: .concrete(0x1d80ded9f9c01f23), required: true), FieldSchema(name: "queue", typeRef: .concrete(0x34ae3055219d9613), required: true), FieldSchema(name: "mach_pc", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "mach_lr", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "mach_fp", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "mach_sp", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "mach_walked", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xd9356298b81639ac)]), required: true), FieldSchema(name: "used_framehop", typeRef: .concrete(0x178367a87f66fb46), required: true)])),
     0xd9356298b81639ac: Schema(id: 0xd9356298b81639ac, typeParams: [], kind: .primitive(.u64)),
+    0xdb87fac9380465c3: Schema(id: 0xdb87fac9380465c3, typeParams: [], kind: .struct(name: "IngestBatch", fields: [FieldSchema(name: "events", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xbe38cdcd73121ca8)]), required: true)])),
     0xdcafd4de6b7969bb: Schema(id: 0xdcafd4de6b7969bb, typeParams: ["T"], kind: .option(element: .var(name: "T"))),
     0xde69b13dbe16811b: Schema(id: 0xde69b13dbe16811b, typeParams: [], kind: .tuple(elements: [.concrete(0xd9356298b81639ac)])),
     0xedc6991c01cb1b8c: Schema(id: 0xedc6991c01cb1b8c, typeParams: [], kind: .struct(name: "WireMachOSymbol", fields: [FieldSchema(name: "start_svma", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "end_svma", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "name", typeRef: .concrete(0xba8125876d6388b4), required: true)])),
@@ -290,14 +291,14 @@ nonisolated(unsafe) public let runIngest_schema_registry: [UInt64: Schema] = [
 /// Per-method schema information for wire protocol.
 nonisolated(unsafe) public let runIngest_method_schemas: [UInt64: MethodSchemaInfo] = [
     0xd593e77239d1f5c4: MethodSchemaInfo(
-        argsSchemaIds: [0x6d7dce914ee150e8, 0x281c5be4f2ee63b4, 0x178367a87f66fb46, 0x9c002a4450cb58dc, 0xd9356298b81639ac, 0x0a96b404b4d79d67, 0x3cdfc405976d47d7, 0x64ceb9aa31fcf27b, 0xdcafd4de6b7969bb, 0x89d6e0da19957f03, 0x2c8d54f2314d0f20, 0x3f1203897762d214, 0x2be434e8c106fbcc, 0x2ddb871534582ed3, 0xae54aaf655597171, 0x1d80ded9f9c01f23, 0x34ae3055219d9613, 0xc2b382e63239944e, 0xbe38cdcd73121ca8, 0x967a48ac345e2f5e, 0xba0496aa8cee7a4c],
-        argsRoot: .generic(0xba0496aa8cee7a4c, args: [.concrete(0x9c002a4450cb58dc), .generic(0x967a48ac345e2f5e, args: [.concrete(0xbe38cdcd73121ca8)])]),
+        argsSchemaIds: [0x6d7dce914ee150e8, 0x281c5be4f2ee63b4, 0x178367a87f66fb46, 0x9c002a4450cb58dc, 0xd9356298b81639ac, 0x0a96b404b4d79d67, 0x3cdfc405976d47d7, 0x64ceb9aa31fcf27b, 0xdcafd4de6b7969bb, 0x89d6e0da19957f03, 0x2c8d54f2314d0f20, 0x3f1203897762d214, 0x2be434e8c106fbcc, 0x2ddb871534582ed3, 0xae54aaf655597171, 0x1d80ded9f9c01f23, 0x34ae3055219d9613, 0xc2b382e63239944e, 0xbe38cdcd73121ca8, 0xdb87fac9380465c3, 0x967a48ac345e2f5e, 0xba0496aa8cee7a4c],
+        argsRoot: .generic(0xba0496aa8cee7a4c, args: [.concrete(0x9c002a4450cb58dc), .generic(0x967a48ac345e2f5e, args: [.concrete(0xdb87fac9380465c3)])]),
         responseSchemaIds: [0x178367a87f66fb46, 0x281c5be4f2ee63b4, 0x42046de663beeef0, 0x5db70a394660f3e6, 0x6d7dce914ee150e8, 0x4cf4b2aeb98a1939, 0xd9356298b81639ac, 0xde69b13dbe16811b, 0xbbbcde238818d295],
         responseRoot: .generic(0x42046de663beeef0, args: [.concrete(0xde69b13dbe16811b), .generic(0x4cf4b2aeb98a1939, args: [.concrete(0xbbbcde238818d295)])])
     ),
     0xf3bae555f41cb749: MethodSchemaInfo(
-        argsSchemaIds: [0xd9356298b81639ac, 0xde69b13dbe16811b, 0x281c5be4f2ee63b4, 0x0a96b404b4d79d67, 0x3cdfc405976d47d7, 0x64ceb9aa31fcf27b, 0xdcafd4de6b7969bb, 0x89d6e0da19957f03, 0x6d7dce914ee150e8, 0x178367a87f66fb46, 0x2c8d54f2314d0f20, 0x3f1203897762d214, 0x2be434e8c106fbcc, 0x2ddb871534582ed3, 0xae54aaf655597171, 0x1d80ded9f9c01f23, 0x34ae3055219d9613, 0xc2b382e63239944e, 0xbe38cdcd73121ca8, 0x967a48ac345e2f5e, 0xba0496aa8cee7a4c],
-        argsRoot: .generic(0xba0496aa8cee7a4c, args: [.concrete(0xde69b13dbe16811b), .generic(0x967a48ac345e2f5e, args: [.concrete(0xbe38cdcd73121ca8)])]),
+        argsSchemaIds: [0xd9356298b81639ac, 0xde69b13dbe16811b, 0x281c5be4f2ee63b4, 0x0a96b404b4d79d67, 0x3cdfc405976d47d7, 0x64ceb9aa31fcf27b, 0xdcafd4de6b7969bb, 0x89d6e0da19957f03, 0x6d7dce914ee150e8, 0x178367a87f66fb46, 0x2c8d54f2314d0f20, 0x3f1203897762d214, 0x2be434e8c106fbcc, 0x2ddb871534582ed3, 0xae54aaf655597171, 0x1d80ded9f9c01f23, 0x34ae3055219d9613, 0xc2b382e63239944e, 0xbe38cdcd73121ca8, 0xdb87fac9380465c3, 0x967a48ac345e2f5e, 0xba0496aa8cee7a4c],
+        argsRoot: .generic(0xba0496aa8cee7a4c, args: [.concrete(0xde69b13dbe16811b), .generic(0x967a48ac345e2f5e, args: [.concrete(0xdb87fac9380465c3)])]),
         responseSchemaIds: [0x178367a87f66fb46, 0x281c5be4f2ee63b4, 0x42046de663beeef0, 0x5db70a394660f3e6, 0x6d7dce914ee150e8, 0x4cf4b2aeb98a1939, 0xbc5c33249a2dc720, 0xd9356298b81639ac, 0xde69b13dbe16811b, 0xbbbcde238818d295],
         responseRoot: .generic(0x42046de663beeef0, args: [.concrete(0xbc5c33249a2dc720), .generic(0x4cf4b2aeb98a1939, args: [.concrete(0xbbbcde238818d295)])])
     ),

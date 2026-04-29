@@ -1,7 +1,7 @@
 //! Wire schema for the staxd RPC.
 //!
 //! The deliberate design choice: this protocol carries kdebug records
-//! verbatim. `KdBufWire` is field-for-field identical to xnu's
+//! verbatim. `KdBuf` is our stable Rust representation of xnu's
 //! `kd_buf`, and `SessionConfig` is just the parameters our recorder
 //! already passes to kperf. Everything that turns those records into
 //! `Sample`s, attributes off-CPU intervals, builds the flamegraph,
@@ -19,6 +19,7 @@
 //! standalone CLI mode).
 
 use facet::Facet;
+use stax_mac_kperf_sys::kdebug::KdBuf;
 
 /// Parameters for a recording session, the bare minimum the daemon
 /// needs to set up kperf + kdebug + kpc on behalf of the client.
@@ -54,31 +55,13 @@ pub struct SessionConfig {
     pub filter_range_value2: u32,
 }
 
-/// Wire-format mirror of xnu's `kd_buf`. Layout matches LP64 exactly
-/// so the daemon can drain `KERN_KDREADTR` straight into a
-/// `Vec<KdBufWire>` and the client can re-cast it into the in-memory
-/// `KdBuf` consumed by the parser.
-#[derive(Clone, Copy, Debug, Facet)]
-pub struct KdBufWire {
-    pub timestamp: u64,
-    pub arg1: u64,
-    pub arg2: u64,
-    pub arg3: u64,
-    pub arg4: u64,
-    /// Carries the current thread id in samples emitted by kperf.
-    pub arg5: u64,
-    pub debugid: u32,
-    pub cpuid: u32,
-    pub unused: u64,
-}
-
 /// One drain pass — what the daemon's `KERN_KDREADTR` loop produces
 /// per cycle, batched so we don't ship a vox message per record.
-/// `Vec<KdBufWire>` rather than a sequence of single records because
-/// the parser expects ordered runs to find sample boundaries.
+/// `Vec<KdBuf>` rather than a sequence of single records because the
+/// parser expects ordered runs to find sample boundaries.
 #[derive(Clone, Debug, Facet)]
 pub struct KdBufBatch {
-    pub records: Vec<KdBufWire>,
+    pub records: Vec<KdBuf>,
     /// mach_absolute_time immediately before the daemon called
     /// KERN_KDREADTR for this batch.
     pub read_started_mach_ticks: u64,

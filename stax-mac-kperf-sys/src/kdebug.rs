@@ -8,6 +8,7 @@
 use std::io;
 use std::mem;
 
+use facet::Facet;
 use libc::{c_int, c_void, sysctl, sysctlbyname};
 
 use crate::error::Error;
@@ -220,7 +221,7 @@ pub mod perf {
 
 /// One kdebug record. Layout matches xnu's `kd_buf` on LP64.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Facet)]
 pub struct KdBuf {
     pub timestamp: u64,
     pub arg1: u64,

@@ -1110,6 +1110,14 @@ public enum IngestEvent: Codable, Sendable {
     case probeResult(WireProbeResult)
 }
 
+public struct IngestBatch: Codable, Sendable {
+    public var events: [IngestEvent]
+
+    nonisolated public init(events: [IngestEvent]) {
+        self.events = events
+    }
+}
+
 public enum RunIngestError: Codable, Sendable, Error {
     case alreadyActive
     case unknownRun(runId: RunId)
@@ -1803,6 +1811,10 @@ nonisolated internal func encodeIngestEvent(_ value: IngestEvent, into buffer: i
         encodeVarint(UInt64(8), into: &buffer)
         encodeWireProbeResult(val, into: &buffer)
     }
+}
+
+nonisolated internal func encodeIngestBatch(_ value: IngestBatch, into buffer: inout ByteBuffer) {
+    encodeVec(value.events, into: &buffer, encoder: { val, buf in encodeIngestEvent(val, into: &buf) })
 }
 
 nonisolated internal func encodeRunIngestError(_ value: RunIngestError, into buffer: inout ByteBuffer) {
@@ -2618,6 +2630,11 @@ nonisolated internal func decodeIngestEvent(from buffer: inout ByteBuffer) throw
         throw VoxError.decodeError("unknown enum variant")
     }
     return result
+}
+
+nonisolated internal func decodeIngestBatch(from buffer: inout ByteBuffer) throws -> IngestBatch {
+    let _events = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeIngestEvent(from: &buf) }) })(&buffer)
+    return IngestBatch(events: _events)
 }
 
 nonisolated internal func decodeRunIngestError(from buffer: inout ByteBuffer) throws -> RunIngestError {

@@ -25,7 +25,7 @@ use stax_mac_kperf_sys::kdebug::{
     self, DBG_FUNC_END, DBG_FUNC_START, DBG_MACH, DBG_MACH_SCHED, DBG_PERF, KDBG_TIMESTAMP_MASK,
     KdBuf, perf,
 };
-use staxd_proto::{KdBufBatch, KdBufWire, SessionConfig, StaxdClient};
+use staxd_proto::{KdBufBatch, SessionConfig, StaxdClient};
 use tracing::{info, warn};
 
 /// User-facing options. Mirrors the shape of
@@ -545,13 +545,20 @@ impl ParserQueue {
         self.counters.clone()
     }
 
-    fn enqueue_records(&self, records: Vec<KdBufWire>) {
+    fn enqueue_records(&self, records: Vec<KdBuf>) {
+        if records.len() <= WORKER_BATCH_CHUNK_RECORDS {
+            self.enqueue_chunk_drop_oldest(WorkerMsg::Batch(OwnedBatch {
+                enqueued_at: Instant::now(),
+                records,
+            }));
+            return;
+        }
+
         for chunk in records.chunks(WORKER_BATCH_CHUNK_RECORDS) {
-            let msg = WorkerMsg::Batch(OwnedBatch {
+            self.enqueue_chunk_drop_oldest(WorkerMsg::Batch(OwnedBatch {
                 enqueued_at: Instant::now(),
                 records: chunk.to_vec(),
-            });
-            self.enqueue_chunk_drop_oldest(msg);
+            }));
         }
     }
 
@@ -617,7 +624,7 @@ fn drop_summary(msg: WorkerMsg) -> ParserDropSummary {
     }
 }
 
-fn count_kperf_samples(records: &[KdBufWire]) -> u64 {
+fn count_kperf_samples(records: &[KdBuf]) -> u64 {
     let mut scanner = KperfProbeTriggerScanner::default();
     let mut count = 0u64;
     for rec in records {
@@ -713,7 +720,7 @@ struct PendingKperfSample {
 }
 
 impl KperfProbeTriggerScanner {
-    fn feed(&mut self, rec: &KdBufWire) -> Option<(u32, u64)> {
+    fn feed(&mut self, rec: &KdBuf) -> Option<(u32, u64)> {
         if kdebug::kdbg_class(rec.debugid) != DBG_PERF {
             return None;
         }
@@ -757,7 +764,7 @@ impl KperfProbeTriggerScanner {
 /// the records out and ships them to the worker via this struct.
 struct OwnedBatch {
     enqueued_at: Instant,
-    records: Vec<KdBufWire>,
+    records: Vec<KdBuf>,
 }
 
 enum WorkerMsg {
@@ -822,7 +829,7 @@ fn worker_thread<S: SampleSink>(
                     break;
                 }
                 counters.update_max_age(batch.enqueued_at.elapsed());
-                let kdbufs: Vec<KdBuf> = batch.records.iter().map(wire_to_kdbuf).collect();
+                let kdbufs = batch.records;
                 if !first_batch_logged {
                     first_batch_logged = true;
                     info!(
@@ -892,20 +899,6 @@ fn worker_thread<S: SampleSink>(
         processed_batches,
         processed_records
     );
-}
-
-fn wire_to_kdbuf(w: &KdBufWire) -> KdBuf {
-    KdBuf {
-        timestamp: w.timestamp,
-        arg1: w.arg1,
-        arg2: w.arg2,
-        arg3: w.arg3,
-        arg4: w.arg4,
-        arg5: w.arg5,
-        debugid: w.debugid,
-        cpuid: w.cpuid,
-        unused: w.unused,
-    }
 }
 
 fn unix_ns_now() -> u64 {

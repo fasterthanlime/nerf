@@ -2188,6 +2188,7 @@ dependencies = [
 name = "stax-mac-kperf-sys"
 version = "0.1.0"
 dependencies = [
+ "facet",
  "libc",
  "log",
  "thiserror",
@@ -2331,6 +2332,7 @@ name = "staxd-proto"
 version = "0.1.0"
 dependencies = [
  "facet",
+ "stax-mac-kperf-sys",
  "vox",
 ]
 

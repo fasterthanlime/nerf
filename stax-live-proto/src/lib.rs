@@ -1128,6 +1128,11 @@ pub enum IngestEvent {
 }
 
 #[derive(Clone, Debug, Facet)]
+pub struct IngestBatch {
+    pub events: Vec<IngestEvent>,
+}
+
+#[derive(Clone, Debug, Facet)]
 pub struct RunConfig {
     /// Free-form label (typically the launch command's basename).
     pub label: String,
@@ -1246,8 +1251,8 @@ impl From<String> for TerminalBrokerError {
     }
 }
 
-/// Recorder → server ingest plane. Open one channel per run; close
-/// the channel to signal end-of-recording.
+/// Recorder → server ingest plane. Open one batch channel per run;
+/// close the channel to signal end-of-recording.
 #[vox::service]
 pub trait RunIngest {
     /// Open a new run. Returns the assigned `RunId` and consumes the
@@ -1258,7 +1263,7 @@ pub trait RunIngest {
     async fn start_run(
         &self,
         config: RunConfig,
-        events: vox::Rx<IngestEvent>,
+        events: vox::Rx<IngestBatch>,
     ) -> Result<RunId, RunIngestError>;
 
     /// Attach an ingest channel to a run that was already created by
@@ -1268,7 +1273,7 @@ pub trait RunIngest {
     async fn attach_run(
         &self,
         run_id: RunId,
-        events: vox::Rx<IngestEvent>,
+        events: vox::Rx<IngestBatch>,
     ) -> Result<(), RunIngestError>;
 
     /// Reliable, request/response target attachment notification.

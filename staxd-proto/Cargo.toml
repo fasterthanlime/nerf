@@ -8,4 +8,5 @@ description = "Schema for the staxd RPC. Tiny crate consumed by both the runtime
 
 [dependencies]
 facet = { version = "0.46", features = ["camino", "reflect"] }
+stax-mac-kperf-sys = { version = "0.1", path = "../stax-mac-kperf-sys" }
 vox = { path = "/Users/amos/bearcove/vox/rust/vox", default-features = false, features = ["runtime"] }

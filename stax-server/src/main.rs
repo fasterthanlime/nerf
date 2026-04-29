@@ -5,7 +5,7 @@
 //! the local socket:
 //!
 //! - `RunControl` — agent-facing lifecycle (status / wait / stop / list).
-//! - `RunIngest` — recorder pushes IngestEvents into the active run.
+//! - `RunIngest` — recorder pushes IngestBatches into the active run.
 //! - `Profiler`  — query the live aggregator (top, flamegraph, annotate, …).
 
 use std::collections::HashMap;
@@ -20,11 +20,11 @@ use stax_live::{
     Aggregator, BinaryRegistry, IntervalKind, LiveServer, LiveSymbolOwned, LoadedBinary, PmuSample,
 };
 use stax_live_proto::{
-    DiagnosticsSnapshot, IngestEvent, LaunchEnvVar, LaunchRequest, ProfilerDispatcher, RunConfig,
-    RunControl, RunControlDispatcher, RunControlError, RunId, RunIngest, RunIngestDispatcher,
-    RunIngestError, RunState, RunSummary, ServerStatus, StopReason, TerminalBroker,
-    TerminalBrokerDispatcher, TerminalBrokerError, TerminalInput, TerminalOutput, WaitCondition,
-    WaitOutcome, WireBinaryLoaded, WireBinaryUnloaded,
+    DiagnosticsSnapshot, IngestBatch, IngestEvent, LaunchEnvVar, LaunchRequest, ProfilerDispatcher,
+    RunConfig, RunControl, RunControlDispatcher, RunControlError, RunId, RunIngest,
+    RunIngestDispatcher, RunIngestError, RunState, RunSummary, ServerStatus, StopReason,
+    TerminalBroker, TerminalBrokerDispatcher, TerminalBrokerError, TerminalInput, TerminalOutput,
+    WaitCondition, WaitOutcome, WireBinaryLoaded, WireBinaryUnloaded,
 };
 use stax_shade_proto::{
     ShadeAck, ShadeCommand, ShadeError, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher,
@@ -363,7 +363,7 @@ impl ServerTelemetry {
 struct Inner {
     active: Option<RunSummary>,
     /// Notify that wakes the active run's drainer task so it drops
-    /// its `Rx<IngestEvent>`. Set when a run starts, cleared by
+    /// its `Rx<IngestBatch>`. Set when a run starts, cleared by
     /// `stop_active` (which then notifies, and by the drainer
     /// itself when its Rx closes naturally).
     cancel: Option<Arc<tokio::sync::Notify>>,
@@ -868,7 +868,7 @@ impl ServerState {
         &self,
         id: RunId,
         cancel: Arc<tokio::sync::Notify>,
-        mut events: vox::Rx<IngestEvent>,
+        mut events: vox::Rx<IngestBatch>,
     ) {
         let state = self.clone();
         let telemetry = self.telemetry.clone();
@@ -894,24 +894,28 @@ impl ServerState {
                         break;
                     }
                     recv = events.recv() => match recv {
-                        Ok(Some(event_sref)) => {
+                        Ok(Some(batch_sref)) => {
                             let state = state.clone();
-                            let _ = event_sref.map(|event| {
-                                let kind = ingest_event_kind(&event);
-                                counts.record(&event);
-                                telemetry.record_ingest_event(&event);
-                                if !first_event_logged {
-                                    first_event_logged = true;
-                                    telemetry.ingest_phase.enter("draining", format!("run_id={} first_kind={kind}", id.0));
-                                    telemetry.registry.event("ingest.first_event", format!("run_id={} kind={kind}", id.0));
-                                    tracing::info!(
-                                        run_id = id.0,
-                                        kind,
-                                        counts = %counts.summary(),
-                                        "stax-server: ingest drainer received first event"
-                                    );
+                            let _ = batch_sref.map(|batch| {
+                                let batch_len = batch.events.len();
+                                for event in batch.events {
+                                    let kind = ingest_event_kind(&event);
+                                    counts.record(&event);
+                                    telemetry.record_ingest_event(&event);
+                                    if !first_event_logged {
+                                        first_event_logged = true;
+                                        telemetry.ingest_phase.enter("draining", format!("run_id={} first_kind={kind}", id.0));
+                                        telemetry.registry.event("ingest.first_event", format!("run_id={} kind={kind}", id.0));
+                                        tracing::info!(
+                                            run_id = id.0,
+                                            kind,
+                                            batch_len,
+                                            counts = %counts.summary(),
+                                            "stax-server: ingest drainer received first batch"
+                                        );
+                                    }
+                                    state.apply_event(id, event);
                                 }
-                                state.apply_event(id, event);
                             });
                             if last_log.elapsed() >= Duration::from_secs(2) {
                                 tracing::info!(
@@ -1469,7 +1473,7 @@ impl RunIngest for ServerState {
     async fn start_run(
         &self,
         config: RunConfig,
-        events: vox::Rx<IngestEvent>,
+        events: vox::Rx<IngestBatch>,
     ) -> Result<RunId, RunIngestError> {
         let (id, cancel) = self.begin_run(config)?;
         self.inner.lock().ingest_attached = true;
@@ -1480,7 +1484,7 @@ impl RunIngest for ServerState {
     async fn attach_run(
         &self,
         run_id: RunId,
-        events: vox::Rx<IngestEvent>,
+        events: vox::Rx<IngestBatch>,
     ) -> Result<(), RunIngestError> {
         let cancel = self.cancel_for_run(run_id)?;
         self.inner.lock().ingest_attached = true;

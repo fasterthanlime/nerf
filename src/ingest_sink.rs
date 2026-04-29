@@ -2,7 +2,7 @@
 //! socket. Async-trait callbacks are intentionally tiny: each one
 //! pushes an owned `IngestEvent` into a sync-friendly tokio mpsc
 //! and returns immediately. A separate forwarder task drains the
-//! mpsc and pumps events through `vox::Tx::send` at whatever rate
+//! mpsc and pumps batches through `vox::Tx::send` at whatever rate
 //! the wire allows.
 
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use stax_live_proto::{
-    IngestEvent, RunId, RunIngestClient, WireBinaryLoaded, WireBinaryUnloaded, WireMachOSymbol,
-    WireOffCpuInterval, WireOnCpuInterval, WireSampleEvent, WireWakeup,
+    IngestBatch, IngestEvent, RunId, RunIngestClient, WireBinaryLoaded, WireBinaryUnloaded,
+    WireMachOSymbol, WireOffCpuInterval, WireOnCpuInterval, WireSampleEvent, WireWakeup,
 };
 use tokio::sync::mpsc::{self, UnboundedSender};
 
@@ -24,13 +24,15 @@ use crate::live_sink::{
 use crate::live_sink::MachOByteSource;
 
 const INGEST_CHANNEL_CAPACITY: u32 = 64;
+const INGEST_BATCH_MAX_EVENTS: usize = 1024;
+const INGEST_BATCH_MAX_DELAY: Duration = Duration::from_millis(5);
 
 /// `LiveSink` impl that drops every event into a channel which a
-/// forwarder task drains and pushes into a vox `Tx<IngestEvent>`.
+/// forwarder task drains and pushes into a vox `Tx<IngestBatch>`.
 ///
 /// `stop_requested` flips to `true` when the forwarder sees the
 /// vox `Tx` reject a send — typically because stax-server dropped
-/// its `Rx<IngestEvent>` after a `RunControl::stop_active`. The
+/// its `Rx<IngestBatch>` after a `RunControl::stop_active`. The
 /// recorder loop polls `LiveSink::stop_requested()` to break out
 /// of `drive_session` cleanly.
 pub struct IngestSink {
@@ -269,7 +271,7 @@ pub async fn connect_and_register_with_telemetry(
         .await?;
     let client = client.with_middleware(vox::ClientLogging::default());
 
-    let (vox_tx, vox_rx) = vox::channel::<IngestEvent>();
+    let (vox_tx, vox_rx) = vox::channel::<IngestBatch>();
     let run_id = match client.start_run(config, vox_rx).await {
         Ok(id) => id,
         Err(vox::VoxError::User(err)) => {
@@ -326,7 +328,7 @@ pub async fn connect_to_existing_run_with_telemetry(
         .await?;
     let client = client.with_middleware(vox::ClientLogging::default());
 
-    let (vox_tx, vox_rx) = vox::channel::<IngestEvent>();
+    let (vox_tx, vox_rx) = vox::channel::<IngestBatch>();
     match client.attach_run(run_id, vox_rx).await {
         Ok(()) => {}
         Err(vox::VoxError::User(err)) => {
@@ -360,7 +362,7 @@ fn spawn_forwarders(
     client: RunIngestClient,
     surface: &'static str,
     run_id: RunId,
-    vox_tx: vox::Tx<IngestEvent>,
+    vox_tx: vox::Tx<IngestBatch>,
     sync_rx: mpsc::UnboundedReceiver<IngestEvent>,
     reliable_rx: std::sync::mpsc::Receiver<ReliableIngest>,
     stop_requested: Arc<AtomicBool>,
@@ -418,74 +420,136 @@ fn spawn_forwarders(
 }
 
 async fn forward_events(
-    vox_tx: vox::Tx<IngestEvent>,
+    vox_tx: vox::Tx<IngestBatch>,
     mut sync_rx: mpsc::UnboundedReceiver<IngestEvent>,
     stop_requested: Arc<AtomicBool>,
     enqueued: Arc<AtomicU64>,
 ) {
     let mut forwarded: u64 = 0;
+    let mut batches: u64 = 0;
     let mut counts = ForwardCounts::default();
     let mut last_log = Instant::now();
     tracing::info!("ingest_sink: event forwarder started");
-    while let Some(event) = sync_rx.recv().await {
-        let kind = ingest_event_kind(&event);
+    'events: while let Some(first_event) = sync_rx.recv().await {
+        let first_kind = ingest_event_kind(&first_event);
         let queued_total = enqueued.load(Ordering::Relaxed);
-        counts.record(&event);
         if forwarded == 0 {
             tracing::info!(
-                kind,
+                kind = first_kind,
                 queued = sync_rx.len(),
                 queued_total,
                 "ingest_sink: forwarder received first event"
             );
         }
+        let mut batch = Vec::with_capacity(INGEST_BATCH_MAX_EVENTS.min(sync_rx.len() + 1));
+        batch.push(first_event);
+        let batch_started = Instant::now();
+        let mut input_closed = false;
+        while batch.len() < INGEST_BATCH_MAX_EVENTS {
+            match sync_rx.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    input_closed = true;
+                    break;
+                }
+            }
+        }
+        while batch.len() < INGEST_BATCH_MAX_EVENTS {
+            let Some(remaining) = INGEST_BATCH_MAX_DELAY.checked_sub(batch_started.elapsed())
+            else {
+                break;
+            };
+            match tokio::time::timeout(remaining, sync_rx.recv()).await {
+                Ok(Some(event)) => {
+                    batch.push(event);
+                    while batch.len() < INGEST_BATCH_MAX_EVENTS {
+                        match sync_rx.try_recv() {
+                            Ok(event) => batch.push(event),
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                input_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if input_closed {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    input_closed = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        let mut batch_counts = ForwardCounts::default();
+        for event in &batch {
+            batch_counts.record(event);
+        }
+        let batch_len = batch.len() as u64;
         let send_start = Instant::now();
-        match vox_tx.send(event).await {
+        match vox_tx.send(IngestBatch { events: batch }).await {
             Ok(()) => {
-                forwarded = forwarded.saturating_add(1);
+                forwarded = forwarded.saturating_add(batch_len);
+                batches = batches.saturating_add(1);
+                counts.merge(&batch_counts);
                 let send_elapsed = send_start.elapsed();
-                if forwarded == 1 {
+                if batches == 1 {
                     tracing::info!(
-                        kind,
+                        kind = first_kind,
                         forwarded,
+                        batches,
+                        batch_len,
                         queued = sync_rx.len(),
                         queued_total,
                         elapsed = ?send_elapsed,
-                        "ingest_sink: forwarder sent first event"
+                        "ingest_sink: forwarder sent first batch"
                     );
                 } else if send_elapsed >= Duration::from_millis(10) {
                     tracing::warn!(
-                        kind,
+                        kind = first_kind,
                         forwarded,
+                        batches,
+                        batch_len,
                         queued = sync_rx.len(),
                         queued_total,
                         elapsed = ?send_elapsed,
-                        "ingest_sink: slow vox event send"
+                        "ingest_sink: slow vox batch send"
                     );
                 }
                 if last_log.elapsed() >= Duration::from_secs(2) {
                     tracing::info!(
                         forwarded,
+                        batches,
                         queued = sync_rx.len(),
                         queued_total,
                         counts = %counts.summary(),
-                        "ingest_sink: forwarder progress: forwarded={} queued={} {}",
+                        "ingest_sink: forwarder progress: forwarded={} batches={} queued={} {}",
                         forwarded,
+                        batches,
                         sync_rx.len(),
                         counts.summary(),
                     );
                     last_log = std::time::Instant::now();
                 }
+                if input_closed {
+                    break 'events;
+                }
             }
             Err(e) => {
                 tracing::warn!(
-                    kind,
+                    kind = first_kind,
                     forwarded,
+                    batches,
+                    batch_len,
                     queued = sync_rx.len(),
                     queued_total,
                     error = ?e,
-                    "ingest_sink: vox send failed (server dropped Rx?) after forwarded={} queued={} err={:?}",
+                    "ingest_sink: vox batch send failed (server dropped Rx?) after forwarded={} batches={} queued={} err={:?}",
                     forwarded,
+                    batches,
                     sync_rx.len(),
                     e
                 );
@@ -496,10 +560,12 @@ async fn forward_events(
     }
     tracing::info!(
         forwarded,
+        batches,
         queued_total = enqueued.load(Ordering::Relaxed),
         counts = %counts.summary(),
-        "ingest_sink: forwarder exiting (sync_rx closed) after forwarded={} {}; flushing vox",
+        "ingest_sink: forwarder exiting (sync_rx closed) after forwarded={} batches={} {}; flushing vox",
         forwarded,
+        batches,
         counts.summary(),
     );
     let _ = vox_tx.close(Default::default()).await;
@@ -544,6 +610,18 @@ struct ForwardCounts {
 }
 
 impl ForwardCounts {
+    fn merge(&mut self, other: &Self) {
+        self.samples += other.samples;
+        self.probe_results += other.probe_results;
+        self.on_cpu += other.on_cpu;
+        self.off_cpu += other.off_cpu;
+        self.binaries_loaded += other.binaries_loaded;
+        self.binaries_unloaded += other.binaries_unloaded;
+        self.target_attached += other.target_attached;
+        self.thread_names += other.thread_names;
+        self.wakeups += other.wakeups;
+    }
+
     fn record(&mut self, event: &IngestEvent) {
         match event {
             IngestEvent::Sample(_) => self.samples += 1,

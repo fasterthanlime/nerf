@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use stax_mac_kperf_sys::bindings::{self, Frameworks};
 use stax_mac_kperf_sys::kdebug::{self, KdBuf, KdRegtype};
-use staxd_proto::{KdBufBatch, KdBufWire, RecordError, RecordSummary, SessionConfig};
+use staxd_proto::{KdBufBatch, RecordError, RecordSummary, SessionConfig};
 
 pub async fn run(
     config: SessionConfig,
@@ -391,7 +391,7 @@ async fn drain(
         // as our detection of "client went away" — without it, the
         // drain loop spins forever holding ktrace ownership long
         // after the client disconnected.
-        let records_vec = buf[..n].iter().map(kdbuf_to_wire).collect();
+        let records_vec = buf[..n].to_vec();
         let queued_for_send_mach_ticks = mach_ticks_now();
         let batch = KdBufBatch {
             records: records_vec,
@@ -525,20 +525,6 @@ fn map_kperf_err(e: stax_mac_kperf_sys::Error) -> RecordError {
             op: "TooManyEvents".into(),
             message: format!("{n} > {cap}"),
         },
-    }
-}
-
-fn kdbuf_to_wire(rec: &KdBuf) -> KdBufWire {
-    KdBufWire {
-        timestamp: rec.timestamp,
-        arg1: rec.arg1,
-        arg2: rec.arg2,
-        arg3: rec.arg3,
-        arg4: rec.arg4,
-        arg5: rec.arg5,
-        debugid: rec.debugid,
-        cpuid: rec.cpuid,
-        unused: rec.unused,
     }
 }
 
