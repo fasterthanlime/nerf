@@ -16,7 +16,8 @@ stax-mac-kperf-sys = { version = "0.1", path = "../stax-mac-kperf-sys" }
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter"] }
 tracing-oslog = "0.3"
 libc = "0.2"
+
 eyre = "0.6"

@@ -13,9 +13,10 @@ stax-shade-proto = { path = "../stax-shade-proto" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 log = "0.4"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter"] }
 tracing-oslog = "0.3"
 parking_lot = "0.12"
+
 eyre = "0.6"
 libc = "0.2"
 

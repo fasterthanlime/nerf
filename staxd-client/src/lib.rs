@@ -73,6 +73,9 @@ pub enum Error {
 
     #[error("vox call returned an error: {0}")]
     VoxCall(String),
+
+    #[error("parser worker did not stop within {budget:?}; detached")]
+    WorkerShutdownTimedOut { budget: Duration },
 }
 
 /// Run a remote recording session. Blocks until `should_stop` returns
@@ -182,7 +185,7 @@ where
         pmc_idx_brmiss: None,
     };
 
-    let (worker_tx, worker_rx) = std::sync::mpsc::channel::<WorkerMsg>();
+    let (worker_tx, worker_rx) = std::sync::mpsc::sync_channel::<WorkerMsg>(WORKER_QUEUE_CAPACITY);
     let abort_worker_backlog = Arc::new(AtomicBool::new(false));
     let worker_abort = abort_worker_backlog.clone();
     let phase_start = Instant::now();
@@ -303,14 +306,7 @@ where
                 }
             }
             total_drained += batch.records.len() as u64;
-            // Hand off to the worker thread. send is non-blocking
-            // for std::sync::mpsc; a slow worker would let this
-            // grow unbounded, but the worker is fast unless an
-            // image rescan is running, in which case batches
-            // queue briefly here instead of stalling vox credit.
-            let _ = worker_tx.send(WorkerMsg::Batch(OwnedBatch {
-                records: batch.records,
-            }));
+            enqueue_worker_batches(&worker_tx, batch.records);
         });
     }
 
@@ -345,9 +341,11 @@ where
         }
     }
 
-    join_worker_with_deadline(worker_handle, abort_worker_backlog)
-        .await
-        .map_err(|e| Error::VoxCall(format!("join worker: {e:?}")))?;
+    if !join_worker_with_deadline(worker_handle, abort_worker_backlog).await {
+        return Err(Error::WorkerShutdownTimedOut {
+            budget: WORKER_SHUTDOWN_BUDGET,
+        });
+    }
 
     info!("staxd-client: locally drained {total_drained} records");
     info!(
@@ -359,30 +357,99 @@ where
     Ok(())
 }
 
+const WORKER_QUEUE_CAPACITY: usize = 16;
+const WORKER_BATCH_CHUNK_RECORDS: usize = 16 * 1024;
+const WORKER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
+const WORKER_ABORT_GRACE: Duration = Duration::from_millis(250);
+
 async fn join_worker_with_deadline(
     worker_handle: std::thread::JoinHandle<()>,
     abort_worker_backlog: Arc<AtomicBool>,
-) -> Result<(), tokio::task::JoinError> {
-    const WORKER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
-    let mut join = tokio::task::spawn_blocking(move || worker_handle.join());
-    match tokio::time::timeout(WORKER_SHUTDOWN_BUDGET, &mut join).await {
-        Ok(result) => {
-            let _ = result?;
-            info!(
-                "staxd-client-worker: shutdown drained within budget budget={:?}",
-                WORKER_SHUTDOWN_BUDGET
-            );
+) -> bool {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("staxd-client-worker-join".to_owned())
+        .spawn(move || {
+            let result = worker_handle.join();
+            let _ = done_tx.send(result);
+        });
+
+    if wait_for_worker_join(&done_rx, WORKER_SHUTDOWN_BUDGET).await {
+        info!(
+            "staxd-client-worker: shutdown drained within budget budget={:?}",
+            WORKER_SHUTDOWN_BUDGET
+        );
+        return true;
+    }
+
+    warn!(
+        "staxd-client-worker: shutdown exceeded {:?}; requesting backlog drop",
+        WORKER_SHUTDOWN_BUDGET
+    );
+    abort_worker_backlog.store(true, Ordering::Release);
+
+    if wait_for_worker_join(&done_rx, WORKER_ABORT_GRACE).await {
+        info!(
+            "staxd-client-worker: shutdown completed after abort grace grace={:?}",
+            WORKER_ABORT_GRACE
+        );
+        true
+    } else {
+        warn!(
+            "staxd-client-worker: still blocked after abort grace {:?}; detaching worker so recorder can exit",
+            WORKER_ABORT_GRACE
+        );
+        false
+    }
+}
+
+async fn wait_for_worker_join(
+    done_rx: &std::sync::mpsc::Receiver<std::thread::Result<()>>,
+    budget: Duration,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        match done_rx.try_recv() {
+            Ok(Ok(())) => return true,
+            Ok(Err(_panic)) => {
+                warn!("staxd-client-worker: parser worker panicked during shutdown");
+                return true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
-        Err(_) => {
-            warn!(
-                "staxd-client-worker: shutdown exceeded {:?}; dropping remaining queued batches",
-                WORKER_SHUTDOWN_BUDGET
-            );
-            abort_worker_backlog.store(true, Ordering::Release);
-            let _ = join.await?;
+        if started.elapsed() >= budget {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn enqueue_worker_batches(
+    worker_tx: &std::sync::mpsc::SyncSender<WorkerMsg>,
+    records: Vec<KdBufWire>,
+) {
+    let mut dropped_chunks = 0u64;
+    let mut dropped_records = 0u64;
+    for chunk in records.chunks(WORKER_BATCH_CHUNK_RECORDS) {
+        let msg = WorkerMsg::Batch(OwnedBatch {
+            records: chunk.to_vec(),
+        });
+        match worker_tx.try_send(msg) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(WorkerMsg::Batch(batch))) => {
+                dropped_chunks += 1;
+                dropped_records += batch.records.len() as u64;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
         }
     }
-    Ok(())
+    if dropped_chunks > 0 {
+        warn!(
+            "staxd-client-worker: parser queue full; dropped kdebug chunks chunks={} records={} queue_capacity={}",
+            dropped_chunks, dropped_records, WORKER_QUEUE_CAPACITY
+        );
+    }
 }
 
 #[derive(Default)]
@@ -480,10 +547,12 @@ fn worker_thread<S: SampleSink>(
     let mut processed_batches: u64 = 0;
     let mut processed_records: u64 = 0;
     let mut first_batch_logged = false;
+    let mut aborted = false;
 
     loop {
         if abort_backlog.load(Ordering::Acquire) {
             info!("staxd-client-worker: shutdown requested; dropping queued kdebug batches");
+            aborted = true;
             break;
         }
         match rx.recv_timeout(TICK_INTERVAL) {
@@ -492,6 +561,7 @@ fn worker_thread<S: SampleSink>(
                     info!(
                         "staxd-client-worker: shutdown requested; dropping queued kdebug batches"
                     );
+                    aborted = true;
                     break;
                 }
                 let kdbufs: Vec<KdBuf> = batch.records.iter().map(wire_to_kdbuf).collect();
@@ -534,6 +604,16 @@ fn worker_thread<S: SampleSink>(
                 processed_batches, processed_records
             );
         }
+    }
+
+    if aborted {
+        info!(
+            "staxd-client-worker: parser pipeline aborted without finish total_elapsed={:?} processed_batches={} processed_records={}",
+            worker_start.elapsed(),
+            processed_batches,
+            processed_records
+        );
+        return;
     }
 
     let phase_start = Instant::now();

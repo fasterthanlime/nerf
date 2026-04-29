@@ -444,7 +444,16 @@ async fn run_recording(
         elapsed = ?recording_start.elapsed(),
         "shade awaiting ingest forwarder"
     );
-    if let Err(e) = forwarder.await {
+    if matches!(
+        &result,
+        Err(staxd_client::Error::WorkerShutdownTimedOut { .. })
+    ) {
+        tracing::warn!(
+            run_id = run_id.0,
+            elapsed = ?recording_start.elapsed(),
+            "shade skipping ingest forwarder await because parser worker was detached"
+        );
+    } else if let Err(e) = forwarder.await {
         tracing::warn!("ingest forwarder task ended unexpectedly: {e}");
     }
 
