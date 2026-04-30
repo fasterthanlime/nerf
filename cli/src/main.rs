@@ -51,6 +51,7 @@ fn main_impl() -> Result<(), Box<dyn Error>> {
         Command::Status => block_on_async(async { run_status().await })?,
         Command::List => block_on_async(async { run_list().await })?,
         Command::Diagnose => block_on_async(async { run_diagnose().await })?,
+        Command::Dump => run_dump()?,
         Command::Wait(args) => block_on_async(async { run_wait(args).await })?,
         Command::Stop => block_on_async(async { run_stop().await })?,
         Command::Top(args) => block_on_async(async { run_top(args).await })?,
@@ -114,6 +115,78 @@ fn stax_server_socket() -> Option<PathBuf> {
 
 // --- agent-facing subcommands ------------------------------------------
 
+fn run_dump() -> Result<(), Box<dyn Error>> {
+    let self_pid = std::process::id();
+    let mut targets = Vec::new();
+    for name in ["staxd", "stax-server", "stax-shade", "stax"] {
+        for pid in pids_by_exact_process_name(name)? {
+            if pid != self_pid {
+                targets.push(DumpTarget {
+                    name: name.to_owned(),
+                    pid,
+                });
+            }
+        }
+    }
+    targets.sort_by(|a, b| (a.pid, &a.name).cmp(&(b.pid, &b.name)));
+    targets.dedup_by_key(|target| target.pid);
+
+    if targets.is_empty() {
+        println!("no stax processes found");
+        return Ok(());
+    }
+
+    let mut failed = false;
+    for target in targets {
+        let rc = unsafe { libc::kill(target.pid as libc::pid_t, libc::SIGUSR1) };
+        if rc == 0 {
+            println!("signaled {} pid {}", target.name, target.pid);
+        } else {
+            failed = true;
+            eprintln!(
+                "failed to signal {} pid {}: {}",
+                target.name,
+                target.pid,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    if failed {
+        Err("one or more dump signals failed".into())
+    } else {
+        Ok(())
+    }
+}
+
+struct DumpTarget {
+    name: String,
+    pid: u32,
+}
+
+fn pids_by_exact_process_name(name: &str) -> Result<Vec<u32>, Box<dyn Error>> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-x", name])
+        .output()?;
+    if output.status.success() {
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| {
+                line.parse::<u32>()
+                    .map_err(|e| format!("pgrep returned invalid pid {line:?}: {e}").into())
+            })
+            .collect();
+    }
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    Err(format!(
+        "pgrep -x {name} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+    .into())
+}
+
 async fn run_record_async(args: RecordArgs) -> Result<(), Box<dyn Error>> {
     let url = require_server_socket()?;
     let client: RunControlClient = vox::connect(&url).await?;
@@ -127,7 +200,9 @@ async fn run_record_async(args: RecordArgs) -> Result<(), Box<dyn Error>> {
     let config = stax_live_proto::RunConfig {
         label,
         frequency_hz: args.frequency,
+        correlate_frequency_hz: args.correlate_frequency.unwrap_or(args.frequency),
         race_kperf: args.race_kperf,
+        correlate_kperf: args.correlate_kperf,
     };
 
     let mut terminal_relay = None;
@@ -658,16 +733,43 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
     }
     let paired_total = update.paired as f64;
     let pct = |n: u64| n as f64 * 100.0 / paired_total;
+    let fp_run_stitchable: u64 = update
+        .common_suffix_hist
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| *k >= stax_live_proto::STITCH_MIN_SUFFIX as usize)
+        .map(|(_, &n)| n)
+        .sum();
     println!(
         "pc_match              : {:>6}  ({:>5.1}%)",
         update.pc_match,
         pct(update.pc_match)
     );
     println!(
-        "stitchable (>= {} suff): {:>6}  ({:>5.1}%)",
+        "fp validator run (>= {})    : {:>6}  ({:>5.1}%)",
         stax_live_proto::STITCH_MIN_SUFFIX,
+        fp_run_stitchable,
+        pct(fp_run_stitchable)
+    );
+    println!(
+        "would ship enriched stack   : {:>6}  ({:>5.1}%)",
         update.stitchable,
         pct(update.stitchable)
+    );
+    println!(
+        "compact run stitchable      : {:>6}  ({:>5.1}%)",
+        update.compact_stitchable,
+        pct(update.compact_stitchable)
+    );
+    println!(
+        "compact+fde run stitchable  : {:>6}  ({:>5.1}%)",
+        update.compact_dwarf_stitchable,
+        pct(update.compact_dwarf_stitchable)
+    );
+    println!(
+        "dwarf run stitchable        : {:>6}  ({:>5.1}%)",
+        update.dwarf_stitchable,
+        pct(update.dwarf_stitchable)
     );
     println!(
         "probe augments kperf  : {:>6}  ({:>5.1}%)  (kperf walked 0, probe ≥1)",
@@ -680,21 +782,20 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
         pct(update.probe_walked_deeper),
     );
     println!(
-        "framehop / fp-walk    : {} / {}",
-        update.framehop_used, update.fp_walk_used,
+        "compact / c+fde / dwarf / fp validator: {} / {} / {} / {}",
+        update.compact_used, update.compact_dwarf_used, update.framehop_used, update.fp_walk_used,
     );
 
-    println!("\ncommon_suffix histogram (deepest matching frames per pair):");
-    for (k, &n) in update.common_suffix_hist.iter().enumerate() {
-        if n > 0 {
-            println!(
-                "  k={k:<3} {n:>6}  ({:>5.1}%)",
-                n as f64 * 100.0 / paired_total
-            );
-        }
-    }
+    println!("\nfp common_run histogram:");
+    print_run_hist(&update.common_suffix_hist, paired_total);
+    println!("\ncompact common_run histogram:");
+    print_run_hist(&update.compact_suffix_hist, paired_total);
+    println!("\ncompact+fde common_run histogram:");
+    print_run_hist(&update.compact_dwarf_suffix_hist, paired_total);
+    println!("\ndwarf common_run histogram:");
+    print_run_hist(&update.dwarf_suffix_hist, paired_total);
 
-    println!("\nmatch rate by frame depth (0 = leaf):");
+    println!("\nmatch rate by frame depth (0 = leaf, fp validator):");
     for cell in &update.depth_match {
         let rate = if cell.total == 0 {
             0.0
@@ -732,9 +833,14 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
     if t.samples > 0 {
         println!("\nprobe timing breakdown (avg / max, causal path):");
         println!(
-            "  kernel ring age    {:>9} / {:>9}  (kperf_ts → staxd read)",
+            "  kdebug pre-read    {:>9} / {:>9}  (kperf_ts → KDREADTR start)",
             fmt_ns(t.avg_kperf_to_staxd_read_ns),
             fmt_ns(t.max_kperf_to_staxd_read_ns)
+        );
+        println!(
+            "  kdebug to staxd    {:>9} / {:>9}  (kperf_ts → KDREADTR done)",
+            fmt_ns(t.avg_kperf_to_staxd_drain_ns),
+            fmt_ns(t.max_kperf_to_staxd_drain_ns)
         );
         println!(
             "  staxd read         {:>9} / {:>9}",
@@ -788,7 +894,7 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
             fmt_ns(t.max_resume_ns)
         );
         println!(
-            "  fp walk            {:>9} / {:>9}",
+            "  unwind             {:>9} / {:>9}",
             fmt_ns(t.avg_walk_ns),
             fmt_ns(t.max_walk_ns)
         );
@@ -804,23 +910,38 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
     }
 
     if !update.threads.is_empty() {
-        println!("\ntop threads by paired count:");
+        println!("\nthreads by kperf sample count:");
         println!(
-            "  {:>10}  {:>7}  {:>11}  {:>13}  {:>9}  name",
-            "tid", "paired", "pc_match", "stitchable", "avg-suff",
+            "  {:>10}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>11}  {:>9}  {:>9}  {:>9}  {:>9}  name",
+            "tid",
+            "kperf",
+            "probe",
+            "paired",
+            "k-only",
+            "p-only",
+            "pc_match",
+            "fp-suff",
+            "c-run",
+            "c+fde",
+            "dw-run",
         );
         for t in &update.threads {
             let name = t.thread_name.as_deref().unwrap_or("(unnamed)");
             let denom = t.paired.max(1) as f64;
             println!(
-                "  {:>10}  {:>7}  {:>5} {:>3.0}%  {:>7} {:>3.0}%  {:>9.2}  {name}",
+                "  {:>10}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>5} {:>3.0}%  {:>9.2}  {:>9.2}  {:>9.2}  {:>9.2}  {name}",
                 t.tid,
+                t.kperf_samples,
+                t.probe_results,
                 t.paired,
+                t.kperf_only,
+                t.probe_only,
                 t.pc_match,
                 t.pc_match as f64 * 100.0 / denom,
-                t.stitchable,
-                t.stitchable as f64 * 100.0 / denom,
                 t.avg_common_suffix,
+                t.avg_compact_common_suffix,
+                t.avg_compact_dwarf_common_suffix,
+                t.avg_dwarf_common_suffix,
             );
         }
     }
@@ -844,11 +965,14 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
         .collect();
     for entry in entries {
         println!(
-            "\n  tid={} t={}ms drift={:+}ns common_suffix={} pc_match={} stitchable={} framehop={}",
+            "\n  tid={} t={}ms drift={:+}ns fp_run={} compact_run={} compact+fde_run={} dwarf_run={} pc_match={} stitchable={} dwarf={}",
             entry.tid,
             entry.timestamp_ns / 1_000_000,
             entry.drift_ns,
             entry.common_suffix,
+            entry.compact_common_suffix,
+            entry.compact_dwarf_common_suffix,
+            entry.dwarf_common_suffix,
             entry.pc_match,
             entry.stitchable,
             entry.used_framehop,
@@ -869,8 +993,9 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
             entry.timing.walk_done_ticks,
         );
         println!(
-            "    path: kernel_age={} staxd_read={} drain→queue={} staxd_queue={} staxd→client={} client→enqueue={} end_to_end_enqueue={} queue={} lookup={} suspend+state={} resume={} walk={} worker_total={} kperf→state={} coalesced={} batch={}",
+            "    path: kdebug_pre_read={} kdebug_to_staxd={} staxd_read={} drain→queue={} staxd_queue={} staxd→client={} client→enqueue={} end_to_end_enqueue={} queue={} lookup={} suspend+state={} resume={} walk={} worker_total={} kperf→state={} coalesced={} batch={}",
             fmt_ns(entry.timing.kperf_to_staxd_read_ns),
+            fmt_ns(entry.timing.kperf_to_staxd_drain_ns),
             fmt_ns(entry.timing.staxd_read_ns),
             fmt_ns(entry.timing.staxd_drain_to_queue_ns),
             fmt_ns(entry.timing.staxd_queue_wait_ns),
@@ -887,30 +1012,43 @@ fn print_probe_diff(update: &ProbeDiffUpdate, recent_limit: u32) {
             entry.queue.coalesced_requests,
             entry.queue.worker_batch_len,
         );
-        println!("    kperf_stack:");
-        for f in &entry.kperf_stack {
-            println!("      {:#018x}  {}", f.address, f.display);
-        }
+        print_stack("kperf_stack", &entry.kperf_stack);
         if !entry.kperf_kernel_stack.is_empty() {
-            println!("    kperf_kernel_stack:");
-            for f in &entry.kperf_kernel_stack {
-                println!("      {:#018x}  {}", f.address, f.display);
-            }
+            print_stack("kperf_kernel_stack", &entry.kperf_kernel_stack);
         }
-        println!("    probe_stack:");
-        for f in &entry.probe_stack {
-            println!("      {:#018x}  {}", f.address, f.display);
+        print_stack("fp_stack", &entry.probe_stack);
+        if !entry.compact_stack.is_empty() {
+            print_stack("compact_stack", &entry.compact_stack);
+        }
+        if !entry.compact_dwarf_stack.is_empty() {
+            print_stack("compact+fde_stack", &entry.compact_dwarf_stack);
+        }
+        if !entry.dwarf_stack.is_empty() {
+            print_stack("dwarf_stack", &entry.dwarf_stack);
         }
         if !entry.stitched_stack.is_empty() {
-            println!("    stitched_stack (would-ship):");
-            for f in &entry.stitched_stack {
-                println!("      {:#018x}  {}", f.address, f.display);
-            }
+            print_stack("stitched_stack (would-ship)", &entry.stitched_stack);
         }
     }
 }
 
-/// 0..100% rendered as a 24-char bar of unicode blocks.
+fn print_run_hist(hist: &[u64], paired_total: f64) {
+    for (k, &n) in hist.iter().enumerate() {
+        if n > 0 {
+            println!(
+                "  k={k:<3} {n:>6}  ({:>5.1}%)",
+                n as f64 * 100.0 / paired_total
+            );
+        }
+    }
+}
+
+fn print_stack(label: &str, frames: &[stax_live_proto::ResolvedFrame]) {
+    println!("    {label}:");
+    for f in frames {
+        println!("      {:#018x}  {}", f.address, f.display);
+    }
+}
 fn bar_str(pct: f64, width: usize) -> String {
     let pct = pct.clamp(0.0, 100.0);
     let filled = (pct / 100.0 * width as f64).round() as usize;

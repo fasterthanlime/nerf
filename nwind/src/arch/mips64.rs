@@ -1,5 +1,5 @@
 use crate::address_space::MemoryReader;
-use crate::arch::{Architecture, Registers, UnwindStatus};
+use crate::arch::{Architecture, Registers, UnwindFailure, UnwindStatus};
 use crate::dwarf::dwarf_unwind;
 use crate::frame_descriptions::{ContextCache, UnwindInfoCache};
 use crate::types::{Bitness, Endianness};
@@ -210,7 +210,7 @@ impl Architecture for Arch {
         regs: &mut Self::Regs,
         initial_address: &mut Option<u64>,
         ra_address: &mut Option<u64>,
-    ) -> Option<UnwindStatus> {
+    ) -> Result<UnwindStatus, UnwindFailure> {
         let result = dwarf_unwind(
             nth_frame,
             memory,
@@ -221,7 +221,7 @@ impl Architecture for Arch {
         )?;
         *initial_address = Some(result.initial_address);
         *ra_address = result.ra_address;
-        let cfa = result.cfa?;
+        let cfa = result.cfa;
 
         let mut recovered_return_address = false;
         for &(register, value) in &state.new_regs {
@@ -241,13 +241,15 @@ impl Architecture for Arch {
 
         if recovered_return_address || nth_frame == 0 {
             regs.pc = regs.r31;
-            Some(UnwindStatus::InProgress)
+            Ok(UnwindStatus::InProgress)
         } else {
             debug!(
                 "Previous frame not found: failed to determine the return address of frame #{}",
                 nth_frame + 1
             );
-            Some(UnwindStatus::Finished)
+            Err(result
+                .return_address_error
+                .unwrap_or(UnwindFailure::MissingReturnAddress))
         }
     }
 }

@@ -1427,6 +1427,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "macho-unwind-info"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb4bdc8b0ce69932332cf76d24af69c3a155242af95c226b2ab6c2e371ed1149"
+dependencies = [
+ "thiserror",
+ "zerocopy",
+ "zerocopy-derive",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1457,6 +1468,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "metrix"
+version = "0.1.0"
+dependencies = [
+ "facet",
 ]
 
 [[package]]
@@ -1627,6 +1645,7 @@ dependencies = [
  "libc",
  "log",
  "lru",
+ "macho-unwind-info",
  "memmap2",
  "object 0.32.2",
  "proc-maps",
@@ -2116,10 +2135,10 @@ dependencies = [
  "libc",
  "log",
  "mach2",
+ "metrix",
  "nwind",
  "stax-live-proto",
  "stax-mac-capture",
- "stax-telemetry",
  "stax-vox-observe",
  "staxd-client",
  "tokio",
@@ -2163,7 +2182,7 @@ name = "stax-live-proto"
 version = "0.1.0"
 dependencies = [
  "facet",
- "stax-telemetry",
+ "metrix",
  "vox",
 ]
 
@@ -2212,13 +2231,13 @@ dependencies = [
  "eyre",
  "libc",
  "log",
+ "metrix",
  "parking_lot",
  "stax-live",
  "stax-live-proto",
  "stax-mac-capture",
  "stax-mac-shared-cache",
  "stax-shade-proto",
- "stax-telemetry",
  "stax-vox-observe",
  "tokio",
  "tracing",
@@ -2237,11 +2256,13 @@ dependencies = [
  "libc",
  "log",
  "mach2",
+ "metrix",
+ "nwind",
  "stax-core",
  "stax-live-proto",
  "stax-mac-capture",
  "stax-shade-proto",
- "stax-telemetry",
+ "stax-target-images",
  "stax-vox-observe",
  "staxd-client",
  "tokio",
@@ -2271,17 +2292,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "stax-telemetry"
-version = "0.1.0"
-dependencies = [
- "facet",
-]
-
-[[package]]
 name = "stax-vox-observe"
 version = "0.1.0"
 dependencies = [
- "stax-telemetry",
+ "metrix",
  "tokio",
  "tracing",
  "vox",
@@ -2295,8 +2309,8 @@ dependencies = [
  "flume",
  "libc",
  "mach2",
+ "metrix",
  "stax-mac-kperf-sys",
- "stax-telemetry",
  "stax-vox-observe",
  "staxd-proto",
  "tokio",
@@ -2313,11 +2327,11 @@ dependencies = [
  "flume",
  "log",
  "mach2",
+ "metrix",
  "stax-mac-capture",
  "stax-mac-kperf-parse",
  "stax-mac-kperf-sys",
  "stax-mac-shared-cache",
- "stax-telemetry",
  "stax-vox-observe",
  "staxd-proto",
  "thiserror",
@@ -2737,6 +2751,7 @@ dependencies = [
  "facet-reflect",
  "futures-util",
  "getrandom 0.4.2",
+ "metrix",
  "moire",
  "smallvec 1.15.1",
  "tokio",
@@ -2859,10 +2874,12 @@ dependencies = [
  "futures-channel",
  "heck",
  "indexmap",
+ "metrix",
  "moire",
  "smallvec 1.15.1",
  "structstruck",
  "tokio",
+ "vox-jit",
  "vox-postcard",
  "vox-schema",
 ]

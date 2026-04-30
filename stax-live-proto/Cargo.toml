@@ -8,5 +8,5 @@ description = "Schema for the stax live RPC service. Lightweight crate consumed 
 
 [dependencies]
 facet = { version = "0.46", features = ["camino", "reflect"] }
-stax-telemetry = { path = "../stax-telemetry" }
+metrix = { path = "../../metrix" }
 vox = { path = "/Users/amos/bearcove/vox/rust/vox", default-features = false, features = ["runtime"] }

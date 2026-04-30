@@ -31,8 +31,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use staxd_proto::{
-    DaemonStatus, KdBufBatch, RecordError, RecordSummary, SessionConfig, SessionState, Staxd,
-    StaxdDispatcher,
+    DaemonStatus, KdBufBatch, RecordError, RecordSummary, STAXD_RECORD_CHANNEL_CAPACITY,
+    SessionConfig, SessionState, Staxd, StaxdDispatcher,
 };
 
 mod session;
@@ -42,12 +42,11 @@ mod session;
 /// `/var/run/`). The default is `/tmp/` for hand-running during
 /// development; root daemon, but no permission gymnastics required.
 const DEFAULT_SOCKET: &str = "/tmp/staxd.sock";
-const STAXD_RECORD_CHANNEL_CAPACITY: u32 = 64;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     init_logging();
-    let telemetry = stax_telemetry::TelemetryRegistry::new("staxd");
+    let telemetry = metrix::TelemetryRegistry::new("staxd");
     let _telemetry_registration =
         stax_vox_observe::register_global_telemetry("staxd", "daemon", telemetry.clone());
     let _vox_sigusr1_dump = stax_vox_observe::install_global_sigusr1_dump("staxd");
@@ -62,7 +61,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
     }
 
-    let server = StaxdServer::new();
+    let server = StaxdServer::new(telemetry.clone());
 
     let listener =
         vox::transport::local::LocalLinkAcceptor::bind(socket_path.to_string_lossy().into_owned())
@@ -171,6 +170,7 @@ fn parse_socket_arg() -> PathBuf {
 #[derive(Clone)]
 struct StaxdServer {
     session: Arc<Mutex<Option<SessionInfo>>>,
+    telemetry: metrix::TelemetryRegistry,
 }
 
 #[derive(Clone)]
@@ -181,9 +181,10 @@ struct SessionInfo {
 }
 
 impl StaxdServer {
-    fn new() -> Self {
+    fn new(telemetry: metrix::TelemetryRegistry) -> Self {
         Self {
             session: Arc::new(Mutex::new(None)),
+            telemetry,
         }
     }
 }
@@ -236,7 +237,7 @@ impl Staxd for StaxdServer {
             config.target_pid, config.frequency_hz, config.buf_records
         );
 
-        let result = session::run(config, records, cancel).await;
+        let result = session::run(config, records, cancel, self.telemetry.clone()).await;
 
         // Always release the slot. The session driver tore down kperf+
         // kdebug on its own when it returned; here we just release the

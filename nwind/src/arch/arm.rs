@@ -1,5 +1,5 @@
 use crate::address_space::{lookup_binary, MemoryReader};
-use crate::arch::{Architecture, Registers, UnwindStatus};
+use crate::arch::{Architecture, Registers, UnwindFailure, UnwindStatus};
 use crate::arm_extab::Error as EhError;
 use crate::arm_extab::{unwind, unwind_from_cache, UnwindInfoCache};
 use crate::types::{Bitness, Endianness};
@@ -136,27 +136,27 @@ impl Architecture for Arch {
         regs: &mut Self::Regs,
         initial_address: &mut Option<u32>,
         ra_address: &mut Option<u32>,
-    ) -> Option<UnwindStatus> {
+    ) -> Result<UnwindStatus, UnwindFailure> {
         let address = regs.get(dwarf::R15).unwrap() as u32;
         if let Some(result) = unwind_from_cache(memory, &mut state.unwind_cache, regs, address) {
             match result {
                 Ok(link_register_addr) => {
                     *ra_address = link_register_addr;
-                    return Some(UnwindStatus::InProgress);
+                    return Ok(UnwindStatus::InProgress);
                 }
                 Err(EhError::EndOfStack) => {
                     debug!("Previous frame not found: EndOfStack");
-                    return Some(UnwindStatus::Finished);
+                    return Ok(UnwindStatus::Finished);
                 }
                 Err(error) => {
                     debug!("Previous frame not found: {:?}", error);
-                    return None;
+                    return Err(UnwindFailure::ArmUnwindFailed);
                 }
             }
         }
 
-        let binary = lookup_binary(nth_frame, memory, regs)?;
-        let binary_data = binary.data()?;
+        let binary = lookup_binary(nth_frame, memory, regs).ok_or(UnwindFailure::NoBinary)?;
+        let binary_data = binary.data().ok_or(UnwindFailure::NoBinary)?;
 
         let exidx_range = match binary_data.arm_exidx_range() {
             Some(exidx_range) => exidx_range,
@@ -165,7 +165,7 @@ impl Architecture for Arch {
                     "Previous frame not found: binary '{}' is missing .ARM.exidx section",
                     binary_data.name()
                 );
-                return None;
+                return Err(UnwindFailure::ArmUnwindInfoMissing);
             }
         };
 
@@ -176,7 +176,7 @@ impl Architecture for Arch {
                     "Previous frame not found: binary '{}' .ARM.exidx address is not known",
                     binary_data.name()
                 );
-                return None;
+                return Err(UnwindFailure::ArmUnwindInfoMissing);
             }
         };
 
@@ -190,7 +190,7 @@ impl Architecture for Arch {
                         "Previous frame not found: binary '{}' .ARM.extab address is not known",
                         binary_data.name()
                     );
-                    return None;
+                    return Err(UnwindFailure::ArmUnwindInfoMissing);
                 }
             }
         };
@@ -227,15 +227,15 @@ impl Architecture for Arch {
         match result {
             Ok(link_register_addr) => {
                 *ra_address = link_register_addr;
-                return Some(UnwindStatus::InProgress);
+                return Ok(UnwindStatus::InProgress);
             }
             Err(EhError::EndOfStack) => {
                 debug!("Previous frame not found: EndOfStack");
-                Some(UnwindStatus::Finished)
+                Ok(UnwindStatus::Finished)
             }
             Err(error) => {
                 debug!("Previous frame not found: {:?}", error);
-                None
+                Err(UnwindFailure::ArmUnwindFailed)
             }
         }
     }

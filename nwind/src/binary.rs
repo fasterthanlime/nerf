@@ -105,6 +105,7 @@ pub struct BinaryData {
     eh_frame_range: Option<Range<usize>>,
     eh_frame_hdr_range: Option<Range<usize>>,
     debug_frame_range: Option<Range<usize>>,
+    macho_unwind_info_range: Option<Range<usize>>,
     gnu_debuglink_range: Option<Range<usize>>,
     arm_extab_range: Option<Range<usize>>,
     arm_exidx_range: Option<Range<usize>>,
@@ -363,6 +364,7 @@ impl BinaryData {
             eh_frame_range,
             eh_frame_hdr_range,
             debug_frame_range,
+            macho_unwind_info_range: None,
             gnu_debuglink_range,
             arm_extab_range,
             arm_exidx_range,
@@ -382,10 +384,18 @@ impl BinaryData {
     /// concept of the ELF-only fields (`eh_frame`, `gnu_debuglink`,
     /// `.ARM.extab` …) and the macOS recorder pre-resolves symbols into
     /// archive-side `MachOSymbolTable` packets, so `symbol_tables` is left
-    /// empty. We only populate what `cmd_annotate`'s code-bytes path
-    /// actually reads: `architecture`, `endianness`, `bitness`,
-    /// `is_shared_object`, `load_headers`, and `build_id` (LC_UUID).
+    /// empty. We populate the fields needed by code lookup and captured
+    /// stack unwinding.
     fn load_macho(path: &str, blob: Blob) -> io::Result<Self> {
+        let thin = {
+            let (thin, offset) = crate::macho::host_thin_slice_with_offset(&blob)?;
+            if offset != 0 || thin.len() != blob.len() {
+                Some(thin.to_vec())
+            } else {
+                None
+            }
+        };
+        let blob = thin.map(Blob::Owned).unwrap_or(blob);
         let parsed = crate::macho::parse(&blob)?;
         let load_headers = parsed
             .segments
@@ -410,10 +420,11 @@ impl BinaryData {
             name: path.to_string(),
             blob,
             data_range: None,
-            text_range: None,
-            eh_frame_range: None,
+            text_range: parsed.text_range,
+            eh_frame_range: parsed.eh_frame_range,
             eh_frame_hdr_range: None,
-            debug_frame_range: None,
+            debug_frame_range: parsed.debug_frame_range,
+            macho_unwind_info_range: parsed.unwind_info_range,
             gnu_debuglink_range: None,
             arm_extab_range: None,
             arm_exidx_range: None,
@@ -495,6 +506,11 @@ impl BinaryData {
     #[inline]
     pub fn debug_frame_range(&self) -> Option<Range<usize>> {
         self.debug_frame_range.clone()
+    }
+
+    #[inline]
+    pub fn macho_unwind_info(&self) -> Option<&[u8]> {
+        Some(&self.blob[self.macho_unwind_info_range.clone()?])
     }
 
     #[inline]

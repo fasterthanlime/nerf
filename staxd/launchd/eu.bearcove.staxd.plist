@@ -37,7 +37,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
-        <string>staxd=info,stax_mac_kperf_sys=info</string>
+        <string>staxd=info,stax_vox_observe=info,stax_mac_kperf_sys=info</string>
     </dict>
 
     <!-- No StandardOutPath / StandardErrorPath: staxd logs

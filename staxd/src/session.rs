@@ -10,19 +10,24 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use mach2::mach_time::{mach_absolute_time, mach_timebase_info};
 use tracing::{info, warn};
 
+use metrix::{HistogramHandle, TelemetryRegistry};
 use stax_mac_kperf_sys::bindings::{self, Frameworks};
-use stax_mac_kperf_sys::kdebug::{self, KdBuf, KdRegtype};
+use stax_mac_kperf_sys::kdebug::{
+    self, DBG_FUNC_END, DBG_FUNC_START, DBG_PERF, KDBG_TIMESTAMP_MASK, KdBuf, KdRegtype, perf,
+};
 use staxd_proto::{KdBufBatch, RecordError, RecordSummary, SessionConfig};
 
 pub async fn run(
     config: SessionConfig,
     records: vox::Tx<KdBufBatch>,
     cancel: Arc<AtomicBool>,
+    telemetry: TelemetryRegistry,
 ) -> Result<RecordSummary, RecordError> {
     let run_start = Instant::now();
     info!(
@@ -72,7 +77,7 @@ pub async fn run(
     setup_kdebug(&config)?;
     info!(elapsed = ?phase_start.elapsed(), "staxd configured/enabled kdebug");
 
-    let result = drain(&fw, &config, records, cancel).await;
+    let result = drain(&fw, &config, records, cancel, telemetry).await;
 
     let phase_start = Instant::now();
     teardown(&fw);
@@ -152,14 +157,18 @@ fn setup_kdebug(config: &SessionConfig) -> Result<(), RecordError> {
     kdebug::set_buf_size(config.buf_records as i32).map_err(map_kperf_err)?;
     kdebug::setup().map_err(map_kperf_err)?;
 
-    let mut filter = KdRegtype {
-        ty: kdebug::KDBG_RANGETYPE,
-        value1: config.filter_range_value1,
-        value2: config.filter_range_value2,
-        value3: 0,
-        value4: 0,
-    };
-    kdebug::set_filter(&mut filter).map_err(map_kperf_err)?;
+    if config.typefilter_cscs.is_empty() {
+        let mut filter = KdRegtype {
+            ty: kdebug::KDBG_RANGETYPE,
+            value1: config.filter_range_value1,
+            value2: config.filter_range_value2,
+            value3: 0,
+            value4: 0,
+        };
+        kdebug::set_filter(&mut filter).map_err(map_kperf_err)?;
+    } else {
+        kdebug::set_typefilter(config.typefilter_cscs.iter().copied()).map_err(map_kperf_err)?;
+    }
     kdebug::enable(true).map_err(map_kperf_err)?;
     Ok(())
 }
@@ -167,6 +176,23 @@ fn setup_kdebug(config: &SessionConfig) -> Result<(), RecordError> {
 const SEND_QUEUE_CAPACITY: usize = 256;
 const SEND_FLUSH_BUDGET: Duration = Duration::from_secs(2);
 const SLOW_SEND_WAIT: Duration = Duration::from_millis(10);
+const MIN_DRAIN_READ_BATCH_RECORDS: usize = 4_096;
+const MAX_DRAIN_READ_BATCH_RECORDS: usize = 16_384;
+const IDLE_SPIN_READS: u32 = 8;
+const IDLE_YIELD_READS: u32 = 32;
+const KDEBUG_BUFWAIT_TIMEOUT: Duration = Duration::from_millis(1);
+const EMPTY_HEARTBEAT_PERIOD: Duration = Duration::from_millis(100);
+
+#[cfg(target_os = "macos")]
+const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(
+        qos_class: libc::c_uint,
+        relative_priority: libc::c_int,
+    ) -> libc::c_int;
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SendDropStats {
@@ -180,6 +206,63 @@ struct SendSummary {
     sent_batches: u64,
     sent_records: u64,
     max_send_wait_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DrainThreadSummary {
+    records_drained: u64,
+    batches_queued: u64,
+    drops: SendDropStats,
+    session_ns: u64,
+}
+
+#[derive(Default)]
+struct KperfSampleAgeScanner {
+    pending: Option<PendingKperfSample>,
+}
+
+struct PendingKperfSample {
+    timestamp: u64,
+    triggered: bool,
+}
+
+impl KperfSampleAgeScanner {
+    fn feed(&mut self, rec: &KdBuf) -> Option<u64> {
+        if kdebug::kdbg_class(rec.debugid) != DBG_PERF {
+            return None;
+        }
+
+        let subclass = kdebug::kdbg_subclass(rec.debugid);
+        let code = kdebug::kdbg_code(rec.debugid);
+        let func = kdebug::kdbg_func(rec.debugid);
+
+        match (subclass, code, func) {
+            (perf::sc::GENERIC, 0, DBG_FUNC_START) => {
+                self.pending = Some(PendingKperfSample {
+                    timestamp: rec.timestamp & KDBG_TIMESTAMP_MASK,
+                    triggered: false,
+                });
+                None
+            }
+            (perf::sc::GENERIC, 0, DBG_FUNC_END) => {
+                self.pending = None;
+                None
+            }
+            (perf::sc::CALLSTACK, perf::cs::UHDR, _) => {
+                let pending = self.pending.as_mut()?;
+                if pending.triggered {
+                    return None;
+                }
+                let user_frames = (rec.arg2 as u32).saturating_add(rec.arg4 as u32);
+                if user_frames == 0 {
+                    return None;
+                }
+                pending.triggered = true;
+                Some(pending.timestamp)
+            }
+            _ => None,
+        }
+    }
 }
 
 struct BatchSendQueue {
@@ -217,6 +300,9 @@ impl BatchSendQueue {
                             self.drops.dropped_empty_batches.saturating_add(1);
                         return true;
                     }
+                    // flume does not have drop-oldest send. This queue owns
+                    // both ends so kdebug draining can evict one queued batch
+                    // and retry without blocking on downstream Vox credit.
                     match self.drop_rx.try_recv() {
                         Ok(dropped) => self.record_drop(dropped),
                         Err(flume::TryRecvError::Empty) => continue,
@@ -245,18 +331,21 @@ async fn send_batches(
     records: vox::Tx<KdBufBatch>,
     rx: flume::Receiver<KdBufBatch>,
     cancel: Arc<AtomicBool>,
+    send_await_latency: HistogramHandle,
 ) -> SendSummary {
     let mut summary = SendSummary::default();
     while let Ok(mut batch) = rx.recv_async().await {
         let records_in_batch = batch.records.len() as u64;
         batch.send_started_mach_ticks = mach_ticks_now();
         let send_wait_start = Instant::now();
-        if let Err(e) = records.send(batch).await {
+        let send_result = records.send(batch).await;
+        let send_wait = send_wait_start.elapsed();
+        send_await_latency.record_duration(send_wait);
+        if let Err(e) = send_result {
             info!(?e, "client closed records channel; ending staxd sender");
             cancel.store(true, Ordering::Relaxed);
             break;
         }
-        let send_wait = send_wait_start.elapsed();
         summary.sent_batches = summary.sent_batches.saturating_add(1);
         summary.sent_records = summary.sent_records.saturating_add(records_in_batch);
         summary.max_send_wait_ns = summary
@@ -278,37 +367,30 @@ async fn drain(
     config: &SessionConfig,
     records: vox::Tx<KdBufBatch>,
     cancel: Arc<AtomicBool>,
+    telemetry: TelemetryRegistry,
 ) -> Result<RecordSummary, RecordError> {
     let session_start = Instant::now();
-    // Match recorder.rs:377: drain at 2x the sample period so the
-    // ringbuffer never fills up. 1kHz → 2ms.
-    let drain_period =
-        Duration::from_micros(((1_000_000u64 / config.frequency_hz.max(1) as u64) * 2).max(500));
-
-    let mut buf: Vec<KdBuf> = vec![empty_kdbuf(); config.buf_records as usize];
-    let mut total_drained: u64 = 0;
-    let mut first_nonempty_logged = false;
-    let mut send_count: u64 = 0;
-    let mut sleep_before_read = true;
-    let mut last_read_started_mach_ticks = 0u64;
     let mut send_queue = BatchSendQueue::new(SEND_QUEUE_CAPACITY);
-    let mut sender_task =
-        tokio::spawn(send_batches(records, send_queue.receiver(), cancel.clone()));
-    let mut last_drop_log = Instant::now();
-    let mut last_logged_drops = SendDropStats::default();
+    let send_await_latency = telemetry.histogram("staxd.records.send.await_ns");
+    let mut sender_task = tokio::spawn(send_batches(
+        records,
+        send_queue.receiver(),
+        cancel.clone(),
+        send_await_latency,
+    ));
 
     info!(
-        drain_period = ?drain_period,
         buf_records = config.buf_records,
+        min_read_batch_records = MIN_DRAIN_READ_BATCH_RECORDS
+            .min(config.buf_records as usize)
+            .max(1),
+        max_read_batch_records = MAX_DRAIN_READ_BATCH_RECORDS
+            .min(config.buf_records as usize)
+            .max(1),
         send_queue_capacity = SEND_QUEUE_CAPACITY,
-        "staxd drain loop starting"
+        "staxd drain supervisor starting"
     );
 
-    // Signal "kperf/kdebug is configured and enabled" before the
-    // first timed drain. Launch-mode shade uses this as the safe
-    // point to resume a suspended child; waiting for the first real
-    // read can add hundreds of ms and can include stale system-wide
-    // SCHED records unrelated to the target.
     let sent_ready_at_unix_ns = unix_ns_now();
     let sent_ready_mach_ticks = mach_ticks_now();
     if !send_queue.enqueue_drop_oldest(KdBufBatch {
@@ -325,12 +407,134 @@ async fn drain(
             session_ns: session_start.elapsed().as_nanos() as u64,
         });
     }
-    send_count += 1;
     info!(
         elapsed = ?session_start.elapsed(),
         drained_at_unix_ns = sent_ready_at_unix_ns,
         mach_ticks = sent_ready_mach_ticks,
         "staxd sent ready batch"
+    );
+
+    let thread_config = config.clone();
+    let thread_cancel = cancel.clone();
+    let thread_telemetry = telemetry.clone();
+    let drain_thread = thread::Builder::new()
+        .name("staxd-kdebug-drain".to_string())
+        .spawn(move || {
+            drain_kdebug_loop(
+                thread_config,
+                send_queue,
+                thread_cancel,
+                thread_telemetry,
+                session_start,
+                sent_ready_at_unix_ns,
+                1,
+            )
+        })
+        .map_err(|e| RecordError::Sysctl {
+            op: "spawn staxd-kdebug-drain".to_string(),
+            message: e.to_string(),
+        })?;
+
+    let drain_result = match tokio::task::spawn_blocking(move || drain_thread.join()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_panic)) => Err(RecordError::Sysctl {
+            op: "staxd-kdebug-drain".to_string(),
+            message: "thread panicked".to_string(),
+        }),
+        Err(e) => Err(RecordError::Sysctl {
+            op: "join staxd-kdebug-drain".to_string(),
+            message: e.to_string(),
+        }),
+    };
+
+    let send_summary = match tokio::time::timeout(SEND_FLUSH_BUDGET, &mut sender_task).await {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(e)) => {
+            warn!("staxd sender task join failed: {e}");
+            SendSummary::default()
+        }
+        Err(_) => {
+            sender_task.abort();
+            warn!(
+                budget = ?SEND_FLUSH_BUDGET,
+                "staxd sender did not flush before teardown; aborting"
+            );
+            SendSummary::default()
+        }
+    };
+
+    let drain_summary = drain_result?;
+    info!(
+        records_drained = drain_summary.records_drained,
+        batches_queued = drain_summary.batches_queued,
+        sent_batches = send_summary.sent_batches,
+        sent_records = send_summary.sent_records,
+        max_send_wait_ns = send_summary.max_send_wait_ns,
+        dropped_batches = drain_summary.drops.dropped_batches,
+        dropped_empty_batches = drain_summary.drops.dropped_empty_batches,
+        dropped_records = drain_summary.drops.dropped_records,
+        elapsed_ns = drain_summary.session_ns,
+        "staxd drain loop ended"
+    );
+
+    Ok(RecordSummary {
+        records_drained: drain_summary.records_drained,
+        session_ns: drain_summary.session_ns,
+    })
+}
+
+fn drain_kdebug_loop(
+    config: SessionConfig,
+    mut send_queue: BatchSendQueue,
+    cancel: Arc<AtomicBool>,
+    telemetry: TelemetryRegistry,
+    session_start: Instant,
+    sent_ready_at_unix_ns: u64,
+    mut send_count: u64,
+) -> Result<DrainThreadSummary, RecordError> {
+    set_drain_thread_qos();
+
+    let min_read_batch_records = MIN_DRAIN_READ_BATCH_RECORDS
+        .min(config.buf_records as usize)
+        .max(1);
+    let max_read_batch_records = MAX_DRAIN_READ_BATCH_RECORDS
+        .min(config.buf_records as usize)
+        .max(min_read_batch_records);
+    let mut read_batch_records = min_read_batch_records;
+    let mut buf: Vec<KdBuf> = vec![empty_kdbuf(); max_read_batch_records];
+    let mut total_drained: u64 = 0;
+    let mut first_nonempty_logged = false;
+    let mut last_read_started_mach_ticks = 0u64;
+    let mut consecutive_empty_reads = 0u32;
+    let mut last_empty_heartbeat = Instant::now();
+    let mut last_drop_log = Instant::now();
+    let mut last_slow_drain_log = Instant::now() - Duration::from_secs(1);
+    let mut last_logged_drops = SendDropStats::default();
+    let mut logged_bufwait_error = false;
+
+    let read_gap_latency = telemetry.histogram("staxd.kdebug.read_gap_ns");
+    let read_latency = telemetry.histogram("staxd.kdebug.read.ns");
+    let read_records = telemetry.histogram("staxd.kdebug.read.records");
+    let idle_wait_latency = telemetry.histogram("staxd.kdebug.bufwait.ns");
+    let idle_wait_threshold_wakeups = telemetry.counter("staxd.kdebug.bufwait.threshold_wakeups");
+    let idle_wait_timeouts = telemetry.counter("staxd.kdebug.bufwait.timeouts");
+    let idle_wait_errors = telemetry.counter("staxd.kdebug.bufwait.errors");
+    let oldest_record_age_latency = telemetry.histogram("staxd.kdebug.record_age.oldest_ns");
+    let newest_record_age_latency = telemetry.histogram("staxd.kdebug.record_age.newest_ns");
+    let kperf_age_at_read_start_latency =
+        telemetry.histogram("staxd.kdebug.kperf_sample_age.at_read_start_ns");
+    let kperf_age_at_read_done_latency =
+        telemetry.histogram("staxd.kdebug.kperf_sample_age.at_read_done_ns");
+    let mut kperf_age_scanner = KperfSampleAgeScanner::default();
+
+    info!(
+        min_read_batch_records,
+        max_read_batch_records,
+        idle_spin_reads = IDLE_SPIN_READS,
+        idle_yield_reads = IDLE_YIELD_READS,
+        bufwait_timeout = ?KDEBUG_BUFWAIT_TIMEOUT,
+        empty_heartbeat_period = ?EMPTY_HEARTBEAT_PERIOD,
+        "staxd kdebug drain thread starting"
     );
 
     loop {
@@ -339,10 +543,27 @@ async fn drain(
             break;
         }
 
-        if sleep_before_read {
-            tokio::time::sleep(drain_period).await;
-        } else {
-            tokio::task::yield_now().await;
+        if consecutive_empty_reads > 0 {
+            if consecutive_empty_reads <= IDLE_SPIN_READS {
+                std::hint::spin_loop();
+            } else if consecutive_empty_reads <= IDLE_YIELD_READS {
+                thread::yield_now();
+            } else {
+                let wait_started = Instant::now();
+                match kdebug::wait_for_buffer(KDEBUG_BUFWAIT_TIMEOUT) {
+                    Ok(true) => idle_wait_threshold_wakeups.inc(1),
+                    Ok(false) => idle_wait_timeouts.inc(1),
+                    Err(e) => {
+                        idle_wait_errors.inc(1);
+                        if !logged_bufwait_error {
+                            warn!("KERN_KDBUFWAIT failed: {e}; falling back to thread sleep");
+                            logged_bufwait_error = true;
+                        }
+                        thread::sleep(KDEBUG_BUFWAIT_TIMEOUT);
+                    }
+                }
+                idle_wait_latency.record_duration(wait_started.elapsed());
+            }
         }
 
         if cancel.load(Ordering::Relaxed) {
@@ -356,8 +577,12 @@ async fn drain(
         } else {
             elapsed_ticks_to_ns(read_started_mach_ticks, last_read_started_mach_ticks)
         };
+        if read_gap_ns != 0 {
+            read_gap_latency.record(read_gap_ns);
+        }
         last_read_started_mach_ticks = read_started_mach_ticks;
-        let n = match kdebug::read_trace(&mut buf) {
+
+        let n = match kdebug::read_trace(&mut buf[..read_batch_records]) {
             Ok(n) => n,
             Err(e) => {
                 warn!("KERN_KDREADTR failed: {e}; ending session");
@@ -365,11 +590,61 @@ async fn drain(
             }
         };
         let drained_mach_ticks = mach_ticks_now();
-        total_drained += n as u64;
         let drained_at_unix_ns = unix_ns_now();
+        read_latency.record(elapsed_ticks_to_ns(
+            drained_mach_ticks,
+            read_started_mach_ticks,
+        ));
+
+        if n == 0 {
+            read_batch_records = min_read_batch_records;
+            consecutive_empty_reads = consecutive_empty_reads.saturating_add(1);
+            if last_empty_heartbeat.elapsed() >= EMPTY_HEARTBEAT_PERIOD {
+                if !send_queue.enqueue_drop_oldest(KdBufBatch {
+                    records: Vec::new(),
+                    read_started_mach_ticks,
+                    drained_mach_ticks,
+                    queued_for_send_mach_ticks: mach_ticks_now(),
+                    send_started_mach_ticks: 0,
+                    drained_at_unix_ns,
+                }) {
+                    info!("records sender closed; ending session");
+                    break;
+                }
+                send_count = send_count.saturating_add(1);
+                last_empty_heartbeat = Instant::now();
+            }
+            continue;
+        }
+
+        if n == read_batch_records && read_batch_records < max_read_batch_records {
+            read_batch_records = read_batch_records
+                .saturating_mul(2)
+                .min(max_read_batch_records);
+        } else if n < read_batch_records / 4 && read_batch_records > min_read_batch_records {
+            read_batch_records = (read_batch_records / 2).max(min_read_batch_records);
+        }
+
+        consecutive_empty_reads = 0;
+        last_empty_heartbeat = Instant::now();
+        total_drained = total_drained.saturating_add(n as u64);
+        read_records.record(n as u64);
+
         let oldest_record_age_ns = oldest_record_age_ns(&buf, n, read_started_mach_ticks);
         let newest_record_age_ns = newest_record_age_ns(&buf, n, read_started_mach_ticks);
-        if n > 0 && !first_nonempty_logged {
+        oldest_record_age_latency.record(oldest_record_age_ns);
+        newest_record_age_latency.record(newest_record_age_ns);
+        for rec in &buf[..n] {
+            let Some(kperf_ts) = kperf_age_scanner.feed(rec) else {
+                continue;
+            };
+            kperf_age_at_read_start_latency
+                .record(elapsed_ticks_to_ns(read_started_mach_ticks, kperf_ts));
+            kperf_age_at_read_done_latency
+                .record(elapsed_ticks_to_ns(drained_mach_ticks, kperf_ts));
+        }
+
+        if !first_nonempty_logged {
             first_nonempty_logged = true;
             info!(
                 elapsed = ?session_start.elapsed(),
@@ -387,10 +662,6 @@ async fn drain(
             );
         }
 
-        // Always send a batch, even when n == 0. The send doubles
-        // as our detection of "client went away" — without it, the
-        // drain loop spins forever holding ktrace ownership long
-        // after the client disconnected.
         let records_vec = buf[..n].to_vec();
         let queued_for_send_mach_ticks = mach_ticks_now();
         let batch = KdBufBatch {
@@ -405,6 +676,8 @@ async fn drain(
             info!("records sender closed; ending session");
             break;
         }
+        send_count = send_count.saturating_add(1);
+
         let drops = send_queue.stats();
         if drops.dropped_records != last_logged_drops.dropped_records
             && last_drop_log.elapsed() >= Duration::from_secs(1)
@@ -418,51 +691,39 @@ async fn drain(
             last_logged_drops = drops;
             last_drop_log = Instant::now();
         }
-        if oldest_record_age_ns >= 100_000_000 || read_gap_ns >= 100_000_000 {
+        if (oldest_record_age_ns >= 100_000_000 || read_gap_ns >= 100_000_000)
+            && last_slow_drain_log.elapsed() >= Duration::from_secs(1)
+        {
             info!(
                 records = n,
-                read_gap_ns, oldest_record_age_ns, newest_record_age_ns, "staxd slow drain cycle"
+                read_batch_records,
+                read_gap_ns,
+                oldest_record_age_ns,
+                newest_record_age_ns,
+                "staxd slow drain cycle"
             );
+            last_slow_drain_log = Instant::now();
         }
-        sleep_before_read = n == 0;
-        send_count += 1;
     }
 
     let final_drops = send_queue.stats();
     drop(send_queue);
-    let send_summary = match tokio::time::timeout(SEND_FLUSH_BUDGET, &mut sender_task).await {
-        Ok(Ok(summary)) => summary,
-        Ok(Err(e)) => {
-            warn!("staxd sender task join failed: {e}");
-            SendSummary::default()
-        }
-        Err(_) => {
-            sender_task.abort();
-            warn!(
-                budget = ?SEND_FLUSH_BUDGET,
-                "staxd sender did not flush before teardown; aborting"
-            );
-            SendSummary::default()
-        }
-    };
-
-    info!(
-        records_drained = total_drained,
-        batches_queued = send_count,
-        sent_batches = send_summary.sent_batches,
-        sent_records = send_summary.sent_records,
-        max_send_wait_ns = send_summary.max_send_wait_ns,
-        dropped_batches = final_drops.dropped_batches,
-        dropped_empty_batches = final_drops.dropped_empty_batches,
-        dropped_records = final_drops.dropped_records,
-        elapsed = ?session_start.elapsed(),
-        "staxd drain loop ended"
-    );
-
-    Ok(RecordSummary {
+    Ok(DrainThreadSummary {
         records_drained: total_drained,
-        session_ns: session_start.elapsed().as_nanos() as u64,
+        batches_queued: send_count,
+        drops: final_drops,
+        session_ns: session_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
     })
+}
+
+fn set_drain_thread_qos() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        if rc != 0 {
+            warn!(errno = rc, "failed to raise staxd kdebug drain thread QoS");
+        }
+    }
 }
 
 fn teardown(fw: &Frameworks) {

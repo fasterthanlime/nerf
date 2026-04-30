@@ -14,7 +14,7 @@ eyre = "0.6"
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 stax-live-proto = { path = "stax-live-proto" }
-stax-telemetry = { path = "stax-telemetry" }
+metrix = { path = "../metrix" }
 stax-vox-observe = { path = "stax-vox-observe" }
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
 
@@ -52,7 +52,6 @@ members = [
   "xtask",
   "stax-live",
   "stax-live-proto",
-  "stax-telemetry",
   "stax-vox-observe",
   "stax-server",
   "stax-shade",

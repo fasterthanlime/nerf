@@ -148,11 +148,10 @@ pub struct PetSample {
     pub pmc: PmuSample,
 }
 
-/// Race-against-return probe output paired with one kperf
-/// `PetSample` by `(tid, timestamp_ns == kperf_ts)`. This is the
-/// future shade-owned correlated stack probe, kept as an ingest
-/// event/server-side queue because the UI diff path is still the
-/// right shape. staxd must not produce these.
+/// Race/correlation probe output. Triggered probes pair exactly with
+/// one kperf `PetSample` by `(tid, timestamp_ns == kperf_ts)`;
+/// correlation probes use `kperf_ts` as the probe request timestamp
+/// and pair by nearest timestamp at query time.
 pub struct ProbeResultRecord {
     pub tid: u32,
     pub timing: ProbeTiming,
@@ -161,18 +160,27 @@ pub struct ProbeResultRecord {
     pub mach_lr: u64,
     pub mach_fp: u64,
     pub mach_sp: u64,
-    /// Walked return addresses from the suspended thread, leaf-most
-    /// first; PAC-stripped; does not include the leaf PC.
+    /// Frame-pointer walked return addresses from the suspended
+    /// thread, leaf-most first; PAC-stripped; does not include the
+    /// leaf PC. This is compared against kperf for validation.
     pub mach_walked: Box<[u64]>,
-    /// `true` if framehop produced the walk, `false` for FP-walk
-    /// fallback.
+    /// Compact-unwind-only return addresses from the same captured stack.
+    pub compact_walked: Box<[u64]>,
+    /// Compact-unwind return addresses, following compact DWARF FDE
+    /// references.
+    pub compact_dwarf_walked: Box<[u64]>,
+    /// DWARF-unwound return addresses from the same captured stack.
+    /// This is the candidate stitch stack when FP validation passes.
+    pub dwarf_walked: Box<[u64]>,
+    /// `true` if `dwarf_walked` is available for this capture.
     pub used_framehop: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeTiming {
-    /// Mach-tick timestamp of the matching kperf sample (matches
-    /// the `PetSample::timestamp_ns` field on the same tid).
+    /// Mach-tick pairing key. For triggered probes this is the
+    /// matching kperf sample timestamp; for correlation probes this
+    /// is the independent probe request timestamp.
     pub kperf_ts: u64,
     pub staxd_read_started: u64,
     pub staxd_drained: u64,

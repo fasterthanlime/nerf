@@ -1,14 +1,15 @@
 use gimli::{self, CfaRule, EvaluationResult, Format, Location, Piece, RegisterRule, Value};
 
 use crate::address_space::{lookup_binary, MemoryReader};
-use crate::arch::{Architecture, Registers, TryInto};
+use crate::arch::{Architecture, Registers, TryInto, UnwindFailure};
 use crate::frame_descriptions::{ContextCache, UnwindInfo, UnwindInfoCache};
 use crate::types::Bitness;
 
 pub struct DwarfResult {
     pub initial_address: u64,
-    pub cfa: Option<u64>,
+    pub cfa: u64,
     pub ra_address: Option<u64>,
+    pub return_address_error: Option<UnwindFailure>,
 }
 
 fn dwarf_get_reg<A, M, R>(
@@ -18,7 +19,7 @@ fn dwarf_get_reg<A, M, R>(
     regs: &A::Regs,
     cfa_value: u64,
     rule: &RegisterRule<R>,
-) -> Option<(u64, u64)>
+) -> Result<(u64, u64), UnwindFailure>
 where
     A: Architecture,
     M: MemoryReader<A>,
@@ -39,17 +40,17 @@ where
                 Some(value) => value,
                 None => {
                     debug!( "Cannot grab register {:?} for frame #{}: failed to fetch it from 0x{:016X}", A::register_name( register ), nth_frame, value_address );
-                    return None;
+                    return Err(UnwindFailure::RegisterMemoryReadFailed);
                 }
             };
             (value_address, value)
         }
         RegisterRule::Expression(ref expression) => {
             let value_address = match evaluate_dwarf_expression(memory, regs, expression.clone()) {
-                Some(value) => value,
-                None => {
+                Ok(value) => value,
+                Err(_) => {
                     debug!( "Cannot grab register {:?} for frame #{}: failed to evaluate DWARF bytecode", A::register_name( register ), nth_frame );
-                    return None;
+                    return Err(UnwindFailure::RegisterExpressionFailed);
                 }
             };
 
@@ -57,7 +58,7 @@ where
                 Some(value) => value,
                 None => {
                     debug!( "Cannot grab register {:?} for frame #{}: failed to fetch it from 0x{:016X}", A::register_name( register ), nth_frame, value_address );
-                    return None;
+                    return Err(UnwindFailure::RegisterMemoryReadFailed);
                 }
             };
 
@@ -68,7 +69,7 @@ where
                 "Handling for this register rule is unimplemented: {:?}",
                 rule
             );
-            return None;
+            return Err(UnwindFailure::UnsupportedRegisterRule);
         }
     };
 
@@ -78,14 +79,14 @@ where
         nth_frame,
         value
     );
-    Some((value_address, value.into()))
+    Ok((value_address, value.into()))
 }
 
 fn evaluate_dwarf_expression<A, M, R>(
     memory: &M,
     regs: &A::Regs,
     expr: gimli::read::Expression<R>,
-) -> Option<u64>
+) -> Result<u64, UnwindFailure>
 where
     A: Architecture,
     M: MemoryReader<A>,
@@ -132,12 +133,12 @@ where
                         }
                         piece => {
                             error!("Unhandled DWARF evaluation result: {:?}", piece);
-                            return None;
+                            return Err(UnwindFailure::CfaExpressionFailed);
                         }
                     }
                 } else {
                     error!("Unhandled DWARF evaluation result: {:?}", pieces);
-                    return None;
+                    return Err(UnwindFailure::CfaExpressionFailed);
                 }
             }
             Ok(EvaluationResult::RequiresRegister {
@@ -146,14 +147,14 @@ where
             }) => {
                 if base_type != gimli::UnitOffset(Default::default()) {
                     error!( "Failed to evaluate DWARF expression: unsupported base type in RequiresRegister rule: {:?}", base_type );
-                    return None;
+                    return Err(UnwindFailure::CfaExpressionFailed);
                 }
 
                 let reg_value = match regs.get(register.0) {
                     Some(reg_value) => reg_value.into(),
                     None => {
                         error!( "Failed to evaluate DWARF expression due to a missing value of register {:?}", A::register_name( register.0 ) );
-                        return None;
+                        return Err(UnwindFailure::CfaExpressionFailed);
                     }
                 };
 
@@ -172,21 +173,21 @@ where
             }) if size as usize == std::mem::size_of::<A::RegTy>() => {
                 if base_type != gimli::UnitOffset(Default::default()) {
                     error!( "Failed to evaluate DWARF expression: unsupported base type in RequiresMemory rule: {:?}", base_type );
-                    return None;
+                    return Err(UnwindFailure::CfaExpressionFailed);
                 }
 
                 let address = match crate::arch::TryFrom::try_from(address) {
                     Some(address) => address,
                     None => {
                         error!( "Failed to evaluate DWARF expression: out of range address in a RequiresMemory rule: 0x{:016X}", address );
-                        return None;
+                        return Err(UnwindFailure::CfaExpressionFailed);
                     }
                 };
                 let raw_value = match memory.get_pointer_at_address(address) {
                     Some(raw_value) => raw_value.into(),
                     None => {
                         error!( "Failed to evaluate DWARF expression: couldn't fetch {} bytes from 0x{:016X}", size, address );
-                        return None;
+                        return Err(UnwindFailure::CfaExpressionFailed);
                     }
                 };
 
@@ -206,16 +207,16 @@ where
                     "Failed to evaluate DWARF expression due to unhandled requirement: {:?}",
                     result
                 );
-                return None;
+                return Err(UnwindFailure::CfaExpressionFailed);
             }
             Err(error) => {
                 error!("Failed to evaluate DWARF expression: {:?}", error);
-                return None;
+                return Err(UnwindFailure::CfaExpressionFailed);
             }
         }
     }
 
-    Some(value)
+    Ok(value)
 }
 
 fn dwarf_unwind_impl<A: Architecture, M: MemoryReader<A>>(
@@ -225,7 +226,7 @@ fn dwarf_unwind_impl<A: Architecture, M: MemoryReader<A>>(
     unwind_info: &UnwindInfo<A::Endianity>,
     next_regs: &mut Vec<(u16, u64)>,
     ra_address: &mut Option<u64>,
-) -> Option<(u64, bool)> {
+) -> Result<(u64, bool, Option<UnwindFailure>), UnwindFailure> {
     debug!(
         "Initial address for frame #{}: 0x{:016X}",
         nth_frame,
@@ -248,7 +249,7 @@ fn dwarf_unwind_impl<A: Architecture, M: MemoryReader<A>>(
                         nth_frame,
                         A::register_name(cfa_register.0)
                     );
-                    return None;
+                    return Err(UnwindFailure::MissingCfaRegister);
                 }
             };
 
@@ -264,78 +265,49 @@ fn dwarf_unwind_impl<A: Architecture, M: MemoryReader<A>>(
             value
         }
         CfaRule::Expression(expr) => {
-            let value = evaluate_dwarf_expression(memory, regs, expr)?;
+            let value = evaluate_dwarf_expression(memory, regs, expr)
+                .map_err(|_| UnwindFailure::CfaExpressionFailed)?;
             debug!("Evaluated CFA for frame #{}: 0x{:016X}", nth_frame, value);
             value
         }
     };
 
     let mut cacheable = true;
+    let mut return_address_error = None;
     unwind_info.each_register(|(register, rule)| {
         debug!("  Register {:?}: {:?}", A::register_name(register.0), rule);
 
-        if let Some((value_address, value)) =
-            dwarf_get_reg(nth_frame + 1, register.0, memory, regs, cfa_value, rule)
-        {
-            if register.0 == A::RETURN_ADDRESS_REG {
-                *ra_address = Some(value_address);
-            }
+        match dwarf_get_reg(nth_frame + 1, register.0, memory, regs, cfa_value, rule) {
+            Ok((value_address, value)) => {
+                if register.0 == A::RETURN_ADDRESS_REG {
+                    *ra_address = Some(value_address);
+                }
 
-            next_regs.push((register.0, value));
-        } else {
-            cacheable = false;
+                next_regs.push((register.0, value));
+            }
+            Err(error) => {
+                if register.0 == A::RETURN_ADDRESS_REG {
+                    return_address_error = Some(error);
+                }
+                cacheable = false;
+            }
         }
     });
 
-    Some((cfa_value, cacheable))
+    Ok((cfa_value, cacheable, return_address_error))
 }
 
-pub fn dwarf_unwind<A: Architecture, M: MemoryReader<A>>(
+pub(crate) fn dwarf_unwind_with_info<A: Architecture, M: MemoryReader<A>>(
     nth_frame: usize,
     memory: &M,
-    ctx_cache: &mut ContextCache<A::Endianity>,
-    unwind_cache: &mut UnwindInfoCache,
     regs: &A::Regs,
+    unwind_info: &UnwindInfo<A::Endianity>,
     next_regs: &mut Vec<(u16, u64)>,
-) -> Option<DwarfResult> {
+) -> Result<DwarfResult, UnwindFailure> {
     next_regs.clear();
-
-    let address: u64 = regs
-        .get(A::INSTRUCTION_POINTER_REG)
-        .expect("DWARF unwind: no instruction pointer")
-        .into();
-    if address == 0 {
-        debug!("Instruction pointer is NULL; cannot continue unwinding");
-        return None;
-    }
-
-    let address = if nth_frame == 0 { address } else { address - 1 };
-    let cached_unwind_info = unwind_cache.lookup(address);
-    let mut uncached_unwind_info = None;
-
-    if cached_unwind_info.is_none() {
-        if let Some(binary) = lookup_binary(nth_frame, memory, regs) {
-            uncached_unwind_info = binary.lookup_unwind_row(ctx_cache, address);
-        } else if let Some(registry) = memory.dynamic_fde_registry() {
-            uncached_unwind_info = registry.lookup_unwind_row(ctx_cache, address);
-        }
-    }
-
-    let unwind_info = match cached_unwind_info
-        .as_ref()
-        .or(uncached_unwind_info.as_ref())
-    {
-        Some(unwind_info) => unwind_info,
-        None => {
-            debug!("No unwind info for address 0x{:016X}", address);
-            return None;
-        }
-    };
 
     if unwind_info.is_signal_frame() {
         debug!("Frame #{} is a signal frame!", nth_frame);
-        // TODO: AFAIK this requires some special handling to be 100% correct, although until I can get a testcase that
-        // can demonstrate the necessity of it I'd rather not do anything blind.
     }
 
     let mut ra_address = None;
@@ -349,21 +321,90 @@ pub fn dwarf_unwind<A: Architecture, M: MemoryReader<A>>(
     );
 
     let initial_address = unwind_info.initial_absolute_address();
-    let cfa = match result {
-        Some((cfa, cacheable)) => {
+    let (cfa, return_address_error) = match result {
+        Ok((cfa, _, return_address_error)) => (cfa, return_address_error),
+        Err(error) => return Err(error),
+    };
+
+    Ok(DwarfResult {
+        initial_address,
+        cfa,
+        ra_address,
+        return_address_error,
+    })
+}
+
+pub fn dwarf_unwind<A: Architecture, M: MemoryReader<A>>(
+    nth_frame: usize,
+    memory: &M,
+    ctx_cache: &mut ContextCache<A::Endianity>,
+    unwind_cache: &mut UnwindInfoCache,
+    regs: &A::Regs,
+    next_regs: &mut Vec<(u16, u64)>,
+) -> Result<DwarfResult, UnwindFailure> {
+    next_regs.clear();
+
+    let address: u64 = regs
+        .get(A::INSTRUCTION_POINTER_REG)
+        .ok_or(UnwindFailure::MissingInstructionPointer)?
+        .into();
+    if address == 0 {
+        debug!("Instruction pointer is NULL; cannot continue unwinding");
+        return Err(UnwindFailure::NullInstructionPointer);
+    }
+
+    let address = if nth_frame == 0 { address } else { address - 1 };
+    let cached_unwind_info = unwind_cache.lookup(address);
+    let mut uncached_unwind_info = None;
+
+    if cached_unwind_info.is_none() {
+        if let Some(binary) = lookup_binary(nth_frame, memory, regs) {
+            uncached_unwind_info = binary.lookup_unwind_row(ctx_cache, address);
+        } else if let Some(registry) = memory.dynamic_fde_registry() {
+            uncached_unwind_info = registry.lookup_unwind_row(ctx_cache, address);
+        } else {
+            return Err(UnwindFailure::NoBinary);
+        }
+    }
+
+    let unwind_info = match cached_unwind_info
+        .as_ref()
+        .or(uncached_unwind_info.as_ref())
+    {
+        Some(unwind_info) => unwind_info,
+        None => {
+            debug!("No unwind info for address 0x{:016X}", address);
+            return Err(UnwindFailure::NoUnwindInfo);
+        }
+    };
+
+    let mut ra_address = None;
+    let result = dwarf_unwind_impl(
+        nth_frame,
+        memory,
+        regs,
+        unwind_info,
+        next_regs,
+        &mut ra_address,
+    );
+
+    let initial_address = unwind_info.initial_absolute_address();
+    let (cfa, return_address_error) = match result {
+        Ok((cfa, cacheable, return_address_error)) => {
             if cacheable {
                 if let Some(uncached_unwind_info) = uncached_unwind_info {
                     uncached_unwind_info.cache_into(unwind_cache);
                 }
             }
-            Some(cfa)
+            (cfa, return_address_error)
         }
-        None => None,
+        Err(error) => return Err(error),
     };
 
-    Some(DwarfResult {
+    Ok(DwarfResult {
         initial_address,
         cfa,
         ra_address,
+        return_address_error,
     })
 }

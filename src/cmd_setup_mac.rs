@@ -55,7 +55,7 @@ const NPERFD_LAUNCHD_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
-        <string>staxd=info,stax_mac_kperf_sys=info</string>
+        <string>staxd=info,stax_vox_observe=info,stax_mac_kperf_sys=info</string>
     </dict>
 
     <!-- No StandardOutPath / StandardErrorPath: staxd logs via

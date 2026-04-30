@@ -56,18 +56,20 @@ pub trait SampleSink {
     fn on_macho_byte_source(&mut self, source: std::sync::Arc<dyn MachOByteSource>) {}
 
     /// One race-against-return probe result. The recorder produces
-    /// these in the staxd-driven path: staxd suspends the sampled
-    /// thread shortly after kperf's PMI lands, walks via framehop,
-    /// and ships the result alongside the kperf records. Pair
-    /// against a `SampleEvent` by matching `(tid, timestamp_ns ==
-    /// timing.kperf_ts)`. Default no-op so archive-only sinks ignore.
+    /// these in the staxd-driven path: the attachment helper suspends
+    /// a thread near a kperf observation, captures its user stack, and
+    /// ships the unwound result alongside the kperf records. Triggered
+    /// probes use `timing.kperf_ts` as the exact kperf timestamp;
+    /// correlation probes use it as the probe's own capture key and
+    /// are paired by nearest timestamp. Default no-op so archive-only
+    /// sinks ignore.
     #[allow(unused_variables)]
     fn on_probe_result(&mut self, ev: ProbeResultEvent<'_>) {}
 }
 
-/// Race-against-return probe output for one kperf sample.
-/// `ProbeTiming::kperf_ts` matches the corresponding `SampleEvent`'s
-/// `timestamp_ns`.
+/// Race/correlation probe output. For triggered probes,
+/// `ProbeTiming::kperf_ts` matches the corresponding `SampleEvent`.
+/// For correlation probes, it is the independent probe request time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeTiming {
     pub kperf_ts: u64,
@@ -111,6 +113,9 @@ pub struct ProbeResultEvent<'a> {
     pub mach_fp: u64,
     pub mach_sp: u64,
     pub mach_walked: &'a [u64],
+    pub compact_walked: &'a [u64],
+    pub compact_dwarf_walked: &'a [u64],
+    pub dwarf_walked: &'a [u64],
     pub used_framehop: bool,
 }
 

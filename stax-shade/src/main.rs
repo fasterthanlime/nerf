@@ -104,6 +104,16 @@ struct Cli {
     #[facet(args::named, default)]
     race_kperf: bool,
 
+    /// Evaluation mode: independently sample target threads at the
+    /// correlation frequency, then correlate with nearest kperf samples.
+    #[facet(args::named, default)]
+    correlate_kperf: bool,
+
+    /// Total process-wide shade-side probe frequency for
+    /// `--correlate-kperf`. Defaults to `--frequency`.
+    #[facet(args::named, default)]
+    correlate_frequency: Option<u32>,
+
     /// Working directory to use when launching a target.
     #[facet(args::named, default)]
     cwd: Option<String>,
@@ -130,7 +140,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_logging();
-    let telemetry = stax_telemetry::TelemetryRegistry::new("stax-shade");
+    let telemetry = metrix::TelemetryRegistry::new("stax-shade");
     let _telemetry_registration =
         stax_vox_observe::register_global_telemetry("stax-shade", "process", telemetry.clone());
     let _vox_sigusr1_dump = stax_vox_observe::install_global_sigusr1_dump("stax-shade");
@@ -155,7 +165,7 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run(cli: Cli, telemetry: stax_telemetry::TelemetryRegistry) -> eyre::Result<()> {
+async fn run(cli: Cli, telemetry: metrix::TelemetryRegistry) -> eyre::Result<()> {
     let mode = match (cli.attach, cli.launch, cli.command.first()) {
         (Some(pid), false, _) => AttachMode::Existing(pid),
         (None, true, Some(_)) => AttachMode::Launch(cli.command.clone()),
@@ -248,7 +258,7 @@ async fn run_recording(
     pre_resume: Option<PreResume>,
     terminal: Option<Pty>,
     launched_pid: Option<u32>,
-    telemetry: stax_telemetry::TelemetryRegistry,
+    telemetry: metrix::TelemetryRegistry,
 ) -> eyre::Result<()> {
     let recording_start = Instant::now();
     let run_id_raw = run_id.0;
@@ -259,7 +269,9 @@ async fn run_recording(
         has_pre_resume = pre_resume.is_some(),
         has_terminal = terminal.is_some(),
         race_kperf = cli.race_kperf,
+        correlate_kperf = cli.correlate_kperf,
         frequency_hz = cli.frequency,
+        correlate_frequency_hz = cli.correlate_frequency.unwrap_or(cli.frequency),
         daemon_socket = %cli.daemon_socket,
         "shade recording lifecycle starting"
     );
@@ -300,10 +312,18 @@ async fn run_recording(
 
     let sink = LiveOnlySink::new(Some(Box::new(ingest_sink)));
     sink.notify_target_attached(pid);
-    let stop_via_sink = sink.live_sink_stop_flag();
-    let sink = if cli.race_kperf {
-        tracing::info!("race-kperf probe enabled");
-        probe::RaceKperfSink::enabled(task, sink)
+    let probe_mode = if cli.correlate_kperf {
+        Some(probe::RaceProbeMode::Correlated {
+            frequency_hz: cli.correlate_frequency.unwrap_or(cli.frequency),
+        })
+    } else if cli.race_kperf {
+        Some(probe::RaceProbeMode::Triggered)
+    } else {
+        None
+    };
+    let sink = if let Some(mode) = probe_mode {
+        tracing::info!(?mode, "kperf probe evaluation enabled");
+        probe::RaceKperfSink::enabled(pid, task, sink, mode)
     } else {
         probe::RaceKperfSink::disabled(sink)
     };
@@ -315,6 +335,11 @@ async fn run_recording(
         frequency_hz: cli.frequency,
         duration: cli.time_limit.map(Duration::from_secs),
         telemetry: Some(telemetry.clone()),
+        kdebug_filter: if cli.race_kperf || cli.correlate_kperf {
+            staxd_client::KdebugFilter::RaceKperfOnly
+        } else {
+            staxd_client::KdebugFilter::Live
+        },
         ..Default::default()
     };
     let drive_pid = opts.pid;
@@ -324,27 +349,34 @@ async fn run_recording(
     let server_stop_requested = Arc::new(AtomicBool::new(false));
     let server_stop_for_task = server_stop_requested.clone();
     tokio::spawn(async move {
-        match commands.recv().await {
-            Ok(Some(command_sref)) => {
-                let mut command = None;
-                let _ = command_sref.map(|value| {
-                    command = Some(value);
-                });
-                match command {
-                    Some(ShadeCommand::Stop) => {
-                        tracing::info!("stop requested by stax-server");
-                        server_stop_for_task.store(true, Ordering::Relaxed);
+        loop {
+            match commands.recv().await {
+                Ok(Some(command_sref)) => {
+                    let mut command = None;
+                    let _ = command_sref.map(|value| {
+                        command = Some(value);
+                    });
+                    match command {
+                        Some(ShadeCommand::Stop) => {
+                            tracing::info!("stop requested by stax-server");
+                            server_stop_for_task.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        None => {}
                     }
-                    None => {}
                 }
-            }
-            Ok(None) => {
-                tracing::info!("shade command channel closed");
-                server_stop_for_task.store(true, Ordering::Relaxed);
-            }
-            Err(e) => {
-                tracing::warn!("shade command channel failed: {e:?}");
-                server_stop_for_task.store(true, Ordering::Relaxed);
+                Ok(None) => {
+                    tracing::info!(
+                        "shade command channel closed; explicit server stop unavailable"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "shade command channel failed: {e:?}; explicit server stop unavailable"
+                    );
+                    break;
+                }
             }
         }
     });
@@ -366,14 +398,16 @@ async fn run_recording(
         elapsed = ?recording_start.elapsed(),
         "shade entering staxd-client drive_session"
     );
+    let mut stop_reason_logged = false;
     let result = staxd_client::drive_session_with_hooks(
         opts,
         sink,
         move || {
             if server_stop_requested.load(Ordering::Relaxed) {
-                return true;
-            }
-            if stop_via_sink() {
+                if !stop_reason_logged {
+                    stop_reason_logged = true;
+                    tracing::info!("shade stopping recording: explicit server stop");
+                }
                 return true;
             }
             if let Some(pid) = launched_pid
@@ -383,6 +417,12 @@ async fn run_recording(
                     .is_none()
                 && let Some(exit) = launched_child_exited(pid)
             {
+                tracing::info!(
+                    pid,
+                    code = exit.code,
+                    signal = exit.signal,
+                    "launched target exited; stopping recording"
+                );
                 *child_exit_for_stop.lock().expect("child_exit poisoned") = Some(exit);
                 return true;
             }
@@ -722,7 +762,7 @@ fn launch_suspended(
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ChildExit {
     code: Option<i32>,
     signal: Option<i32>,
@@ -736,11 +776,28 @@ fn launched_child_exited(pid: u32) -> Option<ChildExit> {
     if r == pid as libc::pid_t {
         Some(decode_wait_status(status))
     } else if r == -1 {
-        Some(ChildExit {
-            code: None,
-            signal: None,
-        })
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => {
+                tracing::debug!(pid, "waitpid interrupted while polling launched target");
+            }
+            _ => {
+                tracing::warn!(
+                    pid,
+                    error = %err,
+                    "waitpid failed while polling launched target; keeping recording alive"
+                );
+            }
+        }
+        None
+    } else if r == 0 {
+        None
     } else {
+        tracing::warn!(
+            pid,
+            returned_pid = r,
+            "waitpid returned an unexpected child while polling launched target; keeping recording alive"
+        );
         None
     }
 }
@@ -753,14 +810,37 @@ fn terminate_launched_child(pid: u32) -> Option<ChildExit> {
         // Match the previous CLI ChildGuard semantics: when the
         // recording ends because of a time limit or user stop, the
         // launched target is not left running in the background.
+        tracing::warn!(pid, "terminating launched target after recording ended");
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
             libc::waitpid(pid as libc::pid_t, &mut status, 0);
         }
-        Some(decode_wait_status(status))
+        let exit = decode_wait_status(status);
+        tracing::info!(
+            pid,
+            code = exit.code,
+            signal = exit.signal,
+            "launched target terminated"
+        );
+        Some(exit)
     } else if r == pid as libc::pid_t {
-        Some(decode_wait_status(status))
+        let exit = decode_wait_status(status);
+        tracing::info!(
+            pid,
+            code = exit.code,
+            signal = exit.signal,
+            "launched target already exited before termination"
+        );
+        Some(exit)
     } else {
+        if r == -1 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                pid,
+                error = %err,
+                "waitpid failed while terminating launched target"
+            );
+        }
         None
     }
 }
@@ -808,7 +888,7 @@ async fn start_terminal_pump(
     socket: &str,
     run_id: stax_live_proto::RunId,
     mut pty: Pty,
-    telemetry: stax_telemetry::TelemetryRegistry,
+    telemetry: metrix::TelemetryRegistry,
 ) -> eyre::Result<TerminalPump> {
     let url = format!("local://{socket}");
     let client: TerminalBrokerClient = vox::connect(&url)
@@ -967,7 +1047,7 @@ async fn register_with_server(
     socket: &str,
     run_id: u64,
     target_pid: u32,
-    telemetry: stax_telemetry::TelemetryRegistry,
+    telemetry: metrix::TelemetryRegistry,
 ) -> eyre::Result<(
     ShadeRegistryClient,
     vox::Rx<ShadeCommand>,

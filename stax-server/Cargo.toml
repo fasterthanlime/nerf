@@ -9,7 +9,7 @@ description = "Unprivileged long-running daemon: hosts the run registry, the liv
 [dependencies]
 stax-live-proto = { path = "../stax-live-proto" }
 stax-live = { path = "../stax-live" }
-stax-telemetry = { path = "../stax-telemetry" }
+metrix = { path = "../../metrix" }
 stax-shade-proto = { path = "../stax-shade-proto" }
 stax-vox-observe = { version = "0.1", path = "../stax-vox-observe" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }

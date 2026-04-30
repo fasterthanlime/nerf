@@ -449,6 +449,8 @@ public struct ProbeTimingSummary: Codable, Sendable {
     public var maxKperfToEnqueueNs: UInt64
     public var avgKperfToStaxdReadNs: UInt64
     public var maxKperfToStaxdReadNs: UInt64
+    public var avgKperfToStaxdDrainNs: UInt64
+    public var maxKperfToStaxdDrainNs: UInt64
     public var avgStaxdReadNs: UInt64
     public var maxStaxdReadNs: UInt64
     public var avgStaxdDrainToSendNs: UInt64
@@ -476,12 +478,14 @@ public struct ProbeTimingSummary: Codable, Sendable {
     public var coalescedRequests: UInt64
     public var maxWorkerBatchLen: UInt32
 
-    nonisolated public init(samples: UInt64, avgKperfToEnqueueNs: UInt64, maxKperfToEnqueueNs: UInt64, avgKperfToStaxdReadNs: UInt64, maxKperfToStaxdReadNs: UInt64, avgStaxdReadNs: UInt64, maxStaxdReadNs: UInt64, avgStaxdDrainToSendNs: UInt64, maxStaxdDrainToSendNs: UInt64, avgStaxdDrainToQueueNs: UInt64, maxStaxdDrainToQueueNs: UInt64, avgStaxdQueueWaitNs: UInt64, maxStaxdQueueWaitNs: UInt64, avgStaxdSendToClientRecvNs: UInt64, maxStaxdSendToClientRecvNs: UInt64, avgClientRecvToEnqueueNs: UInt64, maxClientRecvToEnqueueNs: UInt64, avgQueueWaitNs: UInt64, maxQueueWaitNs: UInt64, avgLookupNs: UInt64, maxLookupNs: UInt64, avgSuspendStateNs: UInt64, maxSuspendStateNs: UInt64, avgResumeNs: UInt64, maxResumeNs: UInt64, avgWalkNs: UInt64, maxWalkNs: UInt64, avgProbeTotalNs: UInt64, maxProbeTotalNs: UInt64, coalescedRequests: UInt64, maxWorkerBatchLen: UInt32) {
+    nonisolated public init(samples: UInt64, avgKperfToEnqueueNs: UInt64, maxKperfToEnqueueNs: UInt64, avgKperfToStaxdReadNs: UInt64, maxKperfToStaxdReadNs: UInt64, avgKperfToStaxdDrainNs: UInt64, maxKperfToStaxdDrainNs: UInt64, avgStaxdReadNs: UInt64, maxStaxdReadNs: UInt64, avgStaxdDrainToSendNs: UInt64, maxStaxdDrainToSendNs: UInt64, avgStaxdDrainToQueueNs: UInt64, maxStaxdDrainToQueueNs: UInt64, avgStaxdQueueWaitNs: UInt64, maxStaxdQueueWaitNs: UInt64, avgStaxdSendToClientRecvNs: UInt64, maxStaxdSendToClientRecvNs: UInt64, avgClientRecvToEnqueueNs: UInt64, maxClientRecvToEnqueueNs: UInt64, avgQueueWaitNs: UInt64, maxQueueWaitNs: UInt64, avgLookupNs: UInt64, maxLookupNs: UInt64, avgSuspendStateNs: UInt64, maxSuspendStateNs: UInt64, avgResumeNs: UInt64, maxResumeNs: UInt64, avgWalkNs: UInt64, maxWalkNs: UInt64, avgProbeTotalNs: UInt64, maxProbeTotalNs: UInt64, coalescedRequests: UInt64, maxWorkerBatchLen: UInt32) {
         self.samples = samples
         self.avgKperfToEnqueueNs = avgKperfToEnqueueNs
         self.maxKperfToEnqueueNs = maxKperfToEnqueueNs
         self.avgKperfToStaxdReadNs = avgKperfToStaxdReadNs
         self.maxKperfToStaxdReadNs = maxKperfToStaxdReadNs
+        self.avgKperfToStaxdDrainNs = avgKperfToStaxdDrainNs
+        self.maxKperfToStaxdDrainNs = maxKperfToStaxdDrainNs
         self.avgStaxdReadNs = avgStaxdReadNs
         self.maxStaxdReadNs = maxStaxdReadNs
         self.avgStaxdDrainToSendNs = avgStaxdDrainToSendNs
@@ -513,15 +517,23 @@ public struct ProbeTimingSummary: Codable, Sendable {
 
 public struct ProbeDiffThread: Codable, Sendable {
     public var tid: UInt32
+    public var kperfSamples: UInt64
+    public var probeResults: UInt64
     public var paired: UInt64
+    public var kperfOnly: UInt64
+    public var probeOnly: UInt64
     public var pcMatch: UInt64
     public var stitchable: UInt64
     public var avgCommonSuffix: Float
     public var threadName: String?
 
-    nonisolated public init(tid: UInt32, paired: UInt64, pcMatch: UInt64, stitchable: UInt64, avgCommonSuffix: Float, threadName: String?) {
+    nonisolated public init(tid: UInt32, kperfSamples: UInt64, probeResults: UInt64, paired: UInt64, kperfOnly: UInt64, probeOnly: UInt64, pcMatch: UInt64, stitchable: UInt64, avgCommonSuffix: Float, threadName: String?) {
         self.tid = tid
+        self.kperfSamples = kperfSamples
+        self.probeResults = probeResults
         self.paired = paired
+        self.kperfOnly = kperfOnly
+        self.probeOnly = probeOnly
         self.pcMatch = pcMatch
         self.stitchable = stitchable
         self.avgCommonSuffix = avgCommonSuffix
@@ -544,6 +556,7 @@ public struct ProbeTimingBreakdown: Codable, Sendable {
     public var walkDoneTicks: UInt64
     public var kperfToEnqueueNs: UInt64
     public var kperfToStaxdReadNs: UInt64
+    public var kperfToStaxdDrainNs: UInt64
     public var staxdReadNs: UInt64
     public var staxdDrainToSendNs: UInt64
     public var staxdDrainToQueueNs: UInt64
@@ -557,7 +570,7 @@ public struct ProbeTimingBreakdown: Codable, Sendable {
     public var walkNs: UInt64
     public var probeTotalNs: UInt64
 
-    nonisolated public init(kperfTsTicks: UInt64, staxdReadStartedTicks: UInt64, staxdDrainedTicks: UInt64, staxdQueuedForSendTicks: UInt64, staxdSendStartedTicks: UInt64, clientReceivedTicks: UInt64, enqueuedTicks: UInt64, workerStartedTicks: UInt64, threadLookupDoneTicks: UInt64, stateDoneTicks: UInt64, resumeDoneTicks: UInt64, walkDoneTicks: UInt64, kperfToEnqueueNs: UInt64, kperfToStaxdReadNs: UInt64, staxdReadNs: UInt64, staxdDrainToSendNs: UInt64, staxdDrainToQueueNs: UInt64, staxdQueueWaitNs: UInt64, staxdSendToClientRecvNs: UInt64, clientRecvToEnqueueNs: UInt64, queueWaitNs: UInt64, lookupNs: UInt64, suspendStateNs: UInt64, resumeNs: UInt64, walkNs: UInt64, probeTotalNs: UInt64) {
+    nonisolated public init(kperfTsTicks: UInt64, staxdReadStartedTicks: UInt64, staxdDrainedTicks: UInt64, staxdQueuedForSendTicks: UInt64, staxdSendStartedTicks: UInt64, clientReceivedTicks: UInt64, enqueuedTicks: UInt64, workerStartedTicks: UInt64, threadLookupDoneTicks: UInt64, stateDoneTicks: UInt64, resumeDoneTicks: UInt64, walkDoneTicks: UInt64, kperfToEnqueueNs: UInt64, kperfToStaxdReadNs: UInt64, kperfToStaxdDrainNs: UInt64, staxdReadNs: UInt64, staxdDrainToSendNs: UInt64, staxdDrainToQueueNs: UInt64, staxdQueueWaitNs: UInt64, staxdSendToClientRecvNs: UInt64, clientRecvToEnqueueNs: UInt64, queueWaitNs: UInt64, lookupNs: UInt64, suspendStateNs: UInt64, resumeNs: UInt64, walkNs: UInt64, probeTotalNs: UInt64) {
         self.kperfTsTicks = kperfTsTicks
         self.staxdReadStartedTicks = staxdReadStartedTicks
         self.staxdDrainedTicks = staxdDrainedTicks
@@ -572,6 +585,7 @@ public struct ProbeTimingBreakdown: Codable, Sendable {
         self.walkDoneTicks = walkDoneTicks
         self.kperfToEnqueueNs = kperfToEnqueueNs
         self.kperfToStaxdReadNs = kperfToStaxdReadNs
+        self.kperfToStaxdDrainNs = kperfToStaxdDrainNs
         self.staxdReadNs = staxdReadNs
         self.staxdDrainToSendNs = staxdDrainToSendNs
         self.staxdDrainToQueueNs = staxdDrainToQueueNs
@@ -848,12 +862,16 @@ public struct DiagnosticsSnapshot: Codable, Sendable {
 public struct RunConfig: Codable, Sendable {
     public var label: String
     public var frequencyHz: UInt32
+    public var correlateFrequencyHz: UInt32
     public var raceKperf: Bool
+    public var correlateKperf: Bool
 
-    nonisolated public init(label: String, frequencyHz: UInt32, raceKperf: Bool) {
+    nonisolated public init(label: String, frequencyHz: UInt32, correlateFrequencyHz: UInt32, raceKperf: Bool, correlateKperf: Bool) {
         self.label = label
         self.frequencyHz = frequencyHz
+        self.correlateFrequencyHz = correlateFrequencyHz
         self.raceKperf = raceKperf
+        self.correlateKperf = correlateKperf
     }
 }
 
@@ -1083,9 +1101,10 @@ public struct WireProbeResult: Codable, Sendable {
     public var machFp: UInt64
     public var machSp: UInt64
     public var machWalked: [UInt64]
+    public var dwarfWalked: [UInt64]
     public var usedFramehop: Bool
 
-    nonisolated public init(tid: UInt32, timing: ProbeTiming, queue: ProbeQueueStats, machPc: UInt64, machLr: UInt64, machFp: UInt64, machSp: UInt64, machWalked: [UInt64], usedFramehop: Bool) {
+    nonisolated public init(tid: UInt32, timing: ProbeTiming, queue: ProbeQueueStats, machPc: UInt64, machLr: UInt64, machFp: UInt64, machSp: UInt64, machWalked: [UInt64], dwarfWalked: [UInt64], usedFramehop: Bool) {
         self.tid = tid
         self.timing = timing
         self.queue = queue
@@ -1094,6 +1113,7 @@ public struct WireProbeResult: Codable, Sendable {
         self.machFp = machFp
         self.machSp = machSp
         self.machWalked = machWalked
+        self.dwarfWalked = dwarfWalked
         self.usedFramehop = usedFramehop
     }
 }
@@ -1381,6 +1401,8 @@ nonisolated internal func encodeProbeTimingSummary(_ value: ProbeTimingSummary, 
     encodeVarint(value.maxKperfToEnqueueNs, into: &buffer)
     encodeVarint(value.avgKperfToStaxdReadNs, into: &buffer)
     encodeVarint(value.maxKperfToStaxdReadNs, into: &buffer)
+    encodeVarint(value.avgKperfToStaxdDrainNs, into: &buffer)
+    encodeVarint(value.maxKperfToStaxdDrainNs, into: &buffer)
     encodeVarint(value.avgStaxdReadNs, into: &buffer)
     encodeVarint(value.maxStaxdReadNs, into: &buffer)
     encodeVarint(value.avgStaxdDrainToSendNs, into: &buffer)
@@ -1411,7 +1433,11 @@ nonisolated internal func encodeProbeTimingSummary(_ value: ProbeTimingSummary, 
 
 nonisolated internal func encodeProbeDiffThread(_ value: ProbeDiffThread, into buffer: inout ByteBuffer) {
     encodeU32(value.tid, into: &buffer)
+    encodeVarint(value.kperfSamples, into: &buffer)
+    encodeVarint(value.probeResults, into: &buffer)
     encodeVarint(value.paired, into: &buffer)
+    encodeVarint(value.kperfOnly, into: &buffer)
+    encodeVarint(value.probeOnly, into: &buffer)
     encodeVarint(value.pcMatch, into: &buffer)
     encodeVarint(value.stitchable, into: &buffer)
     encodeF32(value.avgCommonSuffix, into: &buffer)
@@ -1433,6 +1459,7 @@ nonisolated internal func encodeProbeTimingBreakdown(_ value: ProbeTimingBreakdo
     encodeVarint(value.walkDoneTicks, into: &buffer)
     encodeVarint(value.kperfToEnqueueNs, into: &buffer)
     encodeVarint(value.kperfToStaxdReadNs, into: &buffer)
+    encodeVarint(value.kperfToStaxdDrainNs, into: &buffer)
     encodeVarint(value.staxdReadNs, into: &buffer)
     encodeVarint(value.staxdDrainToSendNs, into: &buffer)
     encodeVarint(value.staxdDrainToQueueNs, into: &buffer)
@@ -1596,7 +1623,9 @@ nonisolated internal func encodeDiagnosticsSnapshot(_ value: DiagnosticsSnapshot
 nonisolated internal func encodeRunConfig(_ value: RunConfig, into buffer: inout ByteBuffer) {
     encodeString(value.label, into: &buffer)
     encodeU32(value.frequencyHz, into: &buffer)
+    encodeU32(value.correlateFrequencyHz, into: &buffer)
     encodeBool(value.raceKperf, into: &buffer)
+    encodeBool(value.correlateKperf, into: &buffer)
 }
 
 nonisolated internal func encodeRunControlError(_ value: RunControlError, into buffer: inout ByteBuffer) {
@@ -1775,6 +1804,7 @@ nonisolated internal func encodeWireProbeResult(_ value: WireProbeResult, into b
     encodeVarint(value.machFp, into: &buffer)
     encodeVarint(value.machSp, into: &buffer)
     encodeVec(value.machWalked, into: &buffer, encoder: { val, buf in encodeVarint(val, into: &buf) })
+    encodeVec(value.dwarfWalked, into: &buffer, encoder: { val, buf in encodeVarint(val, into: &buf) })
     encodeBool(value.usedFramehop, into: &buffer)
 }
 
@@ -2129,6 +2159,8 @@ nonisolated internal func decodeProbeTimingSummary(from buffer: inout ByteBuffer
     let _maxKperfToEnqueueNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _avgKperfToStaxdReadNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _maxKperfToStaxdReadNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _avgKperfToStaxdDrainNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _maxKperfToStaxdDrainNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _avgStaxdReadNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _maxStaxdReadNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _avgStaxdDrainToSendNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
@@ -2155,17 +2187,21 @@ nonisolated internal func decodeProbeTimingSummary(from buffer: inout ByteBuffer
     let _maxProbeTotalNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _coalescedRequests = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _maxWorkerBatchLen = try ({ buf in try decodeU32(from: &buf) })(&buffer)
-    return ProbeTimingSummary(samples: _samples, avgKperfToEnqueueNs: _avgKperfToEnqueueNs, maxKperfToEnqueueNs: _maxKperfToEnqueueNs, avgKperfToStaxdReadNs: _avgKperfToStaxdReadNs, maxKperfToStaxdReadNs: _maxKperfToStaxdReadNs, avgStaxdReadNs: _avgStaxdReadNs, maxStaxdReadNs: _maxStaxdReadNs, avgStaxdDrainToSendNs: _avgStaxdDrainToSendNs, maxStaxdDrainToSendNs: _maxStaxdDrainToSendNs, avgStaxdDrainToQueueNs: _avgStaxdDrainToQueueNs, maxStaxdDrainToQueueNs: _maxStaxdDrainToQueueNs, avgStaxdQueueWaitNs: _avgStaxdQueueWaitNs, maxStaxdQueueWaitNs: _maxStaxdQueueWaitNs, avgStaxdSendToClientRecvNs: _avgStaxdSendToClientRecvNs, maxStaxdSendToClientRecvNs: _maxStaxdSendToClientRecvNs, avgClientRecvToEnqueueNs: _avgClientRecvToEnqueueNs, maxClientRecvToEnqueueNs: _maxClientRecvToEnqueueNs, avgQueueWaitNs: _avgQueueWaitNs, maxQueueWaitNs: _maxQueueWaitNs, avgLookupNs: _avgLookupNs, maxLookupNs: _maxLookupNs, avgSuspendStateNs: _avgSuspendStateNs, maxSuspendStateNs: _maxSuspendStateNs, avgResumeNs: _avgResumeNs, maxResumeNs: _maxResumeNs, avgWalkNs: _avgWalkNs, maxWalkNs: _maxWalkNs, avgProbeTotalNs: _avgProbeTotalNs, maxProbeTotalNs: _maxProbeTotalNs, coalescedRequests: _coalescedRequests, maxWorkerBatchLen: _maxWorkerBatchLen)
+    return ProbeTimingSummary(samples: _samples, avgKperfToEnqueueNs: _avgKperfToEnqueueNs, maxKperfToEnqueueNs: _maxKperfToEnqueueNs, avgKperfToStaxdReadNs: _avgKperfToStaxdReadNs, maxKperfToStaxdReadNs: _maxKperfToStaxdReadNs, avgKperfToStaxdDrainNs: _avgKperfToStaxdDrainNs, maxKperfToStaxdDrainNs: _maxKperfToStaxdDrainNs, avgStaxdReadNs: _avgStaxdReadNs, maxStaxdReadNs: _maxStaxdReadNs, avgStaxdDrainToSendNs: _avgStaxdDrainToSendNs, maxStaxdDrainToSendNs: _maxStaxdDrainToSendNs, avgStaxdDrainToQueueNs: _avgStaxdDrainToQueueNs, maxStaxdDrainToQueueNs: _maxStaxdDrainToQueueNs, avgStaxdQueueWaitNs: _avgStaxdQueueWaitNs, maxStaxdQueueWaitNs: _maxStaxdQueueWaitNs, avgStaxdSendToClientRecvNs: _avgStaxdSendToClientRecvNs, maxStaxdSendToClientRecvNs: _maxStaxdSendToClientRecvNs, avgClientRecvToEnqueueNs: _avgClientRecvToEnqueueNs, maxClientRecvToEnqueueNs: _maxClientRecvToEnqueueNs, avgQueueWaitNs: _avgQueueWaitNs, maxQueueWaitNs: _maxQueueWaitNs, avgLookupNs: _avgLookupNs, maxLookupNs: _maxLookupNs, avgSuspendStateNs: _avgSuspendStateNs, maxSuspendStateNs: _maxSuspendStateNs, avgResumeNs: _avgResumeNs, maxResumeNs: _maxResumeNs, avgWalkNs: _avgWalkNs, maxWalkNs: _maxWalkNs, avgProbeTotalNs: _avgProbeTotalNs, maxProbeTotalNs: _maxProbeTotalNs, coalescedRequests: _coalescedRequests, maxWorkerBatchLen: _maxWorkerBatchLen)
 }
 
 nonisolated internal func decodeProbeDiffThread(from buffer: inout ByteBuffer) throws -> ProbeDiffThread {
     let _tid = try ({ buf in try decodeU32(from: &buf) })(&buffer)
+    let _kperfSamples = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _probeResults = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _paired = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _kperfOnly = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _probeOnly = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _pcMatch = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _stitchable = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _avgCommonSuffix = try ({ buf in try decodeF32(from: &buf) })(&buffer)
     let _threadName = try ({ buf in try decodeOption(from: &buf, decoder: { buf in try decodeString(from: &buf) }) })(&buffer)
-    return ProbeDiffThread(tid: _tid, paired: _paired, pcMatch: _pcMatch, stitchable: _stitchable, avgCommonSuffix: _avgCommonSuffix, threadName: _threadName)
+    return ProbeDiffThread(tid: _tid, kperfSamples: _kperfSamples, probeResults: _probeResults, paired: _paired, kperfOnly: _kperfOnly, probeOnly: _probeOnly, pcMatch: _pcMatch, stitchable: _stitchable, avgCommonSuffix: _avgCommonSuffix, threadName: _threadName)
 }
 
 nonisolated internal func decodeProbeTimingBreakdown(from buffer: inout ByteBuffer) throws -> ProbeTimingBreakdown {
@@ -2183,6 +2219,7 @@ nonisolated internal func decodeProbeTimingBreakdown(from buffer: inout ByteBuff
     let _walkDoneTicks = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _kperfToEnqueueNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _kperfToStaxdReadNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _kperfToStaxdDrainNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _staxdReadNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _staxdDrainToSendNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _staxdDrainToQueueNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
@@ -2195,7 +2232,7 @@ nonisolated internal func decodeProbeTimingBreakdown(from buffer: inout ByteBuff
     let _resumeNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _walkNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _probeTotalNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    return ProbeTimingBreakdown(kperfTsTicks: _kperfTsTicks, staxdReadStartedTicks: _staxdReadStartedTicks, staxdDrainedTicks: _staxdDrainedTicks, staxdQueuedForSendTicks: _staxdQueuedForSendTicks, staxdSendStartedTicks: _staxdSendStartedTicks, clientReceivedTicks: _clientReceivedTicks, enqueuedTicks: _enqueuedTicks, workerStartedTicks: _workerStartedTicks, threadLookupDoneTicks: _threadLookupDoneTicks, stateDoneTicks: _stateDoneTicks, resumeDoneTicks: _resumeDoneTicks, walkDoneTicks: _walkDoneTicks, kperfToEnqueueNs: _kperfToEnqueueNs, kperfToStaxdReadNs: _kperfToStaxdReadNs, staxdReadNs: _staxdReadNs, staxdDrainToSendNs: _staxdDrainToSendNs, staxdDrainToQueueNs: _staxdDrainToQueueNs, staxdQueueWaitNs: _staxdQueueWaitNs, staxdSendToClientRecvNs: _staxdSendToClientRecvNs, clientRecvToEnqueueNs: _clientRecvToEnqueueNs, queueWaitNs: _queueWaitNs, lookupNs: _lookupNs, suspendStateNs: _suspendStateNs, resumeNs: _resumeNs, walkNs: _walkNs, probeTotalNs: _probeTotalNs)
+    return ProbeTimingBreakdown(kperfTsTicks: _kperfTsTicks, staxdReadStartedTicks: _staxdReadStartedTicks, staxdDrainedTicks: _staxdDrainedTicks, staxdQueuedForSendTicks: _staxdQueuedForSendTicks, staxdSendStartedTicks: _staxdSendStartedTicks, clientReceivedTicks: _clientReceivedTicks, enqueuedTicks: _enqueuedTicks, workerStartedTicks: _workerStartedTicks, threadLookupDoneTicks: _threadLookupDoneTicks, stateDoneTicks: _stateDoneTicks, resumeDoneTicks: _resumeDoneTicks, walkDoneTicks: _walkDoneTicks, kperfToEnqueueNs: _kperfToEnqueueNs, kperfToStaxdReadNs: _kperfToStaxdReadNs, kperfToStaxdDrainNs: _kperfToStaxdDrainNs, staxdReadNs: _staxdReadNs, staxdDrainToSendNs: _staxdDrainToSendNs, staxdDrainToQueueNs: _staxdDrainToQueueNs, staxdQueueWaitNs: _staxdQueueWaitNs, staxdSendToClientRecvNs: _staxdSendToClientRecvNs, clientRecvToEnqueueNs: _clientRecvToEnqueueNs, queueWaitNs: _queueWaitNs, lookupNs: _lookupNs, suspendStateNs: _suspendStateNs, resumeNs: _resumeNs, walkNs: _walkNs, probeTotalNs: _probeTotalNs)
 }
 
 nonisolated internal func decodeProbeQueueStats(from buffer: inout ByteBuffer) throws -> ProbeQueueStats {
@@ -2372,8 +2409,10 @@ nonisolated internal func decodeDiagnosticsSnapshot(from buffer: inout ByteBuffe
 nonisolated internal func decodeRunConfig(from buffer: inout ByteBuffer) throws -> RunConfig {
     let _label = try ({ buf in try decodeString(from: &buf) })(&buffer)
     let _frequencyHz = try ({ buf in try decodeU32(from: &buf) })(&buffer)
+    let _correlateFrequencyHz = try ({ buf in try decodeU32(from: &buf) })(&buffer)
     let _raceKperf = try ({ buf in try decodeBool(from: &buf) })(&buffer)
-    return RunConfig(label: _label, frequencyHz: _frequencyHz, raceKperf: _raceKperf)
+    let _correlateKperf = try ({ buf in try decodeBool(from: &buf) })(&buffer)
+    return RunConfig(label: _label, frequencyHz: _frequencyHz, correlateFrequencyHz: _correlateFrequencyHz, raceKperf: _raceKperf, correlateKperf: _correlateKperf)
 }
 
 nonisolated internal func decodeRunControlError(from buffer: inout ByteBuffer) throws -> RunControlError {
@@ -2588,8 +2627,9 @@ nonisolated internal func decodeWireProbeResult(from buffer: inout ByteBuffer) t
     let _machFp = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _machSp = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _machWalked = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeVarint(from: &buf) }) })(&buffer)
+    let _dwarfWalked = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeVarint(from: &buf) }) })(&buffer)
     let _usedFramehop = try ({ buf in try decodeBool(from: &buf) })(&buffer)
-    return WireProbeResult(tid: _tid, timing: _timing, queue: _queue, machPc: _machPc, machLr: _machLr, machFp: _machFp, machSp: _machSp, machWalked: _machWalked, usedFramehop: _usedFramehop)
+    return WireProbeResult(tid: _tid, timing: _timing, queue: _queue, machPc: _machPc, machLr: _machLr, machFp: _machFp, machSp: _machSp, machWalked: _machWalked, dwarfWalked: _dwarfWalked, usedFramehop: _usedFramehop)
 }
 
 nonisolated internal func decodeIngestEvent(from buffer: inout ByteBuffer) throws -> IngestEvent {

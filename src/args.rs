@@ -39,6 +39,10 @@ pub enum Command {
     /// histograms, and recent events.
     Diagnose,
 
+    /// Ask running stax processes to dump SIGUSR1 telemetry/debug
+    /// snapshots into unified logging.
+    Dump,
+
     /// Block until a condition fires, the active run stops, or the
     /// timeout elapses.
     Wait(WaitArgs),
@@ -176,6 +180,17 @@ pub struct RecordArgs {
     /// default profiler path.
     #[facet(args::named, default)]
     pub race_kperf: bool,
+
+    /// Evaluation mode: independently sample shade-side user stacks
+    /// at `--correlate-frequency` (or PET frequency by default),
+    /// then correlate with nearest kperf samples by `(tid, timestamp)`.
+    #[facet(args::named, default)]
+    pub correlate_kperf: bool,
+
+    /// Total process-wide shade-side probe frequency for
+    /// `--correlate-kperf`. Defaults to `--frequency`.
+    #[facet(args::named, default)]
+    pub correlate_frequency: Option<u32>,
 
     /// Profile an existing process by PID instead of launching one.
     #[facet(args::named, args::short = 'p', default)]

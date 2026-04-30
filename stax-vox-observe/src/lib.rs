@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use stax_telemetry::{
+use metrix::{
     CounterHandle, GaugeHandle, HistogramHandle, HistogramSnapshot, TelemetryRegistry,
     TelemetrySnapshot,
 };
@@ -341,6 +341,18 @@ impl TelemetryDebugRegistry {
                 registration_id = entry.id,
                 "\n{formatted}"
             );
+            for histogram in &snapshot.histograms {
+                let formatted = format_histogram_snapshot(histogram);
+                tracing::info!(
+                    process = process_name,
+                    reason,
+                    component = entry.component,
+                    role = entry.role,
+                    registration_id = entry.id,
+                    histogram = histogram.name.as_str(),
+                    "\n{formatted}"
+                );
+            }
         }
     }
 }
@@ -567,17 +579,17 @@ fn format_telemetry_snapshot(snapshot: &TelemetrySnapshot) -> String {
         }
     }
 
-    if !snapshot.counters.is_empty() {
-        let _ = writeln!(out, "\n## Counters");
-        for counter in &snapshot.counters {
-            let _ = writeln!(out, "- `{}`: {}", counter.name, counter.value);
-        }
-    }
-
     if !snapshot.histograms.is_empty() {
         let _ = writeln!(out, "\n## Histograms");
         for histogram in &snapshot.histograms {
             format_histogram(&mut out, histogram);
+        }
+    }
+
+    if !snapshot.counters.is_empty() {
+        let _ = writeln!(out, "\n## Counters");
+        for counter in &snapshot.counters {
+            let _ = writeln!(out, "- `{}`: {}", counter.name, counter.value);
         }
     }
 
@@ -597,6 +609,13 @@ fn format_telemetry_snapshot(snapshot: &TelemetrySnapshot) -> String {
     out
 }
 
+fn format_histogram_snapshot(histogram: &HistogramSnapshot) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# Telemetry Histogram");
+    format_histogram(&mut out, histogram);
+    out
+}
+
 fn format_histogram(out: &mut String, histogram: &HistogramSnapshot) {
     let avg = if histogram.count == 0 {
         0
@@ -608,22 +627,51 @@ fn format_histogram(out: &mut String, histogram: &HistogramSnapshot) {
         "\n### `{}`\n\n- count: {}\n- avg: {}\n- max: {}\n- overflow: {}",
         histogram.name,
         histogram.count,
-        format_duration(Duration::from_nanos(avg)),
-        format_duration(Duration::from_nanos(histogram.max)),
+        format_histogram_value(histogram, avg),
+        format_histogram_value(histogram, histogram.max),
         histogram.overflow
     );
     if histogram.buckets.iter().any(|bucket| bucket.count != 0) {
         let _ = writeln!(out, "- buckets:");
+        let mut previous_le = None;
+        let mut previous_count = 0;
         for bucket in &histogram.buckets {
-            if bucket.count != 0 {
+            let range_count = bucket.count.saturating_sub(previous_count);
+            if range_count != 0 {
                 let _ = writeln!(
                     out,
-                    "  - <= {}: {}",
-                    format_duration(Duration::from_nanos(bucket.le)),
-                    bucket.count
+                    "  - {}: {} (cum {})",
+                    format_histogram_bucket_range(histogram, previous_le, bucket.le),
+                    range_count,
+                    bucket.count,
                 );
             }
+            previous_le = Some(bucket.le);
+            previous_count = bucket.count;
         }
+    }
+}
+
+fn format_histogram_bucket_range(
+    histogram: &HistogramSnapshot,
+    previous_le: Option<u64>,
+    le: u64,
+) -> String {
+    match previous_le {
+        Some(previous_le) => format!(
+            "{}..{}",
+            format_histogram_value(histogram, previous_le),
+            format_histogram_value(histogram, le)
+        ),
+        None => format!("<= {}", format_histogram_value(histogram, le)),
+    }
+}
+
+fn format_histogram_value(histogram: &HistogramSnapshot, value: u64) -> String {
+    if histogram.name.ends_with("_ns") || histogram.name.ends_with(".ns") {
+        format_duration(Duration::from_nanos(value))
+    } else {
+        value.to_string()
     }
 }
 
@@ -966,6 +1014,12 @@ fn channel_detail(surface: &'static str, channel: vox::ChannelEventContext) -> S
 }
 
 impl vox::VoxObserver for VoxObserverLogger {
+    fn telemetry_registry(&self) -> Option<metrix::TelemetryRegistry> {
+        self.telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.registry.clone())
+    }
+
     fn rpc_event(&self, event: vox::RpcEvent) {
         if let Some(telemetry) = &self.telemetry {
             telemetry.rpc_event(self.surface, event);

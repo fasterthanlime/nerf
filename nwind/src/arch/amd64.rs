@@ -1,7 +1,7 @@
 use gimli::{CfaRule, LittleEndian, RegisterRule};
 
 use crate::address_space::{lookup_binary, Binary, MemoryReader};
-use crate::arch::{Architecture, Registers, UnwindStatus};
+use crate::arch::{Architecture, Registers, UnwindFailure, UnwindStatus};
 use crate::dwarf::dwarf_unwind;
 use crate::frame_descriptions::{ContextCache, UnwindInfoCache};
 use crate::types::{Bitness, Endianness};
@@ -217,9 +217,9 @@ impl Architecture for Arch {
         regs: &mut Self::Regs,
         initial_address: &mut Option<u64>,
         ra_address: &mut Option<u64>,
-    ) -> Option<UnwindStatus> {
+    ) -> Result<UnwindStatus, UnwindFailure> {
         if !regs.contains(dwarf::RBP) {
-            let binary = lookup_binary(nth_frame, memory, regs)?;
+            let binary = lookup_binary(nth_frame, memory, regs).ok_or(UnwindFailure::NoBinary)?;
             if let Some(rbp) = guess_ebp(nth_frame, memory, &mut state.ctx_cache, regs, binary) {
                 regs.append(dwarf::RBP, rbp);
             }
@@ -233,11 +233,11 @@ impl Architecture for Arch {
             regs,
             &mut state.new_regs,
         ) {
-            Some(result) => result,
-            None => {
+            Ok(result) => result,
+            Err(error) => {
                 if let Some(rbp) = regs.get(dwarf::RBP) {
                     if !memory.is_stack_address(rbp) {
-                        return None;
+                        return Err(UnwindFailure::FramePointerOutsideStack);
                     }
 
                     if let Some(next_rbp) = memory.get_pointer_at_address(rbp) {
@@ -256,17 +256,18 @@ impl Architecture for Arch {
                                 regs.append(dwarf::RBP, next_rbp);
                                 regs.append(dwarf::RETURN_ADDRESS, next_rip);
                                 *ra_address = Some(next_rip);
-                                return Some(UnwindStatus::InProgress);
+                                return Ok(UnwindStatus::InProgress);
                             }
                         }
                     }
+                    return Err(UnwindFailure::FramePointerReadFailed);
                 }
-                return None;
+                return Err(error);
             }
         };
         *initial_address = Some(result.initial_address);
         *ra_address = result.ra_address;
-        let cfa = result.cfa?;
+        let cfa = result.cfa;
 
         let mut recovered_return_address = false;
         for &(register, value) in &state.new_regs {
@@ -290,9 +291,11 @@ impl Architecture for Arch {
                 "Previous frame not found: failed to determine the return address of frame #{}",
                 nth_frame + 1
             );
-            return Some(UnwindStatus::Finished);
+            return Err(result
+                .return_address_error
+                .unwrap_or(UnwindFailure::MissingReturnAddress));
         }
 
-        Some(UnwindStatus::InProgress)
+        Ok(UnwindStatus::InProgress)
     }
 }

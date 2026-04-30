@@ -53,6 +53,35 @@ pub enum UnwindStatus {
     Finished,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnwindFailure {
+    MissingInstructionPointer,
+    NullInstructionPointer,
+    NoBinary,
+    NoUnwindInfo,
+    MissingCfa,
+    MissingCfaRegister,
+    CfaExpressionFailed,
+    RegisterMemoryReadFailed,
+    RegisterExpressionFailed,
+    UnsupportedRegisterRule,
+    MissingReturnAddress,
+    FramePointerUnavailable,
+    FramePointerOutsideStack,
+    FramePointerReadFailed,
+    ArmUnwindInfoMissing,
+    ArmUnwindFailed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum UnwindMode {
+    #[default]
+    Default,
+    DwarfOnly,
+    CompactOnly,
+    CompactWithDwarfRefs,
+}
+
 pub trait Architecture: Sized {
     const NAME: &'static str;
     const ENDIANNESS: Endianness;
@@ -84,7 +113,20 @@ pub trait Architecture: Sized {
         regs: &mut Self::Regs,
         initial_address: &mut Option<Self::RegTy>,
         ra_address: &mut Option<Self::RegTy>,
-    ) -> Option<UnwindStatus>;
+    ) -> Result<UnwindStatus, UnwindFailure>;
+
+    fn unwind_with_mode<M: MemoryReader<Self>>(
+        nth_frame: usize,
+        memory: &M,
+        state: &mut Self::State,
+        regs: &mut Self::Regs,
+        initial_address: &mut Option<Self::RegTy>,
+        ra_address: &mut Option<Self::RegTy>,
+        mode: UnwindMode,
+    ) -> Result<UnwindStatus, UnwindFailure> {
+        let _ = mode;
+        Self::unwind(nth_frame, memory, state, regs, initial_address, ra_address)
+    }
 }
 
 pub struct RegsIter<'a, T: Copy + Into<u64>> {

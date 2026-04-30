@@ -7,6 +7,7 @@
 
 use std::io;
 use std::mem;
+use std::time::Duration;
 
 use facet::Facet;
 use libc::{c_int, c_void, sysctl, sysctlbyname};
@@ -41,6 +42,7 @@ pub const KERN_KDWRITETR: c_int = 17;
 pub const KERN_KDWRITEMAP: c_int = 18;
 pub const KERN_KDREADCURTHRMAP: c_int = 21;
 pub const KERN_KDSET_TYPEFILTER: c_int = 22;
+pub const KERN_KDBUFWAIT: c_int = 23;
 pub const KERN_KDCPUMAP: c_int = 24;
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,7 @@ pub const KDBG_CODE_MASK: u32 = 0x0000_fffc;
 pub const KDBG_CODE_SHIFT: u32 = 2;
 pub const KDBG_FUNC_MASK: u32 = 0x0000_0003;
 pub const KDBG_EVENTID_MASK: u32 = 0xffff_fffc;
+pub const KDBG_TYPEFILTER_BITMAP_SIZE: usize = (256 * 256) / 8;
 
 pub const DBG_FUNC_NONE: u32 = 0;
 pub const DBG_FUNC_START: u32 = 1;
@@ -80,6 +83,11 @@ pub const fn kdbg_class(debugid: u32) -> u8 {
 #[inline]
 pub const fn kdbg_subclass(debugid: u32) -> u8 {
     ((debugid & KDBG_SUBCLASS_MASK) >> KDBG_SUBCLASS_SHIFT) as u8
+}
+
+#[inline]
+pub const fn kdbg_csc(class: u8, subclass: u8) -> u16 {
+    ((class as u16) << 8) | subclass as u16
 }
 
 #[inline]
@@ -305,6 +313,36 @@ pub fn set_filter(filter: &mut KdRegtype) -> Result<(), Error> {
     Ok(())
 }
 
+/// Install a class/subclass typefilter via `KERN_KDSET_TYPEFILTER`.
+/// Each bit addresses one `(class, subclass)` pair.
+pub fn set_typefilter(cscs: impl IntoIterator<Item = u16>) -> Result<(), Error> {
+    let mut filter = vec![0u8; KDBG_TYPEFILTER_BITMAP_SIZE];
+    for csc in cscs {
+        let csc = usize::from(csc);
+        filter[csc / 8] |= 1u8 << (csc % 8);
+    }
+
+    let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDSET_TYPEFILTER];
+    let mut size = filter.len();
+    let rc = unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            filter.as_mut_ptr() as *mut c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(Error::Sysctl {
+            op: "KERN_KDSET_TYPEFILTER",
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(())
+}
+
 /// Start (`enable=true`) or stop tracing.
 pub fn enable(enable: bool) -> Result<(), Error> {
     let v = if enable { 1 } else { 0 };
@@ -345,9 +383,9 @@ pub fn read_trace(buf: &mut [KdBuf]) -> Result<usize, Error> {
         return Ok(0);
     }
     let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADTR];
-    // The kernel uses `*size` on input as the count of records the
-    // caller can accept and rewrites it to the number returned.
-    let mut size = buf.len();
+    // XNU consumes `*size` as byte capacity on input and rewrites it
+    // to the number of kd_buf records actually copied out.
+    let mut size = mem::size_of_val(buf);
     let rc = unsafe {
         sysctl(
             mib.as_mut_ptr(),
@@ -364,7 +402,43 @@ pub fn read_trace(buf: &mut [KdBuf]) -> Result<usize, Error> {
             source: io::Error::last_os_error(),
         });
     }
+    if size > buf.len() {
+        return Err(Error::Sysctl {
+            op: "KERN_KDREADTR",
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "kernel returned {size} records for {}-record buffer",
+                    buf.len()
+                ),
+            ),
+        });
+    }
     Ok(size)
+}
+
+/// Block until kdebug's kernel buffer crosses its wake threshold, or
+/// until `timeout` expires. Returns true when the threshold was met.
+pub fn wait_for_buffer(timeout: Duration) -> Result<bool, Error> {
+    let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDBUFWAIT];
+    let mut size = timeout.as_millis().min(usize::MAX as u128) as usize;
+    let rc = unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(Error::Sysctl {
+            op: "KERN_KDBUFWAIT",
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(size != 0)
 }
 
 /// Toggle kperf's lightweight-PET mode. Lightweight PET drops some

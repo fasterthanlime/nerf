@@ -342,6 +342,9 @@ impl SampleSink for LiveOnlySink {
             mach_fp: ev.mach_fp,
             mach_sp: ev.mach_sp,
             mach_walked: ev.mach_walked,
+            compact_walked: ev.compact_walked,
+            compact_dwarf_walked: ev.compact_dwarf_walked,
+            dwarf_walked: ev.dwarf_walked,
             used_framehop: ev.used_framehop,
         }));
     }

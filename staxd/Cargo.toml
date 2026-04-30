@@ -13,7 +13,7 @@ path = "src/main.rs"
 [target.'cfg(target_os = "macos")'.dependencies]
 staxd-proto = { path = "../staxd-proto" }
 stax-mac-kperf-sys = { version = "0.1", path = "../stax-mac-kperf-sys" }
-stax-telemetry = { path = "../stax-telemetry" }
+metrix = { path = "../../metrix" }
 stax-vox-observe = { version = "0.1", path = "../stax-vox-observe" }
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }

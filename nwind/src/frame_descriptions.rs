@@ -8,9 +8,9 @@ use std::time::Instant;
 use lru::LruCache;
 
 use gimli::{
-    self, BaseAddresses, CfaRule, CieOrFde, DebugFrame, EhFrame, EhFrameHdr, EndianSlice,
-    FrameDescriptionEntry, ParsedEhFrameHdr, Register, RegisterRule, UnwindContext, UnwindOffset,
-    UnwindSection, UnwindTable, UnwindTableRow,
+    self, BaseAddresses, CfaRule, CieOrFde, DebugFrame, EhFrame, EhFrameHdr, EhFrameOffset,
+    EndianSlice, FrameDescriptionEntry, ParsedEhFrameHdr, Register, RegisterRule, UnwindContext,
+    UnwindOffset, UnwindSection, UnwindTable, UnwindTableRow,
 };
 
 use crate::arch::Endianity;
@@ -530,6 +530,66 @@ impl<E: Endianity> FrameDescriptions<E> {
                     );
                 }
             }
+        }
+
+        None
+    }
+
+    pub fn find_eh_unwind_info_by_fde_offset<'a>(
+        &self,
+        ctx_cache: &'a mut ContextCache<E>,
+        mappings: &[AddressMapping],
+        absolute_address: u64,
+        fde_offset: u32,
+    ) -> Option<UnwindInfo<'a, E>> {
+        let address = if let Some(mapping) = mappings.iter().find(|mapping| {
+            absolute_address >= mapping.actual_address
+                && absolute_address < (mapping.actual_address + mapping.size)
+        }) {
+            absolute_address - mapping.actual_address + mapping.declared_address
+        } else {
+            absolute_address
+        };
+
+        let (bases, eh_frame) = self.eh_frame.as_ref()?;
+        let offset = EhFrameOffset(fde_offset as usize);
+        let fde = eh_frame
+            .fde_from_offset(bases, offset, |_, _, offset| {
+                eh_frame.cie_from_offset(bases, offset)
+            })
+            .map_err(|error| {
+                debug!(
+                    "FDE not found in .eh_frame at offset 0x{:X} for 0x{:016X}: {}",
+                    fde_offset, absolute_address, error
+                );
+                error
+            })
+            .ok()?;
+
+        let initial_address = fde.initial_address();
+        let ctx = unsafe { launder_lifetime(&mut ctx_cache.cached_context) };
+        let mut table = UnwindTable::new(eh_frame, bases, ctx, &fde).ok()?;
+        loop {
+            match table.next_row() {
+                Ok(Some(row)) => {
+                    if !row.contains(address) {
+                        continue;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    error!("Failed to iterate the unwind table: {:?}", error);
+                    break;
+                }
+            }
+
+            return Some(UnwindInfo {
+                initial_address,
+                address,
+                absolute_address,
+                is_signal_frame: fde.is_signal_trampoline(),
+                kind: UnwindInfoKind::Uncached(table.into_current_row().unwrap()),
+            });
         }
 
         None

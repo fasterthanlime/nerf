@@ -12,12 +12,13 @@
 #![cfg(target_os = "macos")]
 
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use mach2::mach_time::mach_absolute_time;
+use metrix::{HistogramHandle, TelemetryRegistry};
 use stax_mac_capture::SampleSink;
 use stax_mac_kperf_parse::pipeline::{Pipeline, PipelineConfig};
 use stax_mac_kperf_sys::bindings::sampler;
@@ -25,7 +26,7 @@ use stax_mac_kperf_sys::kdebug::{
     self, DBG_FUNC_END, DBG_FUNC_START, DBG_MACH, DBG_MACH_SCHED, DBG_PERF, KDBG_TIMESTAMP_MASK,
     KdBuf, perf,
 };
-use staxd_proto::{KdBufBatch, SessionConfig, StaxdClient};
+use staxd_proto::{KdBufBatch, STAXD_RECORD_CHANNEL_CAPACITY, SessionConfig, StaxdClient};
 use tracing::{info, warn};
 
 /// User-facing options. Mirrors the shape of
@@ -49,7 +50,9 @@ pub struct RemoteOptions {
     pub buf_records: u32,
     /// Optional process-wide telemetry registry to receive Vox transport
     /// counters for the staxd records stream.
-    pub telemetry: Option<stax_telemetry::TelemetryRegistry>,
+    pub telemetry: Option<TelemetryRegistry>,
+    /// Which kdebug classes/subclasses to subscribe to.
+    pub kdebug_filter: KdebugFilter,
 }
 
 impl std::fmt::Debug for RemoteOptions {
@@ -61,8 +64,16 @@ impl std::fmt::Debug for RemoteOptions {
             .field("duration", &self.duration)
             .field("buf_records", &self.buf_records)
             .field("telemetry", &self.telemetry.is_some())
+            .field("kdebug_filter", &self.kdebug_filter)
             .finish()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum KdebugFilter {
+    #[default]
+    Live,
+    RaceKperfOnly,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -91,6 +102,48 @@ impl Default for RemoteOptions {
             duration: None,
             buf_records: 1_000_000,
             telemetry: None,
+            kdebug_filter: KdebugFilter::Live,
+        }
+    }
+}
+
+fn typefilter_cscs(filter: KdebugFilter) -> Vec<u16> {
+    let mut cscs: Vec<u16> = (0..=u8::MAX)
+        .map(|subclass| kdebug::kdbg_csc(DBG_PERF, subclass))
+        .collect();
+    if matches!(filter, KdebugFilter::Live) {
+        cscs.push(kdebug::kdbg_csc(DBG_MACH, DBG_MACH_SCHED));
+    }
+    cscs
+}
+
+#[derive(Clone)]
+struct RecordReceiveTelemetry {
+    recv_await_ns: HistogramHandle,
+    batch_drain_to_recv_ns: HistogramHandle,
+    batch_queued_to_recv_ns: HistogramHandle,
+    batch_send_to_recv_ns: HistogramHandle,
+    batch_handle_ns: HistogramHandle,
+    sref_map_ns: HistogramHandle,
+    scanner_enqueue_ns: HistogramHandle,
+    parser_enqueue_ns: HistogramHandle,
+    records_per_batch: HistogramHandle,
+}
+
+impl RecordReceiveTelemetry {
+    fn new(registry: &TelemetryRegistry) -> Self {
+        Self {
+            recv_await_ns: registry.histogram("staxd_client.records.recv.await_ns"),
+            batch_drain_to_recv_ns: registry
+                .histogram("staxd_client.records.batch.drain_to_recv_ns"),
+            batch_queued_to_recv_ns: registry
+                .histogram("staxd_client.records.batch.queued_to_recv_ns"),
+            batch_send_to_recv_ns: registry.histogram("staxd_client.records.batch.send_to_recv_ns"),
+            batch_handle_ns: registry.histogram("staxd_client.records.batch.handle_ns"),
+            sref_map_ns: registry.histogram("staxd_client.records.sref.map_ns"),
+            scanner_enqueue_ns: registry.histogram("staxd_client.records.enqueue.scanner_ns"),
+            parser_enqueue_ns: registry.histogram("staxd_client.records.enqueue.parser_ns"),
+            records_per_batch: registry.histogram("staxd_client.records.batch.records"),
         }
     }
 }
@@ -129,23 +182,24 @@ pub async fn drive_session<S: SampleSink + Send + 'static>(
     drive_session_with_hooks(opts, sink, should_stop, || {}, |_, _| {}).await
 }
 
-/// Like [`drive_session`], but calls `on_kperf_sample_start` from the
-/// recv task as soon as the raw kperf records show that the current
-/// sample has a user stack. This hook exists for race-kperf: stack
-/// capture must not wait behind the heavier parser / symbol / image
-/// pipeline.
+/// Like [`drive_session`], but calls `on_kperf_sample_start` from a
+/// dedicated scanner thread as soon as the raw kperf records show that
+/// the current sample has a user stack. This hook exists for
+/// race-kperf: stack capture must not wait behind the heavier parser /
+/// symbol / image pipeline, and the records receive loop must not scan
+/// batches inline.
 pub async fn drive_session_with_hooks<S, Stop, FirstBatch, SampleStart>(
     opts: RemoteOptions,
     sink: S,
     mut should_stop: Stop,
     mut on_first_batch: FirstBatch,
-    mut on_kperf_sample_start: SampleStart,
+    on_kperf_sample_start: SampleStart,
 ) -> Result<(), Error>
 where
     S: SampleSink + Send + 'static,
     Stop: FnMut() -> bool,
     FirstBatch: FnMut(),
-    SampleStart: FnMut(u32, KperfProbeTriggerTiming),
+    SampleStart: FnMut(u32, KperfProbeTriggerTiming) + Send + 'static,
 {
     let url = if opts.daemon_socket.starts_with("local://") {
         opts.daemon_socket.clone()
@@ -197,6 +251,7 @@ where
         "Staxd",
         &client.caller,
     );
+    let receive_telemetry = opts.telemetry.as_ref().map(RecordReceiveTelemetry::new);
     info!(
         "staxd-client: connected to daemon elapsed={:?}",
         phase_start.elapsed()
@@ -239,8 +294,12 @@ where
     let parser_queue = ParserQueue::new(WORKER_QUEUE_CAPACITY);
     let worker_rx = parser_queue.receiver();
     let worker_counters = parser_queue.counters();
+    let scanner_queue = ProbeScannerQueue::new(PROBE_SCANNER_QUEUE_CAPACITY);
+    let scanner_rx = scanner_queue.receiver();
+    let scanner_counters = scanner_queue.counters();
     let abort_worker_backlog = Arc::new(AtomicBool::new(false));
     let worker_abort = abort_worker_backlog.clone();
+    let probe_trigger_count = Arc::new(AtomicU64::new(0));
     let phase_start = Instant::now();
     let worker_handle = std::thread::Builder::new()
         .name("staxd-client-worker".to_owned())
@@ -260,9 +319,9 @@ where
         phase_start.elapsed()
     );
 
-    // Build the session config the daemon expects. Filter range covers
-    // DBG_MACH..DBG_PERF, mirroring the in-process recorder's default
-    // (so context switches + kperf samples both flow through).
+    // Ask the kernel only for the class/subclass pairs this mode needs.
+    // The old debugid range admitted every class between DBG_MACH
+    // and DBG_PERF, which inflated the ring with unrelated traffic.
     let session_config = SessionConfig {
         target_pid: opts.pid,
         frequency_hz: opts.frequency_hz,
@@ -273,6 +332,7 @@ where
         class_mask: stax_mac_kperf_sys::bindings::KPC_CLASS_FIXED_MASK,
         filter_range_value1: kdebug::kdbg_eventid(DBG_MACH, DBG_MACH_SCHED, 0),
         filter_range_value2: kdebug::kdbg_eventid(DBG_PERF, 0xff, 0x3fff),
+        typefilter_cscs: typefilter_cscs(opts.kdebug_filter),
     };
 
     // Server→client streaming: we construct the channel, hand `tx` to
@@ -280,6 +340,20 @@ where
     // the daemon's record() returns (clean stop or error).
     let (tx, mut rx) = vox::channel::<KdBufBatch>();
     let record_rpc_start = Instant::now();
+    let scanner_probe_trigger_count = probe_trigger_count.clone();
+    let scanner_handle = std::thread::Builder::new()
+        .name("staxd-client-probe-scanner".to_owned())
+        .spawn(move || {
+            probe_scanner_thread(
+                scanner_rx,
+                scanner_counters,
+                scanner_probe_trigger_count,
+                client_start,
+                record_rpc_start,
+                on_kperf_sample_start,
+            )
+        })
+        .map_err(|e| Error::VoxCall(format!("spawn probe scanner thread: {e}")))?;
     info!("staxd-client: spawning record RPC");
     let record_fut = tokio::spawn({
         let client = client.clone();
@@ -290,10 +364,6 @@ where
     let mut total_drained: u64 = 0;
     let mut seen_first_batch = false;
     let mut seen_first_nonempty_batch = false;
-    let mut probe_trigger_count: u64 = 0;
-    let mut first_probe_trigger_logged = false;
-    let mut probe_trigger_scanner = KperfProbeTriggerScanner::default();
-
     loop {
         if should_stop() {
             info!("staxd-client: stop requested");
@@ -312,8 +382,16 @@ where
         // should_stop / duration even on idle targets; no work
         // happens here.
         let recv_timeout = Duration::from_millis(50);
+        let recv_started = Instant::now();
         let batch_sref = match tokio::time::timeout(recv_timeout, rx.recv()).await {
-            Ok(Ok(Some(value))) => value,
+            Ok(Ok(Some(value))) => {
+                if let Some(telemetry) = &receive_telemetry {
+                    telemetry
+                        .recv_await_ns
+                        .record_duration(recv_started.elapsed());
+                }
+                value
+            }
             Ok(Ok(None)) => {
                 info!("staxd-client: daemon closed records channel");
                 break;
@@ -325,9 +403,28 @@ where
             Err(_) => continue,
         };
 
+        let batch_handle_started = Instant::now();
         let client_received_mach_ticks = mach_ticks_now();
         let client_received_unix_ns = unix_ns_now();
+        let sref_map_started = Instant::now();
         let _ = batch_sref.map(|batch| {
+            if let Some(telemetry) = &receive_telemetry {
+                telemetry.records_per_batch.record(batch.records.len() as u64);
+                telemetry.batch_drain_to_recv_ns.record(elapsed_ticks_to_ns(
+                    client_received_mach_ticks,
+                    batch.drained_mach_ticks,
+                ));
+                telemetry.batch_queued_to_recv_ns.record(elapsed_ticks_to_ns(
+                    client_received_mach_ticks,
+                    batch.queued_for_send_mach_ticks,
+                ));
+                if batch.send_started_mach_ticks != 0 {
+                    telemetry.batch_send_to_recv_ns.record(elapsed_ticks_to_ns(
+                        client_received_mach_ticks,
+                        batch.send_started_mach_ticks,
+                    ));
+                }
+            }
             if !seen_first_batch {
                 seen_first_batch = true;
                 info!(
@@ -364,34 +461,41 @@ where
                     record_rpc_start.elapsed()
                 );
             }
-            for rec in &batch.records {
-                if let Some((tid, ts)) = probe_trigger_scanner.feed(rec) {
-                    probe_trigger_count += 1;
-                    if !first_probe_trigger_logged {
-                        first_probe_trigger_logged = true;
-                        info!(
-                            "staxd-client: first race-kperf probe trigger tid={tid} kperf_ts={ts} trigger_count={} since_client_start={:?} since_record_rpc_spawn={:?}",
-                            probe_trigger_count,
-                            client_start.elapsed(),
-                            record_rpc_start.elapsed()
-                        );
-                    }
-                    on_kperf_sample_start(
-                        tid,
-                        KperfProbeTriggerTiming {
-                            kperf_ts: ts,
-                            staxd_read_started: batch.read_started_mach_ticks,
-                            staxd_drained: batch.drained_mach_ticks,
-                            staxd_queued_for_send: batch.queued_for_send_mach_ticks,
-                            staxd_send_started: batch.send_started_mach_ticks,
-                            client_received: client_received_mach_ticks,
-                        },
-                    );
-                }
-            }
             total_drained += batch.records.len() as u64;
-            parser_queue.enqueue_records(batch.records);
+            let records = Arc::new(batch.records);
+            let scanner_enqueue_started = Instant::now();
+            scanner_queue.enqueue_batch(ProbeScannerBatch {
+                records: records.clone(),
+                timing: KperfProbeTriggerTiming {
+                    kperf_ts: 0,
+                    staxd_read_started: batch.read_started_mach_ticks,
+                    staxd_drained: batch.drained_mach_ticks,
+                    staxd_queued_for_send: batch.queued_for_send_mach_ticks,
+                    staxd_send_started: batch.send_started_mach_ticks,
+                    client_received: client_received_mach_ticks,
+                },
+            });
+            if let Some(telemetry) = &receive_telemetry {
+                telemetry
+                    .scanner_enqueue_ns
+                    .record_duration(scanner_enqueue_started.elapsed());
+            }
+            let parser_enqueue_started = Instant::now();
+            parser_queue.enqueue_records(records);
+            if let Some(telemetry) = &receive_telemetry {
+                telemetry
+                    .parser_enqueue_ns
+                    .record_duration(parser_enqueue_started.elapsed());
+            }
         });
+        if let Some(telemetry) = &receive_telemetry {
+            telemetry
+                .sref_map_ns
+                .record_duration(sref_map_started.elapsed());
+            telemetry
+                .batch_handle_ns
+                .record_duration(batch_handle_started.elapsed());
+        }
     }
 
     // Drop our `Rx`. With vox propagating per-channel close to the
@@ -404,6 +508,8 @@ where
     // to drop queued parser work if shutdown exceeds the budget.
     let queue_counters = parser_queue.counters();
     drop(parser_queue);
+    let scanner_queue_counters = scanner_queue.counters();
+    drop(scanner_queue);
 
     let rpc_result = record_fut
         .await
@@ -416,15 +522,18 @@ where
         ),
         Err(vox::VoxError::User(e)) => {
             warn!("staxd-client: daemon returned error: {e:?}");
+            let _ = scanner_handle.join();
             let _ = join_worker_with_deadline(worker_handle, abort_worker_backlog).await;
             return Err(Error::Rpc(e));
         }
         Err(e) => {
+            let _ = scanner_handle.join();
             let _ = join_worker_with_deadline(worker_handle, abort_worker_backlog).await;
             return Err(Error::VoxCall(format!("record rpc: {e:?}")));
         }
     }
 
+    let _ = scanner_handle.join();
     if !join_worker_with_deadline(worker_handle, abort_worker_backlog).await {
         let queue_stats = queue_counters.stats();
         log_parser_queue_stats(queue_stats);
@@ -440,19 +549,28 @@ where
         "staxd-client: session finished total_elapsed={:?} records={} probe_triggers={} parser_dropped_chunks={} parser_dropped_records={} parser_dropped_kperf_samples={} parser_max_queue_depth={} parser_max_queue_age_ns={}",
         client_start.elapsed(),
         total_drained,
-        probe_trigger_count,
+        probe_trigger_count.load(Ordering::Relaxed),
         queue_stats.dropped_chunks,
         queue_stats.dropped_records,
         queue_stats.dropped_kperf_samples,
         queue_stats.max_depth,
         queue_stats.max_age_ns
     );
+    let scanner_stats = scanner_queue_counters.stats();
+    if scanner_stats.dropped_records > 0 || scanner_stats.dropped_batches > 0 {
+        warn!(
+            "staxd-client-probe-scanner: lost data batches={} records={} kperf_samples={} max_depth={}",
+            scanner_stats.dropped_batches,
+            scanner_stats.dropped_records,
+            scanner_stats.dropped_kperf_samples,
+            scanner_stats.max_depth
+        );
+    }
     Ok(())
 }
 
-const STAXD_RECORD_CHANNEL_CAPACITY: u32 = 64;
 const WORKER_QUEUE_CAPACITY: usize = 16;
-const WORKER_BATCH_CHUNK_RECORDS: usize = 16 * 1024;
+const PROBE_SCANNER_QUEUE_CAPACITY: usize = 64;
 const WORKER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 const WORKER_ABORT_GRACE: Duration = Duration::from_millis(250);
 #[derive(Clone, Copy, Default)]
@@ -545,21 +663,11 @@ impl ParserQueue {
         self.counters.clone()
     }
 
-    fn enqueue_records(&self, records: Vec<KdBuf>) {
-        if records.len() <= WORKER_BATCH_CHUNK_RECORDS {
-            self.enqueue_chunk_drop_oldest(WorkerMsg::Batch(OwnedBatch {
-                enqueued_at: Instant::now(),
-                records,
-            }));
-            return;
-        }
-
-        for chunk in records.chunks(WORKER_BATCH_CHUNK_RECORDS) {
-            self.enqueue_chunk_drop_oldest(WorkerMsg::Batch(OwnedBatch {
-                enqueued_at: Instant::now(),
-                records: chunk.to_vec(),
-            }));
-        }
+    fn enqueue_records(&self, records: Arc<Vec<KdBuf>>) {
+        self.enqueue_chunk_drop_oldest(WorkerMsg::Batch(OwnedBatch {
+            enqueued_at: Instant::now(),
+            records,
+        }));
     }
 
     fn enqueue_chunk_drop_oldest(&self, mut msg: WorkerMsg) {
@@ -619,20 +727,142 @@ fn drop_summary(msg: WorkerMsg) -> ParserDropSummary {
         WorkerMsg::Batch(batch) => ParserDropSummary {
             chunks: 1,
             records: batch.records.len() as u64,
-            kperf_samples: count_kperf_samples(&batch.records),
+            kperf_samples: 0,
         },
     }
 }
 
-fn count_kperf_samples(records: &[KdBuf]) -> u64 {
-    let mut scanner = KperfProbeTriggerScanner::default();
-    let mut count = 0u64;
-    for rec in records {
-        if scanner.feed(rec).is_some() {
-            count += 1;
+#[derive(Clone, Copy, Default)]
+struct ProbeScannerQueueStats {
+    dropped_batches: u64,
+    dropped_records: u64,
+    dropped_kperf_samples: u64,
+    max_depth: u64,
+}
+
+#[derive(Default)]
+struct ProbeScannerQueueCounters {
+    dropped_batches: AtomicU64,
+    dropped_records: AtomicU64,
+    dropped_kperf_samples: AtomicU64,
+    max_depth: AtomicU64,
+}
+
+impl ProbeScannerQueueCounters {
+    fn record_drop(&self, batch: &ProbeScannerBatch) {
+        self.dropped_batches.fetch_add(1, Ordering::Relaxed);
+        self.dropped_records
+            .fetch_add(batch.records.len() as u64, Ordering::Relaxed);
+    }
+
+    fn update_max_depth(&self, depth: usize) {
+        update_max(&self.max_depth, u64::try_from(depth).unwrap_or(u64::MAX));
+    }
+
+    fn stats(&self) -> ProbeScannerQueueStats {
+        ProbeScannerQueueStats {
+            dropped_batches: self.dropped_batches.load(Ordering::Relaxed),
+            dropped_records: self.dropped_records.load(Ordering::Relaxed),
+            dropped_kperf_samples: self.dropped_kperf_samples.load(Ordering::Relaxed),
+            max_depth: self.max_depth.load(Ordering::Relaxed),
         }
     }
-    count
+}
+
+struct ProbeScannerQueue {
+    tx: flume::Sender<ProbeScannerBatch>,
+    drop_rx: flume::Receiver<ProbeScannerBatch>,
+    counters: Arc<ProbeScannerQueueCounters>,
+}
+
+impl ProbeScannerQueue {
+    fn new(capacity: usize) -> Self {
+        let (tx, drop_rx) = flume::bounded(capacity);
+        Self {
+            tx,
+            drop_rx,
+            counters: Arc::new(ProbeScannerQueueCounters::default()),
+        }
+    }
+
+    fn receiver(&self) -> flume::Receiver<ProbeScannerBatch> {
+        self.drop_rx.clone()
+    }
+
+    fn counters(&self) -> Arc<ProbeScannerQueueCounters> {
+        self.counters.clone()
+    }
+
+    fn enqueue_batch(&self, mut batch: ProbeScannerBatch) {
+        loop {
+            match self.tx.try_send(batch) {
+                Ok(()) => {
+                    self.counters.update_max_depth(self.drop_rx.len());
+                    return;
+                }
+                Err(flume::TrySendError::Full(returned)) => {
+                    batch = returned;
+                    match self.drop_rx.try_recv() {
+                        Ok(dropped) => self.counters.record_drop(&dropped),
+                        Err(flume::TryRecvError::Empty) => continue,
+                        Err(flume::TryRecvError::Disconnected) => return,
+                    }
+                }
+                Err(flume::TrySendError::Disconnected(_)) => return,
+            }
+        }
+    }
+}
+
+struct ProbeScannerBatch {
+    records: Arc<Vec<KdBuf>>,
+    timing: KperfProbeTriggerTiming,
+}
+
+fn probe_scanner_thread<SampleStart>(
+    rx: flume::Receiver<ProbeScannerBatch>,
+    counters: Arc<ProbeScannerQueueCounters>,
+    probe_trigger_count: Arc<AtomicU64>,
+    client_start: Instant,
+    record_rpc_start: Instant,
+    mut on_kperf_sample_start: SampleStart,
+) where
+    SampleStart: FnMut(u32, KperfProbeTriggerTiming),
+{
+    info!("staxd-client-probe-scanner: started");
+    let mut scanner = KperfProbeTriggerScanner::default();
+    let mut first_probe_trigger_logged = false;
+    while let Ok(batch) = rx.recv() {
+        for rec in batch.records.iter() {
+            let Some((tid, ts)) = scanner.feed(rec) else {
+                continue;
+            };
+            let trigger_count = probe_trigger_count
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if !first_probe_trigger_logged {
+                first_probe_trigger_logged = true;
+                info!(
+                    "staxd-client: first race-kperf probe trigger tid={tid} kperf_ts={ts} trigger_count={} since_client_start={:?} since_record_rpc_spawn={:?}",
+                    trigger_count,
+                    client_start.elapsed(),
+                    record_rpc_start.elapsed()
+                );
+            }
+            let mut timing = batch.timing;
+            timing.kperf_ts = ts;
+            on_kperf_sample_start(tid, timing);
+        }
+    }
+    let stats = counters.stats();
+    info!(
+        "staxd-client-probe-scanner: exiting triggers={} dropped_batches={} dropped_records={} dropped_kperf_samples={} max_depth={}",
+        probe_trigger_count.load(Ordering::Relaxed),
+        stats.dropped_batches,
+        stats.dropped_records,
+        stats.dropped_kperf_samples,
+        stats.max_depth
+    );
 }
 
 fn update_max(max: &AtomicU64, value: u64) {
@@ -764,7 +994,7 @@ impl KperfProbeTriggerScanner {
 /// the records out and ships them to the worker via this struct.
 struct OwnedBatch {
     enqueued_at: Instant,
-    records: Vec<KdBuf>,
+    records: Arc<Vec<KdBuf>>,
 }
 
 enum WorkerMsg {
@@ -911,4 +1141,26 @@ fn unix_ns_now() -> u64 {
 #[inline]
 fn mach_ticks_now() -> u64 {
     unsafe { mach_absolute_time() }
+}
+
+fn elapsed_ticks_to_ns(later: u64, earlier: u64) -> u64 {
+    if later <= earlier {
+        return 0;
+    }
+    let (numer, denom) = mach_timebase_numer_denom();
+    (((later - earlier) as u128) * u128::from(numer) / u128::from(denom)).min(u128::from(u64::MAX))
+        as u64
+}
+
+fn mach_timebase_numer_denom() -> (u32, u32) {
+    static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        let mut info = mach2::mach_time::mach_timebase_info { numer: 0, denom: 0 };
+        let rc = unsafe { mach2::mach_time::mach_timebase_info(&mut info) };
+        if rc == 0 && info.numer != 0 && info.denom != 0 {
+            (info.numer, info.denom)
+        } else {
+            (1, 1)
+        }
+    })
 }

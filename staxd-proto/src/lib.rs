@@ -21,6 +21,9 @@
 use facet::Facet;
 use stax_mac_kperf_sys::kdebug::KdBuf;
 
+/// Flow-control window for the high-volume raw kdebug batch stream.
+pub const STAXD_RECORD_CHANNEL_CAPACITY: u32 = 64;
+
 /// Parameters for a recording session, the bare minimum the daemon
 /// needs to set up kperf + kdebug + kpc on behalf of the client.
 ///
@@ -49,10 +52,14 @@ pub struct SessionConfig {
     /// Bitwise-OR of `KPC_CLASS_*_MASK` for the counter classes the
     /// client wants enabled.
     pub class_mask: u32,
-    /// kdebug debugid range filter (KDBG_RANGETYPE). The daemon
-    /// installs this verbatim via `KERN_KDSETREG`.
+    /// kdebug debugid range filter (KDBG_RANGETYPE). Used only when
+    /// `typefilter_cscs` is empty.
     pub filter_range_value1: u32,
     pub filter_range_value2: u32,
+    /// kdebug class/subclass filter. When non-empty, the daemon
+    /// installs this via `KERN_KDSET_TYPEFILTER` instead of the broad
+    /// legacy debugid range.
+    pub typefilter_cscs: Vec<u16>,
 }
 
 /// One drain pass — what the daemon's `KERN_KDREADTR` loop produces

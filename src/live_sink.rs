@@ -129,10 +129,11 @@ pub struct WakeupEvent<'a> {
 
 /// Race-against-return probe output. Correlates with the matching
 /// `SampleEvent` by `(tid, kperf_ts == SampleEvent::timestamp)`.
-/// `mach_walked` is the suspended thread's stack from framehop
-/// (or FP-walk fallback), leaf-most first, PAC-stripped, no leaf
-/// PC. Server resolves through the same BinaryRegistry as kperf
-/// samples.
+/// `mach_walked` is the suspended thread's FP stack used to validate
+/// correlation against kperf. `compact_walked` and
+/// `compact_dwarf_walked` are metadata-unwound comparator stacks.
+/// `dwarf_walked` is the candidate stitched stack from the same
+/// capture. All are leaf-most first, PAC-stripped, and omit the leaf PC.
 pub struct ProbeResultEvent<'a> {
     pub tid: u32,
     pub timing: ProbeTiming,
@@ -142,6 +143,9 @@ pub struct ProbeResultEvent<'a> {
     pub mach_fp: u64,
     pub mach_sp: u64,
     pub mach_walked: &'a [u64],
+    pub compact_walked: &'a [u64],
+    pub compact_dwarf_walked: &'a [u64],
+    pub dwarf_walked: &'a [u64],
     pub used_framehop: bool,
 }
 

@@ -13,6 +13,10 @@
 //!   PERF_GEN_EVENT | DBG_FUNC_END             end sample
 //! ```
 //!
+//! XNU appends a user-stack fixup frame after the FP chain. The
+//! emitted `Sample::user_backtrace` moves that fixup into call order
+//! immediately after the saved PC.
+//!
 //! `PERF_GEN_EVENT` (subclass `PERF_GENERIC`, code 0) is emitted by
 //! `kperf_sample_internal` around *every* sample regardless of
 //! trigger (timer, PET, PMI), so it's the universal boundary.
@@ -57,6 +61,7 @@ pub struct Parser {
     user_frames: Vec<u64>,
     kernel_frames: Vec<u64>,
     pmc: Vec<u64>,
+    user_main_frames: u32,
     user_remaining: u32,
     kernel_remaining: u32,
     pub stats: ParserStats,
@@ -74,6 +79,7 @@ impl Parser {
             user_frames: Vec::with_capacity(128),
             kernel_frames: Vec::with_capacity(32),
             pmc: Vec::with_capacity(4),
+            user_main_frames: 0,
             user_remaining: 0,
             kernel_remaining: 0,
             stats: ParserStats::default(),
@@ -101,6 +107,7 @@ impl Parser {
                 self.user_frames.clear();
                 self.kernel_frames.clear();
                 self.pmc.clear();
+                self.user_main_frames = 0;
                 self.user_remaining = 0;
                 self.kernel_remaining = 0;
                 self.state = State::InSample {
@@ -111,6 +118,7 @@ impl Parser {
             }
             (perf::sc::GENERIC, 0, DBG_FUNC_END) => {
                 if let State::InSample { tid, timestamp_ns } = self.state {
+                    self.normalize_user_fixup();
                     // Trim trailing zeros from the PMC slice: a 4-arg
                     // record covers up to 4 counters, but Apple
                     // Silicon's fixed class only populates 2 (cycles,
@@ -159,6 +167,7 @@ impl Parser {
                 if matches!(self.state, State::InSample { .. }) {
                     let main = rec.arg2 as u32;
                     let async_n = rec.arg4 as u32;
+                    self.user_main_frames = main;
                     self.user_remaining = main.saturating_add(async_n);
                     self.user_frames.reserve(self.user_remaining as usize);
                 }
@@ -220,10 +229,157 @@ impl Parser {
         frames.extend_from_slice(&chunk[..take]);
         *remaining = remaining.saturating_sub(4);
     }
+
+    fn normalize_user_fixup(&mut self) {
+        let main = (self.user_main_frames as usize).min(self.user_frames.len());
+        if main < 2 {
+            return;
+        }
+
+        // xnu appends an architecture-specific user-stack fixup after
+        // the normal FP chain. On arm64 this is the saved LR, so in
+        // call-order it belongs immediately after the saved PC, not
+        // after thread_start. Keep Sample::user_backtrace leaf-first.
+        let fixup_index = main - 1;
+        let fixup = strip_code_ptr(self.user_frames[fixup_index]);
+        if fixup == 0 {
+            return;
+        }
+        if fixup_index > 1 && self.user_frames.get(1).copied().map(strip_code_ptr) == Some(fixup) {
+            self.user_frames.remove(fixup_index);
+            return;
+        }
+
+        self.user_frames.remove(fixup_index);
+        self.user_frames.insert(1, fixup);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn strip_code_ptr(mut ptr: u64) -> u64 {
+    unsafe {
+        core::arch::asm!(
+            "xpaci {ptr}",
+            ptr = inout(reg) ptr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ptr
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn strip_code_ptr(ptr: u64) -> u64 {
+    ptr
 }
 
 impl Default for Parser {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stax_mac_kperf_sys::kdebug::{kdbg_eventid, DBG_FUNC_NONE};
+
+    fn debugid(subclass: u8, code: u16, func: u32) -> u32 {
+        kdbg_eventid(DBG_PERF, subclass, code) | func
+    }
+
+    fn rec(debugid: u32, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> KdBuf {
+        KdBuf {
+            timestamp: 123,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            arg5: 42,
+            debugid,
+            cpuid: 0,
+            unused: 0,
+        }
+    }
+
+    fn start() -> KdBuf {
+        rec(debugid(perf::sc::GENERIC, 0, DBG_FUNC_START), 0, 0, 0, 0)
+    }
+
+    fn end() -> KdBuf {
+        rec(debugid(perf::sc::GENERIC, 0, DBG_FUNC_END), 0, 0, 0, 0)
+    }
+
+    fn uhdr(main: u64, async_n: u64) -> KdBuf {
+        rec(
+            debugid(perf::sc::CALLSTACK, perf::cs::UHDR, DBG_FUNC_NONE),
+            0,
+            main,
+            0,
+            async_n,
+        )
+    }
+
+    fn udata(a: u64, b: u64, c: u64, d: u64) -> KdBuf {
+        rec(
+            debugid(perf::sc::CALLSTACK, perf::cs::UDATA, DBG_FUNC_NONE),
+            a,
+            b,
+            c,
+            d,
+        )
+    }
+
+    #[test]
+    fn moves_xnu_user_fixup_after_leaf_pc() {
+        let mut parser = Parser::new();
+        let mut out = Vec::new();
+        for rec in [
+            start(),
+            uhdr(5, 0),
+            udata(10, 20, 30, 40),
+            udata(99, 0, 0, 0),
+            end(),
+        ] {
+            parser.feed(&rec, |sample| out = sample.user_backtrace.to_vec());
+        }
+
+        assert_eq!(out, [10, 99, 20, 30, 40]);
+    }
+
+    #[test]
+    fn drops_duplicate_xnu_user_fixup_tail() {
+        let mut parser = Parser::new();
+        let mut out = Vec::new();
+        let signed_fixup = 0xabcd_0000_0000_0063;
+        let stripped_fixup = strip_code_ptr(signed_fixup);
+        for rec in [
+            start(),
+            uhdr(4, 0),
+            udata(10, stripped_fixup, 20, signed_fixup),
+            end(),
+        ] {
+            parser.feed(&rec, |sample| out = sample.user_backtrace.to_vec());
+        }
+
+        assert_eq!(out, [10, stripped_fixup, 20]);
+    }
+
+    #[test]
+    fn keeps_async_frames_after_reordering_user_fixup() {
+        let mut parser = Parser::new();
+        let mut out = Vec::new();
+        for rec in [
+            start(),
+            uhdr(4, 2),
+            udata(10, 20, 30, 99),
+            udata(200, 201, 0, 0),
+            end(),
+        ] {
+            parser.feed(&rec, |sample| out = sample.user_backtrace.to_vec());
+        }
+
+        assert_eq!(out, [10, 99, 20, 30, 200, 201]);
     }
 }

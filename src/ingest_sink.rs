@@ -168,6 +168,9 @@ impl LiveSink for IngestSink {
             mach_fp: ev.mach_fp,
             mach_sp: ev.mach_sp,
             mach_walked: ev.mach_walked.to_vec(),
+            compact_walked: ev.compact_walked.to_vec(),
+            compact_dwarf_walked: ev.compact_dwarf_walked.to_vec(),
+            dwarf_walked: ev.dwarf_walked.to_vec(),
             used_framehop: ev.used_framehop,
         }));
     }
@@ -254,7 +257,7 @@ pub async fn connect_and_register(
 pub async fn connect_and_register_with_telemetry(
     server_socket: &str,
     config: stax_live_proto::RunConfig,
-    telemetry: Option<stax_telemetry::TelemetryRegistry>,
+    telemetry: Option<metrix::TelemetryRegistry>,
 ) -> eyre::Result<(
     stax_live_proto::RunId,
     IngestSink,
@@ -315,7 +318,7 @@ pub async fn connect_to_existing_run(
 pub async fn connect_to_existing_run_with_telemetry(
     server_socket: &str,
     run_id: stax_live_proto::RunId,
-    telemetry: Option<stax_telemetry::TelemetryRegistry>,
+    telemetry: Option<metrix::TelemetryRegistry>,
 ) -> eyre::Result<(IngestSink, tokio::task::JoinHandle<()>)> {
     let url = format!("local://{server_socket}");
     let mut observer = stax_vox_observe::VoxObserverLogger::new("ingest-sink", "attach_run");

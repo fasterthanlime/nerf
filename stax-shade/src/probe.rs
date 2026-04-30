@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::mach_port::mach_port_deallocate;
@@ -16,6 +19,11 @@ use mach2::traps::mach_task_self;
 use mach2::vm::mach_vm_deallocate;
 use mach2::vm::mach_vm_read_overwrite;
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
+use nwind::arch::Registers;
+use nwind::{
+    CapturedImageMapping, CapturedStackUnwinder, CapturedUnwindError, DwarfRegs, UnwindFailure,
+    UnwindMode, UserFrame,
+};
 use stax_mac_capture::sample_sink::CpuIntervalEvent;
 use stax_mac_capture::{
     BinaryLoadedEvent, BinaryUnloadedEvent, JitdumpEvent, MachOByteSource, ProbeQueueStats,
@@ -24,13 +32,54 @@ use stax_mac_capture::{
 use staxd_client::KperfProbeTriggerTiming;
 
 const MAX_FP_FRAMES: usize = 64;
-const MAX_FP_DELTA: u64 = 8 * 1024 * 1024;
 const STACK_SNAPSHOT_BYTES: usize = 512 * 1024;
 const STACK_SNAPSHOT_CHUNK: usize = 16 * 1024;
 const PROBE_UNWIND_QUEUE_CAPACITY: usize = 1024;
+const TIMER_SLEEP_MARGIN: Duration = Duration::from_millis(1);
+const TIMER_YIELD_WINDOW: Duration = Duration::from_micros(200);
+const THREAD_DEMAND_DECAY_INTERVAL: Duration = Duration::from_millis(250);
+const THREAD_DEMAND_RETENTION: Duration = Duration::from_secs(5);
+const INFERIOR_HELPER_MAGIC: u32 = 0x3158_5453; // STX1, little-endian on the wire.
+const INFERIOR_HELPER_OP_CAPTURE: u32 = 1;
+const INFERIOR_HELPER_OP_HELLO: u32 = 2;
+const INFERIOR_HELPER_STATUS_OK: u32 = 0;
+const INFERIOR_HELPER_TIMEOUT: Duration = Duration::from_millis(50);
+const INFERIOR_HELPER_RECONNECT_INTERVAL: Duration = Duration::from_millis(10);
+const INFERIOR_HELPER_RESPONSE_HEADER_BYTES: usize = 88;
+const INFERIOR_HELPER_THREAD_NAME: &str = "stax-inferior-helper";
+
+#[cfg(target_os = "macos")]
+const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(
+        qos_class: libc::c_uint,
+        relative_priority: libc::c_int,
+    ) -> libc::c_int;
+}
+
 pub struct RaceKperfSink<S> {
     inner: S,
     probe: Option<RaceProbeWorker>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RaceProbeMode {
+    Triggered,
+    /// Independently issue at most `frequency_hz` probe requests per
+    /// second across the target process. Kperf observations maintain a
+    /// decaying per-tid demand score, and each tick probes the tid with
+    /// the highest current demand.
+    Correlated {
+        frequency_hz: u32,
+    },
+}
+
+impl RaceProbeMode {
+    fn is_correlated(self) -> bool {
+        matches!(self, Self::Correlated { .. })
+    }
 }
 
 impl<S> RaceKperfSink<S> {
@@ -38,10 +87,10 @@ impl<S> RaceKperfSink<S> {
         Self { inner, probe: None }
     }
 
-    pub fn enabled(task: mach_port_t, inner: S) -> Self {
+    pub fn enabled(pid: u32, task: mach_port_t, inner: S, mode: RaceProbeMode) -> Self {
         Self {
             inner,
-            probe: Some(RaceProbeWorker::new(task)),
+            probe: Some(RaceProbeWorker::new(pid, task, mode)),
         }
     }
 
@@ -58,11 +107,17 @@ impl<S: SampleSink> SampleSink for RaceKperfSink<S> {
 
     fn on_binary_loaded(&mut self, ev: BinaryLoadedEvent<'_>) {
         self.drain_probe_results();
+        if let Some(probe) = self.probe.as_ref() {
+            probe.on_binary_loaded(&ev);
+        }
         self.inner.on_binary_loaded(ev);
     }
 
     fn on_binary_unloaded(&mut self, ev: BinaryUnloadedEvent<'_>) {
         self.drain_probe_results();
+        if let Some(probe) = self.probe.as_ref() {
+            probe.on_binary_unloaded(&ev);
+        }
         self.inner.on_binary_unloaded(ev);
     }
 
@@ -106,86 +161,86 @@ impl<S: SampleSink> RaceKperfSink<S> {
         let Some(probe) = self.probe.as_mut() else {
             return;
         };
-        for result in probe.drain_results() {
-            self.inner.on_probe_result(ProbeResultEvent {
-                tid: result.tid,
-                timing: result.timing,
-                queue: result.queue,
-                mach_pc: result.pc,
-                mach_lr: result.lr,
-                mach_fp: result.fp,
-                mach_sp: result.sp,
-                mach_walked: &result.walked,
-                used_framehop: false,
-            });
+        for event in probe.drain_results() {
+            match event {
+                ProbeWorkerEvent::Snapshot(result) => {
+                    self.inner.on_probe_result(ProbeResultEvent {
+                        tid: result.tid,
+                        timing: result.timing,
+                        queue: result.queue,
+                        mach_pc: result.pc,
+                        mach_lr: 0,
+                        mach_fp: result.fp,
+                        mach_sp: result.sp,
+                        mach_walked: &result.fp_walked,
+                        compact_walked: &result.compact_walked,
+                        compact_dwarf_walked: &result.compact_dwarf_walked,
+                        dwarf_walked: &result.dwarf_walked,
+                        used_framehop: result.used_dwarf,
+                    });
+                }
+                ProbeWorkerEvent::ThreadName { pid, tid, name } => {
+                    self.inner
+                        .on_thread_name(ThreadNameEvent { pid, tid, name });
+                }
+            }
         }
     }
 }
 
 struct RaceProbeWorker {
     trigger: RaceProbeTrigger,
-    res_rx: Receiver<ProbeSnapshotWithKey>,
+    res_rx: Receiver<ProbeWorkerEvent>,
+    image_tx: mpsc::Sender<ProbeImageUpdate>,
 }
 
 impl RaceProbeWorker {
-    fn new(task: mach_port_t) -> Self {
+    fn new(pid: u32, task: mach_port_t, mode: RaceProbeMode) -> Self {
         let requests = Arc::new(LatestProbeRequests::default());
+        let thread_demands = Arc::new(ThreadDemandTracker::new());
         let worker_requests = requests.clone();
+        let worker_thread_demands = thread_demands.clone();
         let (capture_tx, capture_rx) =
             mpsc::sync_channel::<ProbeCaptureWithKey>(PROBE_UNWIND_QUEUE_CAPACITY);
-        let (res_tx, res_rx) = mpsc::channel::<ProbeSnapshotWithKey>();
+        let (image_tx, image_rx) = mpsc::channel::<ProbeImageUpdate>();
+        let (res_tx, res_rx) = mpsc::channel::<ProbeWorkerEvent>();
+        let res_tx_from_helper = res_tx.clone();
+        let image_tx_from_probe = image_tx.clone();
         std::thread::Builder::new()
             .name("stax-race-unwind".to_owned())
             .spawn(move || {
-                tracing::info!("race-kperf unwind worker started");
-                let mut results_sent: u64 = 0;
-                let mut first_result_logged = false;
-                while let Ok(capture) = capture_rx.recv() {
-                    let mut timing = capture.timing;
-                    let walked = fp_walk_snapshot(&capture.stack, capture.fp);
-                    timing.walk_done = unsafe { mach_absolute_time() };
-                    let out = ProbeSnapshotWithKey {
-                        tid: capture.tid,
-                        timing,
-                        queue: capture.queue,
-                        pc: capture.pc,
-                        lr: capture.lr,
-                        fp: capture.fp,
-                        sp: capture.sp,
-                        walked,
-                    };
-                    if res_tx.send(out).is_err() {
-                        tracing::info!(results_sent, "race-kperf probe result receiver closed");
-                        return;
-                    }
-                    results_sent += 1;
-                    if !first_result_logged {
-                        first_result_logged = true;
-                        tracing::info!(
-                            tid = capture.tid,
-                            kperf_ts = capture.timing.kperf_ts,
-                            results_sent,
-                            coalesced = capture.queue.coalesced_requests,
-                            worker_batch_len = capture.queue.worker_batch_len,
-                            stack_bytes = capture.stack.bytes.len(),
-                            "race-kperf unwind worker sent first result"
-                        );
-                    }
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_unwind_worker(capture_rx, image_rx, res_tx);
+                }));
+                if let Err(payload) = result {
+                    tracing::error!(
+                        panic = %panic_payload_message(payload.as_ref()),
+                        "race-kperf unwind worker panicked"
+                    );
                 }
-                tracing::info!(results_sent, "race-kperf unwind worker exiting");
             })
             .expect("spawn race unwind worker");
         std::thread::Builder::new()
             .name("stax-race-probe".to_owned())
             .spawn(move || {
+                set_probe_thread_qos("race-kperf probe worker");
                 tracing::info!("race-kperf probe worker started");
                 let mut probe = RaceProbe::new(task);
+                let mut helper =
+                    connect_inprocess_helper(pid, &worker_thread_demands, &res_tx_from_helper);
+                let mut helper_next_connect = Instant::now() + INFERIOR_HELPER_RECONNECT_INTERVAL;
                 let mut batches: u64 = 0;
                 let mut requests_seen: u64 = 0;
                 let mut captures_sent: u64 = 0;
+                let mut helper_captures_sent: u64 = 0;
                 let mut captures_dropped: u64 = 0;
+                let mut first_helper_capture_logged = false;
                 let mut first_request_logged = false;
+                let mut images_seeded = false;
                 while let Some(batch) = worker_requests.take_all() {
+                    if !images_seeded {
+                        images_seeded = seed_target_images(task, &image_tx_from_probe);
+                    }
                     batches += 1;
                     let worker_batch_len = batch.len() as u32;
                     for req in batch {
@@ -202,6 +257,75 @@ impl RaceProbeWorker {
                         }
                         let mut timing = req.timing;
                         timing.worker_started = unsafe { mach_absolute_time() };
+                        if helper.is_none() && Instant::now() >= helper_next_connect {
+                            helper =
+                                connect_inprocess_helper(
+                                    pid,
+                                    &worker_thread_demands,
+                                    &res_tx_from_helper,
+                                );
+                            helper_next_connect = Instant::now() + INFERIOR_HELPER_RECONNECT_INTERVAL;
+                        }
+                        if let Some(helper_client) = helper.as_mut() {
+                            match helper_client.capture(req.tid, timing) {
+                                Ok(Some(mut capture)) => {
+                                    capture.queue = ProbeQueueStats {
+                                        coalesced_requests: req.coalesced_requests,
+                                        worker_batch_len,
+                                    };
+                                    let stack_bytes = capture.stack.bytes.len();
+                                    match capture_tx.try_send(capture) {
+                                        Ok(()) => {
+                                            captures_sent += 1;
+                                            helper_captures_sent =
+                                                helper_captures_sent.saturating_add(1);
+                                        }
+                                        Err(mpsc::TrySendError::Full(_)) => {
+                                            captures_dropped += 1;
+                                            if captures_dropped.is_multiple_of(1024) {
+                                                tracing::warn!(
+                                                    captures_dropped,
+                                                    captures_sent,
+                                                    helper_captures_sent,
+                                                    "race-kperf unwind queue full; dropping captures"
+                                                );
+                                            }
+                                        }
+                                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                                            tracing::info!(
+                                                batches,
+                                                requests_seen,
+                                                captures_sent,
+                                                helper_captures_sent,
+                                                captures_dropped,
+                                                "race-kperf unwind worker closed"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                    if !first_helper_capture_logged {
+                                        first_helper_capture_logged = true;
+                                        tracing::info!(
+                                            tid = req.tid,
+                                            kperf_ts = timing.kperf_ts,
+                                            helper_captures_sent,
+                                            stack_bytes,
+                                            "race-kperf inferior helper sent first stack capture"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                Ok(None) => continue,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        pid,
+                                        error = ?err,
+                                        "race-kperf inferior helper failed; falling back to remote capture"
+                                    );
+                                    helper = None;
+                                }
+                            }
+                        }
                         if let Some(capture) = probe.probe_sample(req.tid, timing) {
                             let out = ProbeCaptureWithKey {
                                 tid: req.tid,
@@ -246,18 +370,39 @@ impl RaceProbeWorker {
                     batches,
                     requests_seen,
                     captures_sent,
+                    helper_captures_sent,
                     captures_dropped,
                     "race-kperf probe worker exiting"
                 );
             })
             .expect("spawn race probe worker");
+        if let RaceProbeMode::Correlated { frequency_hz } = mode {
+            let sampler_requests = requests.clone();
+            let sampler_thread_demands = thread_demands.clone();
+            let sampler_enqueued = Arc::new(AtomicU64::new(0));
+            let sampler_enqueued_for_thread = sampler_enqueued.clone();
+            std::thread::Builder::new()
+                .name("stax-corr-probe-timer".to_owned())
+                .spawn(move || {
+                    periodic_probe_sampler(
+                        sampler_requests,
+                        sampler_thread_demands,
+                        sampler_enqueued_for_thread,
+                        frequency_hz,
+                    )
+                })
+                .expect("spawn correlated probe sampler");
+        }
         Self {
             trigger: RaceProbeTrigger {
                 requests,
+                thread_demands,
+                mode,
                 enqueued_probe_requests: Arc::new(AtomicU64::new(0)),
                 coalesced_probe_requests: Arc::new(AtomicU64::new(0)),
             },
             res_rx,
+            image_tx,
         }
     }
 
@@ -265,13 +410,43 @@ impl RaceProbeWorker {
         self.trigger.clone()
     }
 
-    fn drain_results(&self) -> Vec<ProbeSnapshotWithKey> {
+    fn drain_results(&self) -> Vec<ProbeWorkerEvent> {
         let mut out = Vec::new();
-        while let Ok(snapshot) = self.res_rx.try_recv() {
-            out.push(snapshot);
+        while let Ok(event) = self.res_rx.try_recv() {
+            out.push(event);
         }
         out
     }
+
+    fn on_binary_loaded(&self, ev: &BinaryLoadedEvent<'_>) {
+        if ev.vmsize == 0 || ev.path.is_empty() || ev.text_bytes.is_some() {
+            return;
+        }
+        let mapping = CapturedImageMapping::executable_text(ev.path, ev.base_avma, ev.vmsize, 0);
+        let _ = self.image_tx.send(ProbeImageUpdate::Loaded(mapping));
+    }
+
+    fn on_binary_unloaded(&self, ev: &BinaryUnloadedEvent<'_>) {
+        let _ = self.image_tx.send(ProbeImageUpdate::Unloaded {
+            base_avma: ev.base_avma,
+        });
+    }
+}
+
+fn connect_inprocess_helper(
+    pid: u32,
+    thread_demands: &ThreadDemandTracker,
+    results: &mpsc::Sender<ProbeWorkerEvent>,
+) -> Option<InProcessHelperClient> {
+    let helper = InProcessHelperClient::connect(pid)?;
+    let helper_tid = helper.helper_tid;
+    thread_demands.suppress(helper_tid);
+    let _ = results.send(ProbeWorkerEvent::ThreadName {
+        pid,
+        tid: helper_tid,
+        name: INFERIOR_HELPER_THREAD_NAME,
+    });
+    Some(helper)
 }
 
 impl Drop for RaceProbeWorker {
@@ -283,6 +458,8 @@ impl Drop for RaceProbeWorker {
 #[derive(Clone)]
 pub struct RaceProbeTrigger {
     requests: Arc<LatestProbeRequests>,
+    thread_demands: Arc<ThreadDemandTracker>,
+    mode: RaceProbeMode,
     enqueued_probe_requests: Arc<AtomicU64>,
     coalesced_probe_requests: Arc<AtomicU64>,
 }
@@ -293,6 +470,12 @@ impl RaceProbeTrigger {
     /// request for the same tid; that is intentional because
     /// race-kperf wants fresh observations, not FIFO delivery.
     pub fn enqueue(&self, tid: u32, trigger: KperfProbeTriggerTiming) -> bool {
+        if !self.thread_demands.observe(tid) {
+            return false;
+        }
+        if self.mode.is_correlated() {
+            return false;
+        }
         let enqueued = self
             .enqueued_probe_requests
             .fetch_add(1, Ordering::Relaxed)
@@ -337,6 +520,162 @@ impl RaceProbeTrigger {
     }
 }
 
+struct ThreadDemandTracker {
+    state: Mutex<ThreadDemandState>,
+}
+
+struct ThreadDemandState {
+    threads: HashMap<u32, ThreadDemand>,
+    suppressed: HashSet<u32>,
+    last_decay: Instant,
+}
+
+struct ThreadDemand {
+    demand: u32,
+    observed: u64,
+    probed: u64,
+    last_seen: Instant,
+    last_probed: Option<Instant>,
+}
+
+struct ThreadDemandChoice {
+    tid: u32,
+    known_tids: usize,
+    demand: u32,
+    deficit: u64,
+}
+
+impl ThreadDemandTracker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ThreadDemandState {
+                threads: HashMap::new(),
+                suppressed: HashSet::new(),
+                last_decay: Instant::now(),
+            }),
+        }
+    }
+
+    fn observe(&self, tid: u32) -> bool {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .expect("thread demand tracker lock poisoned");
+        state.decay(now);
+        if state.suppressed.contains(&tid) {
+            state.threads.remove(&tid);
+            return false;
+        }
+        let thread = state.threads.entry(tid).or_insert(ThreadDemand {
+            demand: 0,
+            observed: 0,
+            probed: 0,
+            last_seen: now,
+            last_probed: None,
+        });
+        thread.demand = thread.demand.saturating_add(1);
+        thread.observed = thread.observed.saturating_add(1);
+        thread.last_seen = now;
+        true
+    }
+
+    fn suppress(&self, tid: u32) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("thread demand tracker lock poisoned");
+        state.suppressed.insert(tid);
+        state.threads.remove(&tid);
+    }
+
+    fn pick(&self) -> Option<ThreadDemandChoice> {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .expect("thread demand tracker lock poisoned");
+        state.decay(now);
+        let mut best: Option<ThreadDemandCandidate> = None;
+        for (&tid, thread) in &state.threads {
+            if state.suppressed.contains(&tid) {
+                continue;
+            }
+            if thread.demand == 0 {
+                continue;
+            }
+            let idle_ns = thread
+                .last_probed
+                .map(|last_probed| now.saturating_duration_since(last_probed).as_nanos())
+                .unwrap_or(1_000_000_000);
+            let candidate = ThreadDemandCandidate {
+                tid,
+                demand: thread.demand,
+                deficit: thread.observed.saturating_sub(thread.probed),
+                urgency: u128::from(thread.demand).saturating_mul(idle_ns),
+            };
+            if best
+                .as_ref()
+                .is_none_or(|current| candidate.is_better_than(current))
+            {
+                best = Some(candidate);
+            }
+        }
+        let best = best?;
+        let known_tids = state.threads.len();
+        let thread = state
+            .threads
+            .get_mut(&best.tid)
+            .expect("selected thread disappeared from demand tracker");
+        thread.probed = thread.probed.saturating_add(1);
+        thread.last_probed = Some(now);
+        Some(ThreadDemandChoice {
+            tid: best.tid,
+            known_tids,
+            demand: best.demand,
+            deficit: best.deficit,
+        })
+    }
+}
+
+impl ThreadDemandState {
+    fn decay(&mut self, now: Instant) {
+        if now.duration_since(self.last_decay) < THREAD_DEMAND_DECAY_INTERVAL {
+            return;
+        }
+        self.last_decay = now;
+        for thread in self.threads.values_mut() {
+            thread.demand /= 2;
+        }
+        self.threads.retain(|_, thread| {
+            thread.demand > 0 || now.duration_since(thread.last_seen) < THREAD_DEMAND_RETENTION
+        });
+    }
+}
+
+struct ThreadDemandCandidate {
+    tid: u32,
+    demand: u32,
+    deficit: u64,
+    urgency: u128,
+}
+
+impl ThreadDemandCandidate {
+    fn is_better_than(&self, other: &Self) -> bool {
+        (
+            self.urgency,
+            self.demand,
+            self.deficit,
+            std::cmp::Reverse(self.tid),
+        ) > (
+            other.urgency,
+            other.demand,
+            other.deficit,
+            std::cmp::Reverse(other.tid),
+        )
+    }
+}
+
 #[derive(Default)]
 struct LatestProbeRequests {
     state: Mutex<LatestProbeState>,
@@ -352,6 +691,9 @@ struct LatestProbeState {
 impl LatestProbeRequests {
     fn push(&self, request: ProbeRequest) -> bool {
         let mut state = self.state.lock().expect("race probe request lock poisoned");
+        if state.closed {
+            return false;
+        }
         let mut request = request;
         let replaced = if let Some(previous) = state.pending.remove(&request.tid) {
             request.coalesced_requests = previous.coalesced_requests.saturating_add(1);
@@ -382,6 +724,102 @@ impl LatestProbeRequests {
         let mut state = self.state.lock().expect("race probe request lock poisoned");
         state.closed = true;
         self.ready.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("race probe request lock poisoned")
+            .closed
+    }
+}
+
+fn periodic_probe_sampler(
+    requests: Arc<LatestProbeRequests>,
+    thread_demands: Arc<ThreadDemandTracker>,
+    enqueued_probe_requests: Arc<AtomicU64>,
+    frequency_hz: u32,
+) {
+    set_probe_thread_qos("correlated kperf probe sampler");
+    let frequency_hz = frequency_hz.max(1);
+    let interval = Duration::from_nanos((1_000_000_000u64 / u64::from(frequency_hz)).max(1));
+    let mut first_logged = false;
+    let mut ticks: u64 = 0;
+    let mut next_tick = Instant::now();
+    tracing::info!(
+        frequency_hz,
+        interval_ns = interval.as_nanos() as u64,
+        "correlated kperf probe sampler started"
+    );
+    while !requests.is_closed() {
+        next_tick += interval;
+        if let Some(choice) = thread_demands.pick() {
+            ticks = ticks.saturating_add(1);
+            let request_ticks = unsafe { mach_absolute_time() };
+            let enqueued = enqueued_probe_requests
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            let replaced = requests.push(ProbeRequest {
+                tid: choice.tid,
+                timing: correlated_probe_timing(request_ticks),
+                coalesced_requests: 0,
+            });
+            if !first_logged {
+                first_logged = true;
+                tracing::info!(
+                    tid = choice.tid,
+                    probe_ts = request_ticks,
+                    known_tids = choice.known_tids,
+                    demand = choice.demand,
+                    deficit = choice.deficit,
+                    replaced,
+                    "correlated kperf first periodic probe request enqueued"
+                );
+            } else if enqueued.is_multiple_of(4096) {
+                tracing::debug!(
+                    enqueued,
+                    ticks,
+                    tid = choice.tid,
+                    known_tids = choice.known_tids,
+                    demand = choice.demand,
+                    deficit = choice.deficit,
+                    "correlated kperf periodic probe requests enqueued"
+                );
+            }
+        }
+        wait_until(next_tick);
+    }
+    tracing::info!(
+        ticks,
+        enqueued = enqueued_probe_requests.load(Ordering::Relaxed),
+        "correlated kperf probe sampler exiting"
+    );
+}
+
+fn wait_until(deadline: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline - now;
+        if remaining > TIMER_SLEEP_MARGIN + TIMER_YIELD_WINDOW {
+            std::thread::sleep(remaining - TIMER_SLEEP_MARGIN);
+        } else if remaining > TIMER_YIELD_WINDOW {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+fn set_probe_thread_qos(label: &'static str) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        if rc != 0 {
+            tracing::warn!(errno = rc, label, "failed to raise probe thread QoS");
+        }
     }
 }
 
@@ -444,10 +882,10 @@ impl RaceProbe {
 
         Ok(ProbeCapture {
             timing,
-            pc: strip_ptr(state.pc),
-            lr: strip_ptr(state.lr),
-            fp: strip_ptr(state.fp),
-            sp: strip_ptr(state.sp),
+            pc: strip_code_ptr(state.pc),
+            lr: strip_code_ptr(state.lr),
+            fp: strip_data_ptr(state.fp),
+            sp: strip_data_ptr(state.sp),
             stack,
         })
     }
@@ -481,15 +919,661 @@ fn probe_timing_from_trigger(trigger: KperfProbeTriggerTiming, enqueued: u64) ->
     }
 }
 
+fn correlated_probe_timing(request_ticks: u64) -> ProbeTiming {
+    ProbeTiming {
+        kperf_ts: request_ticks,
+        client_received: request_ticks,
+        enqueued: request_ticks,
+        ..ProbeTiming::default()
+    }
+}
+
 struct ProbeSnapshotWithKey {
     tid: u32,
     timing: ProbeTiming,
     queue: ProbeQueueStats,
     pc: u64,
+    fp: u64,
+    sp: u64,
+    fp_walked: Vec<u64>,
+    compact_walked: Vec<u64>,
+    compact_dwarf_walked: Vec<u64>,
+    dwarf_walked: Vec<u64>,
+    used_dwarf: bool,
+}
+
+struct DwarfUnwindOutcome {
+    walked: Vec<u64>,
+    bridge_steps: usize,
+}
+
+struct DwarfUnwindFailure {
+    error: CapturedUnwindError,
+    bridge_attempted: bool,
+    bridge_steps: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DwarfSeedRegs {
+    pc: u64,
     lr: u64,
     fp: u64,
     sp: u64,
-    walked: Vec<u64>,
+}
+
+struct FpBridgeStep {
+    seed: DwarfSeedRegs,
+}
+
+enum ProbeImageUpdate {
+    Loaded(CapturedImageMapping),
+    Unloaded { base_avma: u64 },
+}
+
+#[derive(Default)]
+struct DwarfFailureStats {
+    no_mappings: u64,
+    no_mapped_regions: u64,
+    missing_stack_pointer: u64,
+    missing_instruction_pointer: u64,
+    empty_stack: u64,
+    no_binary: u64,
+    no_unwind_info: u64,
+    null_instruction_pointer: u64,
+    missing_cfa: u64,
+    missing_cfa_register: u64,
+    cfa_expression_failed: u64,
+    register_memory_read_failed: u64,
+    register_expression_failed: u64,
+    unsupported_register_rule: u64,
+    missing_return_address: u64,
+    no_caller_frames: u64,
+    other: u64,
+}
+
+impl DwarfFailureStats {
+    fn record(&mut self, error: &CapturedUnwindError) {
+        match error {
+            CapturedUnwindError::NoMappings => self.no_mappings += 1,
+            CapturedUnwindError::NoMappedRegions => self.no_mapped_regions += 1,
+            CapturedUnwindError::MissingStackPointer => self.missing_stack_pointer += 1,
+            CapturedUnwindError::MissingInstructionPointer => self.missing_instruction_pointer += 1,
+            CapturedUnwindError::EmptyStack => self.empty_stack += 1,
+            CapturedUnwindError::OnlyLeafFrame { reason } => match reason {
+                Some(UnwindFailure::NoBinary) => self.no_binary += 1,
+                Some(UnwindFailure::NoUnwindInfo) => self.no_unwind_info += 1,
+                Some(UnwindFailure::NullInstructionPointer) => self.null_instruction_pointer += 1,
+                Some(UnwindFailure::MissingCfa) => self.missing_cfa += 1,
+                Some(UnwindFailure::MissingCfaRegister) => self.missing_cfa_register += 1,
+                Some(UnwindFailure::CfaExpressionFailed) => self.cfa_expression_failed += 1,
+                Some(UnwindFailure::RegisterMemoryReadFailed) => {
+                    self.register_memory_read_failed += 1
+                }
+                Some(UnwindFailure::RegisterExpressionFailed) => {
+                    self.register_expression_failed += 1
+                }
+                Some(UnwindFailure::UnsupportedRegisterRule) => self.unsupported_register_rule += 1,
+                Some(UnwindFailure::MissingReturnAddress) => self.missing_return_address += 1,
+                Some(UnwindFailure::MissingInstructionPointer) => {
+                    self.missing_instruction_pointer += 1
+                }
+                Some(_) => self.other += 1,
+                None => self.no_caller_frames += 1,
+            },
+        }
+    }
+}
+
+fn run_unwind_worker(
+    capture_rx: mpsc::Receiver<ProbeCaptureWithKey>,
+    image_rx: mpsc::Receiver<ProbeImageUpdate>,
+    res_tx: mpsc::Sender<ProbeWorkerEvent>,
+) {
+    set_probe_thread_qos("race-kperf unwind worker");
+    tracing::info!("race-kperf unwind worker started");
+    let mut results_sent: u64 = 0;
+    let mut dwarf_successes: u64 = 0;
+    let mut dwarf_failures: u64 = 0;
+    let mut dwarf_bridge_attempts: u64 = 0;
+    let mut dwarf_bridge_successes: u64 = 0;
+    let mut dwarf_bridge_steps: u64 = 0;
+    let mut fp_successes: u64 = 0;
+    let mut dwarf_failure_stats = DwarfFailureStats::default();
+    let mut first_result_logged = false;
+    let mut first_compact_failure_logged = false;
+    let mut first_compact_dwarf_failure_logged = false;
+    let mut unwinder = CapturedStackUnwinder::new();
+    let mut compact_frames = Vec::new();
+    let mut compact_dwarf_frames = Vec::new();
+    let mut dwarf_frames = Vec::new();
+    while let Ok(capture) = capture_rx.recv() {
+        drain_image_updates(&mut unwinder, &image_rx);
+        let mut timing = capture.timing;
+        let fp_walked = fp_walk_capture(&capture);
+        if !fp_walked.is_empty() {
+            fp_successes = fp_successes.saturating_add(1);
+        }
+        let compact_walked = match metadata_unwind_capture(
+            &mut unwinder,
+            &capture,
+            &mut compact_frames,
+            UnwindMode::CompactOnly,
+        ) {
+            Ok(walked) => walked,
+            Err(error) => {
+                if !first_compact_failure_logged {
+                    first_compact_failure_logged = true;
+                    tracing::debug!(
+                        tid = capture.tid,
+                        kperf_ts = capture.timing.kperf_ts,
+                        error = ?error,
+                        "race-kperf compact-only unwind produced no caller frames"
+                    );
+                }
+                Vec::new()
+            }
+        };
+        let compact_dwarf_walked = match metadata_unwind_capture(
+            &mut unwinder,
+            &capture,
+            &mut compact_dwarf_frames,
+            UnwindMode::CompactWithDwarfRefs,
+        ) {
+            Ok(walked) => walked,
+            Err(error) => {
+                if !first_compact_dwarf_failure_logged {
+                    first_compact_dwarf_failure_logged = true;
+                    tracing::debug!(
+                        tid = capture.tid,
+                        kperf_ts = capture.timing.kperf_ts,
+                        error = ?error,
+                        "race-kperf compact+fde unwind produced no caller frames"
+                    );
+                }
+                Vec::new()
+            }
+        };
+        let dwarf_walked = match dwarf_unwind_capture(&mut unwinder, &capture, &mut dwarf_frames) {
+            Ok(outcome) => {
+                dwarf_successes = dwarf_successes.saturating_add(1);
+                if outcome.bridge_steps != 0 {
+                    dwarf_bridge_attempts = dwarf_bridge_attempts.saturating_add(1);
+                    dwarf_bridge_successes = dwarf_bridge_successes.saturating_add(1);
+                    dwarf_bridge_steps =
+                        dwarf_bridge_steps.saturating_add(outcome.bridge_steps as u64);
+                }
+                outcome.walked
+            }
+            Err(failure) => {
+                dwarf_failures = dwarf_failures.saturating_add(1);
+                if failure.bridge_attempted {
+                    dwarf_bridge_attempts = dwarf_bridge_attempts.saturating_add(1);
+                    dwarf_bridge_steps =
+                        dwarf_bridge_steps.saturating_add(failure.bridge_steps as u64);
+                }
+                dwarf_failure_stats.record(&failure.error);
+                if dwarf_failures == 1 || dwarf_failures.is_multiple_of(1024) {
+                    let reload = unwinder.last_reload();
+                    tracing::warn!(
+                        tid = capture.tid,
+                        kperf_ts = capture.timing.kperf_ts,
+                        error = ?failure.error,
+                        bridge_attempted = failure.bridge_attempted,
+                        bridge_steps = failure.bridge_steps,
+                        mapped_regions = reload.mapped_regions,
+                        loaded_binaries = reload.loaded_binaries,
+                        load_failures = reload.load_failures.len(),
+                        dwarf_failures,
+                        dwarf_bridge_attempts,
+                        dwarf_bridge_successes,
+                        dwarf_bridge_steps,
+                        no_mappings = dwarf_failure_stats.no_mappings,
+                        no_mapped_regions = dwarf_failure_stats.no_mapped_regions,
+                        missing_sp = dwarf_failure_stats.missing_stack_pointer,
+                        missing_ip = dwarf_failure_stats.missing_instruction_pointer,
+                        empty_stack = dwarf_failure_stats.empty_stack,
+                        no_binary = dwarf_failure_stats.no_binary,
+                        no_unwind_info = dwarf_failure_stats.no_unwind_info,
+                        null_ip = dwarf_failure_stats.null_instruction_pointer,
+                        missing_cfa = dwarf_failure_stats.missing_cfa,
+                        missing_cfa_register = dwarf_failure_stats.missing_cfa_register,
+                        cfa_expression_failed = dwarf_failure_stats.cfa_expression_failed,
+                        register_memory_read_failed =
+                            dwarf_failure_stats.register_memory_read_failed,
+                        register_expression_failed = dwarf_failure_stats.register_expression_failed,
+                        unsupported_register_rule = dwarf_failure_stats.unsupported_register_rule,
+                        missing_return_address = dwarf_failure_stats.missing_return_address,
+                        no_caller_frames = dwarf_failure_stats.no_caller_frames,
+                        other_failures = dwarf_failure_stats.other,
+                        "race-kperf dwarf unwind failed; keeping FP validator only"
+                    );
+                }
+                Vec::new()
+            }
+        };
+        timing.walk_done = unsafe { mach_absolute_time() };
+        let out = ProbeSnapshotWithKey {
+            tid: capture.tid,
+            timing,
+            queue: capture.queue,
+            pc: capture.pc,
+            fp: capture.fp,
+            sp: capture.sp,
+            fp_walked,
+            compact_walked,
+            compact_dwarf_walked,
+            used_dwarf: !dwarf_walked.is_empty(),
+            dwarf_walked,
+        };
+        if res_tx.send(ProbeWorkerEvent::Snapshot(out)).is_err() {
+            tracing::info!(results_sent, "race-kperf probe result receiver closed");
+            return;
+        }
+        results_sent += 1;
+        if !first_result_logged {
+            first_result_logged = true;
+            tracing::info!(
+                tid = capture.tid,
+                kperf_ts = capture.timing.kperf_ts,
+                results_sent,
+                coalesced = capture.queue.coalesced_requests,
+                worker_batch_len = capture.queue.worker_batch_len,
+                stack_bytes = capture.stack.bytes.len(),
+                fp_successes,
+                dwarf_successes,
+                dwarf_failures,
+                dwarf_bridge_attempts,
+                dwarf_bridge_successes,
+                dwarf_bridge_steps,
+                "race-kperf unwind worker sent first result"
+            );
+        }
+    }
+    tracing::info!(
+        results_sent,
+        fp_successes,
+        dwarf_successes,
+        dwarf_failures,
+        dwarf_bridge_attempts,
+        dwarf_bridge_successes,
+        dwarf_bridge_steps,
+        no_mappings = dwarf_failure_stats.no_mappings,
+        no_mapped_regions = dwarf_failure_stats.no_mapped_regions,
+        missing_sp = dwarf_failure_stats.missing_stack_pointer,
+        missing_ip = dwarf_failure_stats.missing_instruction_pointer,
+        empty_stack = dwarf_failure_stats.empty_stack,
+        no_binary = dwarf_failure_stats.no_binary,
+        no_unwind_info = dwarf_failure_stats.no_unwind_info,
+        null_ip = dwarf_failure_stats.null_instruction_pointer,
+        missing_cfa = dwarf_failure_stats.missing_cfa,
+        missing_cfa_register = dwarf_failure_stats.missing_cfa_register,
+        cfa_expression_failed = dwarf_failure_stats.cfa_expression_failed,
+        register_memory_read_failed = dwarf_failure_stats.register_memory_read_failed,
+        register_expression_failed = dwarf_failure_stats.register_expression_failed,
+        unsupported_register_rule = dwarf_failure_stats.unsupported_register_rule,
+        missing_return_address = dwarf_failure_stats.missing_return_address,
+        no_caller_frames = dwarf_failure_stats.no_caller_frames,
+        other_failures = dwarf_failure_stats.other,
+        "race-kperf unwind worker exiting"
+    );
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_owned()
+    }
+}
+
+fn seed_target_images(task: mach_port_t, image_tx: &mpsc::Sender<ProbeImageUpdate>) -> bool {
+    let walker = stax_target_images::TargetImageWalker::new(task);
+    let images = match walker.enumerate() {
+        Ok(images) => images,
+        Err(error) => {
+            tracing::debug!(?error, "race-kperf target image seed failed");
+            return false;
+        }
+    };
+
+    let mut sent = 0usize;
+    let mut skipped = 0usize;
+    for image in images {
+        let Some(sections) = image.sections.as_ref() else {
+            skipped += 1;
+            continue;
+        };
+        let Some(text) = sections.text_avma.as_ref() else {
+            skipped += 1;
+            continue;
+        };
+        if text.start >= text.end {
+            skipped += 1;
+            continue;
+        }
+        let mapping =
+            CapturedImageMapping::executable_text(image.path, text.start, text.end - text.start, 0);
+        if image_tx.send(ProbeImageUpdate::Loaded(mapping)).is_ok() {
+            sent += 1;
+        }
+    }
+
+    tracing::info!(
+        sent,
+        skipped,
+        "race-kperf seeded target image mappings for dwarf unwind"
+    );
+    sent > 0
+}
+
+fn drain_image_updates(
+    unwinder: &mut CapturedStackUnwinder,
+    image_rx: &mpsc::Receiver<ProbeImageUpdate>,
+) {
+    while let Ok(update) = image_rx.try_recv() {
+        match update {
+            ProbeImageUpdate::Loaded(mapping) => unwinder.add_mapping(mapping),
+            ProbeImageUpdate::Unloaded { base_avma } => unwinder.remove_mapping_by_start(base_avma),
+        }
+    }
+}
+
+fn fp_walk_capture(capture: &ProbeCaptureWithKey) -> Vec<u64> {
+    let mut walked = Vec::with_capacity(MAX_FP_FRAMES);
+    let mut fp = strip_data_ptr(capture.fp);
+    for _ in 0..MAX_FP_FRAMES {
+        let Some(next_fp) = read_stack_u64(&capture.stack, fp) else {
+            break;
+        };
+        let Some(saved_lr) = read_stack_u64(&capture.stack, fp.saturating_add(8)) else {
+            break;
+        };
+        let saved_lr = strip_code_ptr(saved_lr);
+        if saved_lr != 0 {
+            walked.push(saved_lr);
+        }
+        let next_fp = strip_data_ptr(next_fp);
+        if next_fp <= fp {
+            break;
+        }
+        fp = next_fp;
+    }
+    walked
+}
+
+fn read_stack_u64(stack: &StackSnapshot, address: u64) -> Option<u64> {
+    let offset = address.checked_sub(stack.base)? as usize;
+    let end = offset.checked_add(8)?;
+    let bytes = stack.bytes.get(offset..end)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn dwarf_unwind_capture(
+    unwinder: &mut CapturedStackUnwinder,
+    capture: &ProbeCaptureWithKey,
+    frames: &mut Vec<UserFrame>,
+) -> Result<DwarfUnwindOutcome, DwarfUnwindFailure> {
+    match dwarf_unwind_from_seed(
+        unwinder,
+        DwarfSeedRegs::from_capture(capture),
+        capture.stack.base,
+        &capture.stack,
+        frames,
+    ) {
+        Ok(walked) => {
+            return Ok(DwarfUnwindOutcome {
+                walked,
+                bridge_steps: 0,
+            });
+        }
+        Err(error) if !should_bridge_dwarf_failure(&error) => {
+            return Err(DwarfUnwindFailure {
+                error,
+                bridge_attempted: false,
+                bridge_steps: 0,
+            });
+        }
+        Err(error) => {
+            let mut last_error = error;
+            let mut bridge_steps = 0usize;
+            let mut bridge_prefix = Vec::with_capacity(MAX_FP_FRAMES);
+            let mut fp = strip_data_ptr(capture.fp);
+            let mut sp = strip_data_ptr(capture.sp);
+
+            while bridge_steps < MAX_FP_FRAMES {
+                let Some(step) = fp_bridge_step(&capture.stack, fp, sp) else {
+                    return Err(DwarfUnwindFailure {
+                        error: last_error,
+                        bridge_attempted: true,
+                        bridge_steps,
+                    });
+                };
+
+                bridge_steps += 1;
+                bridge_prefix.push(step.seed.pc);
+
+                match dwarf_unwind_from_seed(
+                    unwinder,
+                    step.seed,
+                    capture.stack.base,
+                    &capture.stack,
+                    frames,
+                ) {
+                    Ok(mut walked) => {
+                        bridge_prefix.append(&mut walked);
+                        bridge_prefix.dedup();
+                        return Ok(DwarfUnwindOutcome {
+                            walked: bridge_prefix,
+                            bridge_steps,
+                        });
+                    }
+                    Err(error) if should_bridge_dwarf_failure(&error) => {
+                        last_error = error;
+                        fp = step.seed.fp;
+                        sp = step.seed.sp;
+                    }
+                    Err(error) => {
+                        return Err(DwarfUnwindFailure {
+                            error,
+                            bridge_attempted: true,
+                            bridge_steps,
+                        });
+                    }
+                }
+            }
+
+            Err(DwarfUnwindFailure {
+                error: last_error,
+                bridge_attempted: true,
+                bridge_steps,
+            })
+        }
+    }
+}
+
+fn metadata_unwind_capture(
+    unwinder: &mut CapturedStackUnwinder,
+    capture: &ProbeCaptureWithKey,
+    frames: &mut Vec<UserFrame>,
+    mode: UnwindMode,
+) -> Result<Vec<u64>, CapturedUnwindError> {
+    match unwind_from_seed(
+        unwinder,
+        DwarfSeedRegs::from_capture(capture),
+        capture.stack.base,
+        &capture.stack,
+        frames,
+        mode,
+    ) {
+        Ok(walked) => Ok(walked),
+        Err(error) if !should_bridge_metadata_failure(&error) => Err(error),
+        Err(error) => {
+            let mut last_error = error;
+            let mut bridge_steps = 0usize;
+            let mut bridge_prefix = Vec::with_capacity(MAX_FP_FRAMES);
+            let mut fp = strip_data_ptr(capture.fp);
+            let mut sp = strip_data_ptr(capture.sp);
+
+            while bridge_steps < MAX_FP_FRAMES {
+                let Some(step) = fp_bridge_step(&capture.stack, fp, sp) else {
+                    return Err(last_error);
+                };
+
+                bridge_steps += 1;
+                bridge_prefix.push(step.seed.pc);
+
+                match unwind_from_seed(
+                    unwinder,
+                    step.seed,
+                    capture.stack.base,
+                    &capture.stack,
+                    frames,
+                    mode,
+                ) {
+                    Ok(mut walked) => {
+                        bridge_prefix.append(&mut walked);
+                        bridge_prefix.dedup();
+                        return Ok(bridge_prefix);
+                    }
+                    Err(error) if should_bridge_metadata_failure(&error) => {
+                        last_error = error;
+                        fp = step.seed.fp;
+                        sp = step.seed.sp;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            Err(last_error)
+        }
+    }
+}
+
+fn dwarf_unwind_from_seed(
+    unwinder: &mut CapturedStackUnwinder,
+    seed: DwarfSeedRegs,
+    stack_base: u64,
+    stack: &StackSnapshot,
+    frames: &mut Vec<UserFrame>,
+) -> Result<Vec<u64>, CapturedUnwindError> {
+    unwind_from_seed(
+        unwinder,
+        seed,
+        stack_base,
+        stack,
+        frames,
+        UnwindMode::Default,
+    )
+}
+
+fn unwind_from_seed(
+    unwinder: &mut CapturedStackUnwinder,
+    seed: DwarfSeedRegs,
+    stack_base: u64,
+    stack: &StackSnapshot,
+    frames: &mut Vec<UserFrame>,
+    mode: UnwindMode,
+) -> Result<Vec<u64>, CapturedUnwindError> {
+    let mut regs = dwarf_regs_from_seed(seed);
+    unwinder.unwind_into_with_mode_at(&mut regs, stack_base, &stack.bytes, frames, mode)?;
+    let mut walked = Vec::with_capacity(frames.len().saturating_sub(1).min(MAX_FP_FRAMES));
+    for frame in frames.iter().skip(1).take(MAX_FP_FRAMES) {
+        let pc = strip_code_ptr(frame.address);
+        if pc != 0 && walked.last().copied() != Some(pc) {
+            walked.push(pc);
+        }
+    }
+    if walked.is_empty() {
+        return Err(CapturedUnwindError::OnlyLeafFrame { reason: None });
+    }
+    Ok(walked)
+}
+
+fn should_bridge_dwarf_failure(error: &CapturedUnwindError) -> bool {
+    matches!(
+        error,
+        CapturedUnwindError::OnlyLeafFrame {
+            reason: Some(UnwindFailure::NoUnwindInfo | UnwindFailure::NoBinary)
+        }
+    )
+}
+
+fn should_bridge_metadata_failure(error: &CapturedUnwindError) -> bool {
+    matches!(error, CapturedUnwindError::OnlyLeafFrame { .. })
+}
+
+fn fp_bridge_step(stack: &StackSnapshot, fp: u64, sp: u64) -> Option<FpBridgeStep> {
+    let fp = strip_data_ptr(fp);
+    if fp == 0 || fp < strip_data_ptr(sp) {
+        return None;
+    }
+
+    let next_fp = strip_data_ptr(read_stack_u64(stack, fp)?);
+    let pc = strip_code_ptr(read_stack_u64(stack, fp.checked_add(8)?)?);
+    if next_fp == 0 || next_fp <= fp || pc == 0 {
+        return None;
+    }
+
+    let caller_sp = fp.checked_add(16)?;
+    let lr = read_stack_u64(stack, next_fp.checked_add(8)?)
+        .map(strip_code_ptr)
+        .unwrap_or(0);
+
+    Some(FpBridgeStep {
+        seed: DwarfSeedRegs {
+            pc,
+            lr,
+            fp: next_fp,
+            sp: caller_sp,
+        },
+    })
+}
+
+impl DwarfSeedRegs {
+    fn from_capture(capture: &ProbeCaptureWithKey) -> Self {
+        Self {
+            pc: capture.pc,
+            lr: capture.lr,
+            fp: capture.fp,
+            sp: capture.sp,
+        }
+    }
+}
+
+fn dwarf_regs_from_seed(seed: DwarfSeedRegs) -> DwarfRegs {
+    let mut regs = DwarfRegs::new();
+    append_native_dwarf_regs(&mut regs, seed);
+    regs
+}
+
+#[cfg(target_arch = "aarch64")]
+fn append_native_dwarf_regs(regs: &mut DwarfRegs, seed: DwarfSeedRegs) {
+    use nwind::arch::aarch64::dwarf;
+
+    regs.append(dwarf::PC, seed.pc);
+    regs.append(dwarf::X30, seed.lr);
+    regs.append(dwarf::X29, seed.fp);
+    regs.append(dwarf::X31, seed.sp);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn append_native_dwarf_regs(regs: &mut DwarfRegs, seed: DwarfSeedRegs) {
+    use nwind::arch::amd64::dwarf;
+
+    regs.append(dwarf::RETURN_ADDRESS, seed.pc);
+    regs.append(dwarf::RBP, seed.fp);
+    regs.append(dwarf::RSP, seed.sp);
+}
+
+enum ProbeWorkerEvent {
+    Snapshot(ProbeSnapshotWithKey),
+    ThreadName {
+        pid: u32,
+        tid: u32,
+        name: &'static str,
+    },
 }
 
 struct ProbeCaptureWithKey {
@@ -501,6 +1585,164 @@ struct ProbeCaptureWithKey {
     fp: u64,
     sp: u64,
     stack: StackSnapshot,
+}
+
+struct InProcessHelperClient {
+    stream: UnixStream,
+    next_seq: u64,
+    helper_tid: u32,
+}
+
+impl InProcessHelperClient {
+    fn connect(pid: u32) -> Option<Self> {
+        let path = inferior_helper_socket_path(pid);
+        match UnixStream::connect(&path) {
+            Ok(stream) => {
+                let _ = stream.set_read_timeout(Some(INFERIOR_HELPER_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(INFERIOR_HELPER_TIMEOUT));
+                let mut client = Self {
+                    stream,
+                    next_seq: 1,
+                    helper_tid: 0,
+                };
+                match client.query_helper_tid() {
+                    Ok(helper_tid) => {
+                        client.helper_tid = helper_tid;
+                        tracing::info!(
+                            pid,
+                            helper_tid,
+                            path = %path.display(),
+                            "connected to inferior stack helper"
+                        );
+                        Some(client)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            pid,
+                            path = %path.display(),
+                            error = ?err,
+                            "inferior stack helper hello failed"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    pid,
+                    path = %path.display(),
+                    error = ?err,
+                    "inferior stack helper unavailable"
+                );
+                None
+            }
+        }
+    }
+
+    fn query_helper_tid(&mut self) -> std::io::Result<u32> {
+        let (status, header, _) = self.roundtrip(INFERIOR_HELPER_OP_HELLO, 0)?;
+        if status != INFERIOR_HELPER_STATUS_OK {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("inferior helper hello status {status}"),
+            ));
+        }
+        u32::try_from(read_u64(&header, 48)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "inferior helper tid does not fit u32",
+            )
+        })
+    }
+
+    fn capture(
+        &mut self,
+        tid: u32,
+        mut timing: ProbeTiming,
+    ) -> std::io::Result<Option<ProbeCaptureWithKey>> {
+        let (status, header, stack_bytes) = self.roundtrip(INFERIOR_HELPER_OP_CAPTURE, tid)?;
+        if status != INFERIOR_HELPER_STATUS_OK {
+            return Ok(None);
+        }
+
+        timing.thread_lookup_done = read_u64(&header, 16);
+        timing.state_done = read_u64(&header, 24);
+        timing.resume_done = read_u64(&header, 32);
+
+        Ok(Some(ProbeCaptureWithKey {
+            tid,
+            timing,
+            queue: ProbeQueueStats::default(),
+            pc: strip_code_ptr(read_u64(&header, 48)),
+            lr: strip_code_ptr(read_u64(&header, 56)),
+            fp: strip_data_ptr(read_u64(&header, 64)),
+            sp: strip_data_ptr(read_u64(&header, 72)),
+            stack: StackSnapshot {
+                base: strip_data_ptr(read_u64(&header, 72)),
+                bytes: stack_bytes,
+            },
+        }))
+    }
+
+    fn roundtrip(&mut self, op: u32, tid: u32) -> std::io::Result<(u32, [u8; 88], Vec<u8>)> {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+
+        let mut request = [0u8; 24];
+        write_u32(&mut request, 0, INFERIOR_HELPER_MAGIC);
+        write_u32(&mut request, 4, op);
+        write_u64(&mut request, 8, seq);
+        write_u32(&mut request, 16, tid);
+        self.stream.write_all(&request)?;
+
+        let mut header = [0u8; INFERIOR_HELPER_RESPONSE_HEADER_BYTES];
+        self.stream.read_exact(&mut header)?;
+        let magic = read_u32(&header, 0);
+        if magic != INFERIOR_HELPER_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad inferior helper magic {magic:#x}"),
+            ));
+        }
+        let status = read_u32(&header, 4);
+        let response_seq = read_u64(&header, 8);
+        if response_seq != seq {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("inferior helper response seq {response_seq} != request seq {seq}"),
+            ));
+        }
+        let payload_len = read_u32(&header, 80) as usize;
+        if payload_len > STACK_SNAPSHOT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("inferior helper returned {payload_len} stack bytes"),
+            ));
+        }
+        let mut payload = vec![0u8; payload_len];
+        self.stream.read_exact(&mut payload)?;
+        Ok((status, header, payload))
+    }
+}
+
+fn inferior_helper_socket_path(pid: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/tmp/stax-inferior-helper-{pid}.sock"))
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("u32 field"))
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(buf[offset..offset + 8].try_into().expect("u64 field"))
+}
+
+fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
+    buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 struct ThreadState {
@@ -609,43 +1851,8 @@ fn deallocate_port(port: mach_port_t) {
     let _ = unsafe { mach_port_deallocate(mach_task_self(), port) };
 }
 
-fn fp_walk_snapshot(stack: &StackSnapshot, mut fp: u64) -> Vec<u64> {
-    let mut out = Vec::new();
-    fp = strip_ptr(fp);
-    for _ in 0..MAX_FP_FRAMES {
-        if fp == 0 || fp & 0xf != 0 {
-            break;
-        }
-        let Some((next_fp, ret)) = stack.read_frame_record(fp) else {
-            break;
-        };
-        let next_fp = strip_ptr(next_fp);
-        let ret = strip_ptr(ret);
-        if ret == 0 {
-            break;
-        }
-        out.push(ret);
-        if next_fp <= fp || next_fp.saturating_sub(fp) > MAX_FP_DELTA {
-            break;
-        }
-        fp = next_fp;
-    }
-    out
-}
-
-impl StackSnapshot {
-    fn read_frame_record(&self, fp: u64) -> Option<(u64, u64)> {
-        let offset = fp.checked_sub(self.base)? as usize;
-        let end = offset.checked_add(16)?;
-        let bytes = self.bytes.get(offset..end)?;
-        let next_fp = u64::from_ne_bytes(bytes[0..8].try_into().ok()?);
-        let ret = u64::from_ne_bytes(bytes[8..16].try_into().ok()?);
-        Some((next_fp, ret))
-    }
-}
-
 fn copy_stack_window(task: mach_port_t, sp: u64) -> StackSnapshot {
-    let base = strip_ptr(sp);
+    let base = strip_data_ptr(sp);
     let mut bytes = vec![0u8; STACK_SNAPSHOT_BYTES];
     let mut copied = 0usize;
     while copied < STACK_SNAPSHOT_BYTES {
@@ -765,11 +1972,35 @@ fn read_thread_state(thread: thread_act_t) -> Result<ThreadState, ProbeError> {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn strip_ptr(ptr: u64) -> u64 {
-    ptr & 0x0000_ffff_ffff_ffff
+fn strip_code_ptr(mut ptr: u64) -> u64 {
+    unsafe {
+        core::arch::asm!(
+            "xpaci {ptr}",
+            ptr = inout(reg) ptr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ptr
+}
+
+#[cfg(target_arch = "aarch64")]
+fn strip_data_ptr(mut ptr: u64) -> u64 {
+    unsafe {
+        core::arch::asm!(
+            "xpacd {ptr}",
+            ptr = inout(reg) ptr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ptr
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-fn strip_ptr(ptr: u64) -> u64 {
+fn strip_code_ptr(ptr: u64) -> u64 {
+    ptr
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn strip_data_ptr(ptr: u64) -> u64 {
     ptr
 }

@@ -17,6 +17,8 @@ use lru::LruCache;
 
 use proc_maps::Region;
 
+use crate::arch::UnwindFailure;
+use crate::arch::UnwindMode;
 use crate::arch::{Architecture, Endianity, Registers};
 #[cfg(not(feature = "addr2line"))]
 use crate::binary::BinaryDataReader;
@@ -125,10 +127,26 @@ fn translate_address(mappings: &[AddressMapping], address: u64) -> u64 {
     }
 }
 
+fn untranslate_address(mappings: &[AddressMapping], address: u64) -> u64 {
+    if let Some(mapping) = mappings.iter().find(|mapping| {
+        address >= mapping.declared_address && address < (mapping.declared_address + mapping.size)
+    }) {
+        address - mapping.declared_address + mapping.actual_address
+    } else {
+        address
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Default, Debug, Hash)]
 struct BinaryAddresses {
     arm_exidx: Option<u64>,
     arm_extab: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MachOCompactUnwindEntry {
+    pub initial_address: u64,
+    pub opcode: u32,
 }
 
 pub struct Binary<A: Architecture> {
@@ -345,6 +363,69 @@ impl<A: Architecture> Binary<A> {
         self.frame_descriptions
             .as_ref()
             .and_then(move |fde| fde.find_unwind_info(ctx_cache, &self.mappings, address))
+    }
+
+    pub(crate) fn lookup_macho_compact_unwind(
+        &self,
+        absolute_address: u64,
+    ) -> Option<MachOCompactUnwindEntry> {
+        let binary_data = self.data.as_ref()?;
+        let unwind_info = macho_unwind_info::UnwindInfo::parse(binary_data.macho_unwind_info()?)
+            .map_err(|error| {
+                debug!(
+                    "Failed to parse __unwind_info for '{}': {}",
+                    self.name(),
+                    error
+                );
+                error
+            })
+            .ok()?;
+        let image_base = self
+            .load_headers
+            .iter()
+            .filter(|header| header.file_offset == 0 && header.file_size != 0)
+            .map(|header| header.address)
+            .min()
+            .unwrap_or(0);
+        let declared_address = translate_address(&self.mappings, absolute_address);
+        let compact_offset = declared_address.checked_sub(image_base)?;
+        if compact_offset > u32::MAX as u64 {
+            return None;
+        }
+        let compact_pc = compact_offset as u32;
+        let function = unwind_info
+            .lookup(compact_pc)
+            .map_err(|error| {
+                debug!(
+                    "Failed to look up __unwind_info entry for '{}' at 0x{:016X}: {}",
+                    self.name(),
+                    absolute_address,
+                    error
+                );
+                error
+            })
+            .ok()??;
+        let initial_declared_address = image_base.saturating_add(function.start_address as u64);
+        Some(MachOCompactUnwindEntry {
+            initial_address: untranslate_address(&self.mappings, initial_declared_address),
+            opcode: function.opcode,
+        })
+    }
+
+    pub(crate) fn lookup_eh_unwind_row_by_fde_offset<'a>(
+        &self,
+        ctx_cache: &'a mut ContextCache<A::Endianity>,
+        absolute_address: u64,
+        fde_offset: u32,
+    ) -> Option<UnwindInfo<'a, A::Endianity>> {
+        self.frame_descriptions.as_ref().and_then(move |fde| {
+            fde.find_eh_unwind_info_by_fde_offset(
+                ctx_cache,
+                &self.mappings,
+                absolute_address,
+                fde_offset,
+            )
+        })
     }
 
     pub fn arm_exidx_address(&self) -> Option<u64> {
@@ -669,6 +750,23 @@ impl BufferReader for Vec<u8> {
     #[inline]
     fn get_u64_at_offset(&self, endianness: Endianness, offset: u64) -> Option<u64> {
         self.as_slice().get_u64_at_offset(endianness, offset)
+    }
+}
+
+impl<T: ?Sized + BufferReader> BufferReader for &T {
+    #[inline]
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+
+    #[inline]
+    fn get_u32_at_offset(&self, endianness: Endianness, offset: u64) -> Option<u32> {
+        (**self).get_u32_at_offset(endianness, offset)
+    }
+
+    #[inline]
+    fn get_u64_at_offset(&self, endianness: Endianness, offset: u64) -> Option<u64> {
+        (**self).get_u64_at_offset(endianness, offset)
     }
 }
 
@@ -1431,7 +1529,13 @@ pub fn reload<A: Architecture>(
 
     let new_region_count = new_regions.len();
     *current_regions = RangeMap::from_vec(new_regions);
-    assert_eq!(new_region_count, current_regions.len());
+    if new_region_count != current_regions.len() {
+        warn!(
+            "Region map coalesced or dropped overlapping ranges: input={}, stored={}",
+            new_region_count,
+            current_regions.len()
+        );
+    }
 
     for (id, binary) in old_binary_map {
         reloaded
@@ -1445,10 +1549,15 @@ pub fn reload<A: Architecture>(
             .map(|region| region.start..region.end),
     );
 
-    assert_eq!(
-        new_region_count as i32 - old_region_count as i32,
-        reloaded.regions_mapped.len() as i32 - reloaded.regions_unmapped.len() as i32
-    );
+    let region_delta = new_region_count as i32 - old_region_count as i32;
+    let reload_delta =
+        reloaded.regions_mapped.len() as i32 - reloaded.regions_unmapped.len() as i32;
+    if region_delta != reload_delta {
+        warn!(
+            "Reload accounting mismatch: region_delta={}, reload_delta={}",
+            region_delta, reload_delta
+        );
+    }
     reloaded
 }
 
@@ -1471,41 +1580,7 @@ where
         stack: &dyn BufferReader,
         output: &mut Vec<UserFrame>,
     ) {
-        output.clear();
-
-        let stack_address = match dwarf_regs.get(A::STACK_POINTER_REG) {
-            Some(address) => address,
-            None => return,
-        };
-
-        let memory = Memory {
-            regions: &self.regions,
-            stack,
-            stack_address,
-        };
-
-        self.ctx
-            .set_panic_on_partial_backtrace(self.panic_on_partial_backtrace);
-
-        let mut ctx = self.ctx.start(&memory, |regs: &mut A::Regs| {
-            use crate::arch::TryInto;
-
-            regs.clear();
-            for (register, value) in dwarf_regs.iter() {
-                regs.append(register, value.try_into().unwrap());
-            }
-        });
-
-        loop {
-            let frame = UserFrame {
-                address: ctx.current_address().into(),
-                initial_address: ctx.current_initial_address().map(|value| value.into()),
-            };
-            output.push(frame);
-            if !ctx.unwind(&memory) {
-                break;
-            }
-        }
+        self.unwind_with_mode(dwarf_regs, stack, output, UnwindMode::Default);
     }
 
     fn decode_symbol_while<'a>(
@@ -1546,6 +1621,72 @@ impl<A: Architecture> AddressSpace<A> {
             binary_map: HashMap::new(),
             regions: RangeMap::new(),
             panic_on_partial_backtrace: false,
+        }
+    }
+
+    pub fn last_unwind_failure(&self) -> Option<UnwindFailure> {
+        self.ctx.last_failure()
+    }
+}
+
+impl<A: Architecture> AddressSpace<A>
+where
+    A::RegTy: Primitive,
+{
+    pub fn unwind_with_mode(
+        &mut self,
+        dwarf_regs: &mut DwarfRegs,
+        stack: &dyn BufferReader,
+        output: &mut Vec<UserFrame>,
+        mode: UnwindMode,
+    ) {
+        let stack_address = match dwarf_regs.get(A::STACK_POINTER_REG) {
+            Some(address) => address,
+            None => return,
+        };
+
+        self.unwind_with_mode_and_stack_base(dwarf_regs, stack_address, stack, output, mode);
+    }
+
+    pub fn unwind_with_mode_and_stack_base(
+        &mut self,
+        dwarf_regs: &mut DwarfRegs,
+        stack_address: u64,
+        stack: &dyn BufferReader,
+        output: &mut Vec<UserFrame>,
+        mode: UnwindMode,
+    ) {
+        output.clear();
+
+        let memory = Memory {
+            regions: &self.regions,
+            stack,
+            stack_address,
+        };
+
+        self.ctx
+            .set_panic_on_partial_backtrace(self.panic_on_partial_backtrace);
+
+        let mut ctx = self
+            .ctx
+            .start_with_mode(&memory, mode, |regs: &mut A::Regs| {
+                use crate::arch::TryInto;
+
+                regs.clear();
+                for (register, value) in dwarf_regs.iter() {
+                    regs.append(register, value.try_into().unwrap());
+                }
+            });
+
+        loop {
+            let frame = UserFrame {
+                address: ctx.current_address().into(),
+                initial_address: ctx.current_initial_address().map(|value| value.into()),
+            };
+            output.push(frame);
+            if !ctx.unwind(&memory) {
+                break;
+            }
         }
     }
 }

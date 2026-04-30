@@ -748,9 +748,11 @@ fn build_pet_samples_update(
 const PROBE_DRIFT_BUCKETS_NS: &[u64] =
     &[1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
 
+const PROBE_PAIR_WINDOW_NS: u64 = 600_000;
 const PROBE_RECENT_CAP: usize = 64;
 const PROBE_DEPTH_CAP: usize = 32;
 const PROBE_THREADS_CAP: usize = 32;
+const INFERIOR_HELPER_THREAD_NAME: &str = "stax-inferior-helper";
 
 /// Look up the host's mach_timebase ratio once. Apple Silicon
 /// reports 1:1 (so ticks == ns) but x86 macOS uses different
@@ -794,9 +796,23 @@ fn elapsed_ticks_to_ns(later: u64, earlier: u64) -> u64 {
         .min(u64::MAX as i128) as u64
 }
 
-fn probe_timing_breakdown(probe: &ProbeResultRecord) -> ProbeTimingBreakdown {
+fn abs_tick_delta_ns(a: u64, b: u64) -> u64 {
+    ticks_to_ns((a as i128) - (b as i128))
+        .unsigned_abs()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn elapsed_ticks_to_ns_if_set(later: u64, earlier: u64) -> u64 {
+    if later == 0 || earlier == 0 {
+        0
+    } else {
+        elapsed_ticks_to_ns(later, earlier)
+    }
+}
+
+fn probe_timing_breakdown(probe: &ProbeResultRecord, kperf_ts: u64) -> ProbeTimingBreakdown {
     ProbeTimingBreakdown {
-        kperf_ts_ticks: probe.timing.kperf_ts,
+        kperf_ts_ticks: kperf_ts,
         staxd_read_started_ticks: probe.timing.staxd_read_started,
         staxd_drained_ticks: probe.timing.staxd_drained,
         staxd_queued_for_send_ticks: probe.timing.staxd_queued_for_send,
@@ -808,32 +824,33 @@ fn probe_timing_breakdown(probe: &ProbeResultRecord) -> ProbeTimingBreakdown {
         state_done_ticks: probe.timing.state_done,
         resume_done_ticks: probe.timing.resume_done,
         walk_done_ticks: probe.timing.walk_done,
-        kperf_to_enqueue_ns: elapsed_ticks_to_ns(probe.timing.enqueued, probe.timing.kperf_ts),
-        kperf_to_staxd_read_ns: elapsed_ticks_to_ns(
+        kperf_to_enqueue_ns: elapsed_ticks_to_ns(probe.timing.enqueued, kperf_ts),
+        kperf_to_staxd_read_ns: elapsed_ticks_to_ns_if_set(
             probe.timing.staxd_read_started,
-            probe.timing.kperf_ts,
+            kperf_ts,
         ),
-        staxd_read_ns: elapsed_ticks_to_ns(
+        kperf_to_staxd_drain_ns: elapsed_ticks_to_ns_if_set(probe.timing.staxd_drained, kperf_ts),
+        staxd_read_ns: elapsed_ticks_to_ns_if_set(
             probe.timing.staxd_drained,
             probe.timing.staxd_read_started,
         ),
-        staxd_drain_to_send_ns: elapsed_ticks_to_ns(
+        staxd_drain_to_send_ns: elapsed_ticks_to_ns_if_set(
             probe.timing.staxd_send_started,
             probe.timing.staxd_drained,
         ),
-        staxd_drain_to_queue_ns: elapsed_ticks_to_ns(
+        staxd_drain_to_queue_ns: elapsed_ticks_to_ns_if_set(
             probe.timing.staxd_queued_for_send,
             probe.timing.staxd_drained,
         ),
-        staxd_queue_wait_ns: elapsed_ticks_to_ns(
+        staxd_queue_wait_ns: elapsed_ticks_to_ns_if_set(
             probe.timing.staxd_send_started,
             probe.timing.staxd_queued_for_send,
         ),
-        staxd_send_to_client_recv_ns: elapsed_ticks_to_ns(
+        staxd_send_to_client_recv_ns: elapsed_ticks_to_ns_if_set(
             probe.timing.client_received,
             probe.timing.staxd_send_started,
         ),
-        client_recv_to_enqueue_ns: elapsed_ticks_to_ns(
+        client_recv_to_enqueue_ns: elapsed_ticks_to_ns_if_set(
             probe.timing.enqueued,
             probe.timing.client_received,
         ),
@@ -859,6 +876,8 @@ struct ProbeTimingAccum {
     max_kperf_to_enqueue_ns: u64,
     sum_kperf_to_staxd_read_ns: u128,
     max_kperf_to_staxd_read_ns: u64,
+    sum_kperf_to_staxd_drain_ns: u128,
+    max_kperf_to_staxd_drain_ns: u64,
     sum_staxd_read_ns: u128,
     max_staxd_read_ns: u64,
     sum_staxd_drain_to_send_ns: u128,
@@ -896,6 +915,10 @@ impl ProbeTimingAccum {
         self.max_kperf_to_staxd_read_ns = self
             .max_kperf_to_staxd_read_ns
             .max(t.kperf_to_staxd_read_ns);
+        self.sum_kperf_to_staxd_drain_ns += t.kperf_to_staxd_drain_ns as u128;
+        self.max_kperf_to_staxd_drain_ns = self
+            .max_kperf_to_staxd_drain_ns
+            .max(t.kperf_to_staxd_drain_ns);
         self.sum_staxd_read_ns += t.staxd_read_ns as u128;
         self.max_staxd_read_ns = self.max_staxd_read_ns.max(t.staxd_read_ns);
         self.sum_staxd_drain_to_send_ns += t.staxd_drain_to_send_ns as u128;
@@ -946,6 +969,8 @@ impl ProbeTimingAccum {
             max_kperf_to_enqueue_ns: self.max_kperf_to_enqueue_ns,
             avg_kperf_to_staxd_read_ns: avg(self.sum_kperf_to_staxd_read_ns),
             max_kperf_to_staxd_read_ns: self.max_kperf_to_staxd_read_ns,
+            avg_kperf_to_staxd_drain_ns: avg(self.sum_kperf_to_staxd_drain_ns),
+            max_kperf_to_staxd_drain_ns: self.max_kperf_to_staxd_drain_ns,
             avg_staxd_read_ns: avg(self.sum_staxd_read_ns),
             max_staxd_read_ns: self.max_staxd_read_ns,
             avg_staxd_drain_to_send_ns: avg(self.sum_staxd_drain_to_send_ns),
@@ -998,6 +1023,9 @@ fn build_probe_diff_update(
 ) -> ProbeDiffUpdate {
     let session_start = agg.session_start_ns().unwrap_or(0);
     let mut hist = vec![0u64; 33];
+    let mut compact_hist = vec![0u64; 33];
+    let mut compact_dwarf_hist = vec![0u64; 33];
+    let mut dwarf_hist = vec![0u64; 33];
     let mut bucket_count = vec![0u64; PROBE_DRIFT_BUCKETS_NS.len() + 1];
     let mut bucket_pc_match = vec![0u64; PROBE_DRIFT_BUCKETS_NS.len() + 1];
     let mut depth_match = vec![0u64; PROBE_DEPTH_CAP];
@@ -1012,7 +1040,12 @@ fn build_probe_diff_update(
     let mut probe_deeper: u64 = 0;
     let mut pc_match_n: u64 = 0;
     let mut stitchable_n: u64 = 0;
+    let mut compact_stitchable_n: u64 = 0;
+    let mut compact_dwarf_stitchable_n: u64 = 0;
+    let mut dwarf_stitchable_n: u64 = 0;
     let mut framehop_n: u64 = 0;
+    let mut compact_n: u64 = 0;
+    let mut compact_dwarf_n: u64 = 0;
     let mut fp_walk_n: u64 = 0;
     let mut timing = ProbeTimingAccum::default();
 
@@ -1031,159 +1064,281 @@ fn build_probe_diff_update(
             if thread_tid != want {
                 continue;
             }
+        } else if agg.thread_name(thread_tid) == Some(INFERIOR_HELPER_THREAD_NAME) {
+            continue;
         }
         let Some(stats) = agg.thread_stats(thread_tid) else {
             continue;
         };
-        total_kperf = total_kperf.saturating_add(stats.pet_samples.len() as u64);
-        total_probes = total_probes.saturating_add(stats.probe_results.len() as u64);
+        let t_kperf = stats.pet_samples.len() as u64;
+        let t_probes = stats.probe_results.len() as u64;
+        total_kperf = total_kperf.saturating_add(t_kperf);
+        total_probes = total_probes.saturating_add(t_probes);
 
         let mut t_paired: u64 = 0;
+        let mut t_kperf_only: u64 = 0;
+        let mut t_probe_only: u64 = 0;
         let mut t_pc_match: u64 = 0;
         let mut t_stitchable: u64 = 0;
+        let mut t_compact_stitchable: u64 = 0;
+        let mut t_compact_dwarf_stitchable: u64 = 0;
+        let mut t_dwarf_stitchable: u64 = 0;
         let mut t_common_total: u64 = 0;
+        let mut t_compact_common_total: u64 = 0;
+        let mut t_compact_dwarf_common_total: u64 = 0;
+        let mut t_dwarf_common_total: u64 = 0;
 
-        // Two-pointer merge over the two append-ordered queues.
-        let mut pet_iter = stats.pet_samples.iter().peekable();
-        let mut probe_iter = stats.probe_results.iter().peekable();
-        loop {
-            match (pet_iter.peek(), probe_iter.peek()) {
-                (None, None) => break,
-                (Some(_), None) => {
-                    pet_iter.next();
+        // Pair each probe with the nearest unmatched PET sample inside
+        // the bounded window. Keep the window strict: correlate mode is
+        // only useful when the independent capture is close enough to be
+        // the same execution moment, not merely the same millisecond-ish
+        // neighborhood.
+        let mut pets: Vec<_> = stats.pet_samples.iter().collect();
+        pets.sort_by_key(|pet| pet.timestamp_ns);
+        let mut probes: Vec<_> = stats.probe_results.iter().collect();
+        probes.sort_by_key(|probe| probe.timing.kperf_ts);
+        let mut pet_idx = 0usize;
+        for probe in probes {
+            while let Some(pet) = pets.get(pet_idx) {
+                if pet.timestamp_ns < probe.timing.kperf_ts
+                    && abs_tick_delta_ns(pet.timestamp_ns, probe.timing.kperf_ts)
+                        > PROBE_PAIR_WINDOW_NS
+                {
+                    pet_idx += 1;
                     kperf_only += 1;
-                }
-                (None, Some(_)) => {
-                    probe_iter.next();
-                    probe_only += 1;
-                }
-                (Some(pet), Some(probe)) => {
-                    if pet.timestamp_ns < probe.timing.kperf_ts {
-                        pet_iter.next();
-                        kperf_only += 1;
-                        continue;
-                    }
-                    if pet.timestamp_ns > probe.timing.kperf_ts {
-                        probe_iter.next();
-                        probe_only += 1;
-                        continue;
-                    }
-                    let pet = pet_iter.next().unwrap();
-                    let probe = probe_iter.next().unwrap();
-
-                    paired += 1;
-                    t_paired += 1;
-                    if probe.used_framehop {
-                        framehop_n += 1;
-                    } else {
-                        fp_walk_n += 1;
-                    }
-
-                    let kperf_walk: &[u64] = if !pet.stack.is_empty() {
-                        &pet.stack[1..]
-                    } else {
-                        &[]
-                    };
-                    let probe_walk = &probe.mach_walked[..];
-
-                    let common = longest_common_suffix(kperf_walk, probe_walk);
-                    let bucket = common.min(hist.len() - 1);
-                    hist[bucket] += 1;
-                    t_common_total = t_common_total.saturating_add(common as u64);
-
-                    let probe_full_depth = 1 + probe_walk.len();
-                    let pet_full_depth = pet.stack.len();
-                    let max_depth = pet_full_depth.min(probe_full_depth).min(PROBE_DEPTH_CAP);
-                    for d in 0..max_depth {
-                        depth_total[d] += 1;
-                        let kperf_frame = pet.stack[d];
-                        let probe_frame = if d == 0 {
-                            probe.mach_pc
-                        } else {
-                            probe_walk[d - 1]
-                        };
-                        if kperf_frame == probe_frame {
-                            depth_match[d] += 1;
-                        }
-                    }
-
-                    if pet_full_depth <= 1 && probe_full_depth >= 2 {
-                        probe_augmented += 1;
-                    }
-                    if probe_full_depth > pet_full_depth {
-                        probe_deeper += 1;
-                    }
-
-                    let drift_ns_signed = ticks_to_ns(
-                        (probe.timing.state_done as i128) - (probe.timing.kperf_ts as i128),
-                    );
-                    let timing_breakdown = probe_timing_breakdown(probe);
-                    timing.add(timing_breakdown, probe.queue);
-                    let drift_abs_ns = drift_ns_signed.unsigned_abs() as u64;
-                    let bucket_idx = PROBE_DRIFT_BUCKETS_NS
-                        .iter()
-                        .position(|&edge| drift_abs_ns < edge)
-                        .unwrap_or(PROBE_DRIFT_BUCKETS_NS.len());
-                    bucket_count[bucket_idx] += 1;
-
-                    let kperf_leaf = pet.stack.first().copied().unwrap_or(0);
-                    let pc_match = kperf_leaf == probe.mach_pc;
-                    if pc_match {
-                        pc_match_n += 1;
-                        t_pc_match += 1;
-                        bucket_pc_match[bucket_idx] += 1;
-                    }
-                    let stitchable = pc_match && (common as u32) >= STITCH_MIN_SUFFIX;
-                    if stitchable {
-                        stitchable_n += 1;
-                        t_stitchable += 1;
-                    }
-
-                    let ring = per_thread_recent.entry(thread_tid).or_insert_with(|| {
-                        std::collections::VecDeque::with_capacity(PROBE_RECENT_CAP)
-                    });
-                    if ring.len() == PROBE_RECENT_CAP {
-                        ring.pop_front();
-                    }
-                    ring.push_back(RawEntry {
-                        timestamp_ns: pet.timestamp_ns.saturating_sub(session_start),
-                        drift_ns: drift_ns_signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-                        timing: timing_breakdown,
-                        queue: probe.queue,
-                        common_suffix: common as u32,
-                        pc_match,
-                        stitchable,
-                        used_framehop: probe.used_framehop,
-                        kperf_stack: pet.stack.to_vec().into_boxed_slice(),
-                        kperf_kernel_stack: pet.kernel_stack.to_vec().into_boxed_slice(),
-                        probe_pc: probe.mach_pc,
-                        probe_walked: probe.mach_walked.to_vec().into_boxed_slice(),
-                    });
+                    t_kperf_only += 1;
+                } else {
+                    break;
                 }
             }
+
+            let mut best_idx = None;
+            let mut best_delta_ns = u64::MAX;
+            let mut scan_idx = pet_idx;
+            while let Some(pet) = pets.get(scan_idx) {
+                let delta_ns = abs_tick_delta_ns(pet.timestamp_ns, probe.timing.kperf_ts);
+                if pet.timestamp_ns > probe.timing.kperf_ts && delta_ns > PROBE_PAIR_WINDOW_NS {
+                    break;
+                }
+                if delta_ns <= PROBE_PAIR_WINDOW_NS && delta_ns < best_delta_ns {
+                    best_idx = Some(scan_idx);
+                    best_delta_ns = delta_ns;
+                }
+                scan_idx += 1;
+            }
+
+            let Some(best_idx) = best_idx else {
+                probe_only += 1;
+                t_probe_only += 1;
+                continue;
+            };
+
+            while pet_idx < best_idx {
+                pet_idx += 1;
+                kperf_only += 1;
+                t_kperf_only += 1;
+            }
+
+            let pet = pets[best_idx];
+            pet_idx = best_idx + 1;
+
+            paired += 1;
+            t_paired += 1;
+            if !probe.dwarf_walked.is_empty() {
+                framehop_n += 1;
+            }
+            if !probe.compact_walked.is_empty() {
+                compact_n += 1;
+            }
+            if !probe.compact_dwarf_walked.is_empty() {
+                compact_dwarf_n += 1;
+            }
+            if !probe.mach_walked.is_empty() {
+                fp_walk_n += 1;
+            }
+
+            let kperf_walk: &[u64] = if !pet.stack.is_empty() {
+                &pet.stack[1..]
+            } else {
+                &[]
+            };
+            let fp_stack = logical_probe_stack(probe.mach_pc, 0, &probe.mach_walked);
+            let fp_walk = &fp_stack[1..];
+            let compact_stack = logical_probe_stack(probe.mach_pc, 0, &probe.compact_walked);
+            let compact_walk = &compact_stack[1..];
+            let compact_dwarf_stack =
+                logical_probe_stack(probe.mach_pc, 0, &probe.compact_dwarf_walked);
+            let compact_dwarf_walk = &compact_dwarf_stack[1..];
+            let dwarf_stack = logical_probe_stack(probe.mach_pc, 0, &probe.dwarf_walked);
+            let dwarf_walk = &dwarf_stack[1..];
+
+            let common = longest_common_run(kperf_walk, fp_walk);
+            let bucket = common.min(hist.len() - 1);
+            hist[bucket] += 1;
+            t_common_total = t_common_total.saturating_add(common as u64);
+            let compact_common = longest_common_run(kperf_walk, compact_walk);
+            let compact_bucket = compact_common.min(compact_hist.len() - 1);
+            compact_hist[compact_bucket] += 1;
+            t_compact_common_total = t_compact_common_total.saturating_add(compact_common as u64);
+            let compact_dwarf_common = longest_common_run(kperf_walk, compact_dwarf_walk);
+            let compact_dwarf_bucket = compact_dwarf_common.min(compact_dwarf_hist.len() - 1);
+            compact_dwarf_hist[compact_dwarf_bucket] += 1;
+            t_compact_dwarf_common_total =
+                t_compact_dwarf_common_total.saturating_add(compact_dwarf_common as u64);
+            let dwarf_common = longest_common_run(kperf_walk, dwarf_walk);
+            let dwarf_bucket = dwarf_common.min(dwarf_hist.len() - 1);
+            dwarf_hist[dwarf_bucket] += 1;
+            t_dwarf_common_total = t_dwarf_common_total.saturating_add(dwarf_common as u64);
+
+            let probe_full_depth = fp_stack.len();
+            let pet_full_depth = pet.stack.len();
+            let max_depth = pet_full_depth.min(probe_full_depth).min(PROBE_DEPTH_CAP);
+            for d in 0..max_depth {
+                depth_total[d] += 1;
+                let kperf_frame = pet.stack[d];
+                let probe_frame = fp_stack[d];
+                if kperf_frame == probe_frame {
+                    depth_match[d] += 1;
+                }
+            }
+
+            if pet_full_depth <= 1 && probe_full_depth >= 2 {
+                probe_augmented += 1;
+            }
+            if probe_full_depth > pet_full_depth {
+                probe_deeper += 1;
+            }
+
+            let drift_ns_signed =
+                ticks_to_ns((probe.timing.state_done as i128) - (pet.timestamp_ns as i128));
+            let timing_breakdown = probe_timing_breakdown(probe, pet.timestamp_ns);
+            timing.add(timing_breakdown, probe.queue);
+            let drift_abs_ns = drift_ns_signed.unsigned_abs() as u64;
+            let bucket_idx = PROBE_DRIFT_BUCKETS_NS
+                .iter()
+                .position(|&edge| drift_abs_ns < edge)
+                .unwrap_or(PROBE_DRIFT_BUCKETS_NS.len());
+            bucket_count[bucket_idx] += 1;
+
+            let kperf_leaf = pet.stack.first().copied().unwrap_or(0);
+            let pc_match = kperf_leaf == probe.mach_pc;
+            if pc_match {
+                pc_match_n += 1;
+                t_pc_match += 1;
+                bucket_pc_match[bucket_idx] += 1;
+            }
+            let compact_stitchable =
+                (compact_common as u32) >= STITCH_MIN_SUFFIX && !probe.compact_walked.is_empty();
+            if compact_stitchable {
+                compact_stitchable_n += 1;
+                t_compact_stitchable += 1;
+            }
+            let compact_dwarf_stitchable = (compact_dwarf_common as u32) >= STITCH_MIN_SUFFIX
+                && !probe.compact_dwarf_walked.is_empty();
+            if compact_dwarf_stitchable {
+                compact_dwarf_stitchable_n += 1;
+                t_compact_dwarf_stitchable += 1;
+            }
+            let dwarf_stitchable =
+                (dwarf_common as u32) >= STITCH_MIN_SUFFIX && !probe.dwarf_walked.is_empty();
+            if dwarf_stitchable {
+                dwarf_stitchable_n += 1;
+                t_dwarf_stitchable += 1;
+            }
+            let stitchable = dwarf_stitchable;
+            if stitchable {
+                stitchable_n += 1;
+                t_stitchable += 1;
+            }
+
+            let ring = per_thread_recent
+                .entry(thread_tid)
+                .or_insert_with(|| std::collections::VecDeque::with_capacity(PROBE_RECENT_CAP));
+            if ring.len() == PROBE_RECENT_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(RawEntry {
+                timestamp_ns: pet.timestamp_ns.saturating_sub(session_start),
+                drift_ns: drift_ns_signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+                timing: timing_breakdown,
+                queue: probe.queue,
+                common_suffix: common as u32,
+                compact_common_suffix: compact_common as u32,
+                compact_dwarf_common_suffix: compact_dwarf_common as u32,
+                dwarf_common_suffix: dwarf_common as u32,
+                pc_match,
+                stitchable,
+                used_framehop: probe.used_framehop,
+                kperf_stack: pet.stack.to_vec().into_boxed_slice(),
+                kperf_kernel_stack: pet.kernel_stack.to_vec().into_boxed_slice(),
+                probe_stack: fp_stack.into_boxed_slice(),
+                compact_stack: compact_stack.into_boxed_slice(),
+                compact_dwarf_stack: compact_dwarf_stack.into_boxed_slice(),
+                dwarf_stack: dwarf_stack.into_boxed_slice(),
+            });
+        }
+        while pet_idx < pets.len() {
+            pet_idx += 1;
+            kperf_only += 1;
+            t_kperf_only += 1;
         }
 
-        if t_paired > 0 {
+        if t_kperf > 0 || t_probes > 0 {
             threads_summary.push(ProbeDiffThread {
                 tid: thread_tid,
+                kperf_samples: t_kperf,
+                probe_results: t_probes,
                 paired: t_paired,
+                kperf_only: t_kperf_only,
+                probe_only: t_probe_only,
                 pc_match: t_pc_match,
                 stitchable: t_stitchable,
-                avg_common_suffix: t_common_total as f32 / t_paired as f32,
+                compact_stitchable: t_compact_stitchable,
+                compact_dwarf_stitchable: t_compact_dwarf_stitchable,
+                dwarf_stitchable: t_dwarf_stitchable,
+                avg_common_suffix: if t_paired == 0 {
+                    0.0
+                } else {
+                    t_common_total as f32 / t_paired as f32
+                },
+                avg_compact_common_suffix: if t_paired == 0 {
+                    0.0
+                } else {
+                    t_compact_common_total as f32 / t_paired as f32
+                },
+                avg_compact_dwarf_common_suffix: if t_paired == 0 {
+                    0.0
+                } else {
+                    t_compact_dwarf_common_total as f32 / t_paired as f32
+                },
+                avg_dwarf_common_suffix: if t_paired == 0 {
+                    0.0
+                } else {
+                    t_dwarf_common_total as f32 / t_paired as f32
+                },
                 thread_name: agg.thread_name(thread_tid).map(|s| s.to_owned()),
             });
         }
     }
 
-    // Sort threads by stitchable first (the actually-interesting
-    // signal), then paired count. This is also what we use to
-    // pick the focus thread for `recent[]`.
-    threads_summary.sort_by(|a, b| {
-        b.stitchable
-            .cmp(&a.stitchable)
-            .then(b.paired.cmp(&a.paired))
+    let focus_tid: Option<u32> = only_tid.or_else(|| {
+        threads_summary
+            .iter()
+            .max_by(|a, b| {
+                a.stitchable
+                    .cmp(&b.stitchable)
+                    .then(a.paired.cmp(&b.paired))
+            })
+            .map(|t| t.tid)
     });
-    let focus_tid: Option<u32> = only_tid.or_else(|| threads_summary.first().map(|t| t.tid));
+
+    threads_summary.sort_by(|a, b| {
+        b.kperf_samples
+            .cmp(&a.kperf_samples)
+            .then(b.kperf_only.cmp(&a.kperf_only))
+            .then(b.paired.cmp(&a.paired))
+            .then(b.probe_results.cmp(&a.probe_results))
+    });
     threads_summary.truncate(PROBE_THREADS_CAP);
 
     // Materialise ResolvedFrames only for the focus thread's ring.
@@ -1193,14 +1348,37 @@ fn build_probe_diff_update(
         .map(|ring| {
             ring.into_iter()
                 .map(|raw| {
-                    let mut probe_stack: Vec<ResolvedFrame> =
-                        Vec::with_capacity(raw.probe_walked.len() + 1);
-                    probe_stack.push(resolve_frame(bins, raw.probe_pc));
-                    for &addr in raw.probe_walked.iter() {
-                        probe_stack.push(resolve_frame(bins, addr));
-                    }
+                    let probe_stack: Vec<ResolvedFrame> = raw
+                        .probe_stack
+                        .iter()
+                        .map(|&addr| resolve_frame(bins, addr))
+                        .collect();
+                    let compact_stack: Vec<ResolvedFrame> = raw
+                        .compact_stack
+                        .iter()
+                        .map(|&addr| resolve_frame(bins, addr))
+                        .collect();
+                    let compact_dwarf_stack: Vec<ResolvedFrame> = raw
+                        .compact_dwarf_stack
+                        .iter()
+                        .map(|&addr| resolve_frame(bins, addr))
+                        .collect();
+                    let dwarf_stack: Vec<ResolvedFrame> = raw
+                        .dwarf_stack
+                        .iter()
+                        .map(|&addr| resolve_frame(bins, addr))
+                        .collect();
+                    let kperf_kernel_stack: Vec<ResolvedFrame> = raw
+                        .kperf_kernel_stack
+                        .iter()
+                        .map(|&addr| resolve_frame(bins, addr))
+                        .collect();
                     let stitched_stack: Vec<ResolvedFrame> = if raw.stitchable {
-                        probe_stack.clone()
+                        kperf_kernel_stack
+                            .iter()
+                            .cloned()
+                            .chain(dwarf_stack.iter().cloned())
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -1215,14 +1393,16 @@ fn build_probe_diff_update(
                             .iter()
                             .map(|&addr| resolve_frame(bins, addr))
                             .collect(),
-                        kperf_kernel_stack: raw
-                            .kperf_kernel_stack
-                            .iter()
-                            .map(|&addr| resolve_frame(bins, addr))
-                            .collect(),
+                        kperf_kernel_stack,
                         probe_stack,
+                        compact_stack,
+                        compact_dwarf_stack,
+                        dwarf_stack,
                         stitched_stack,
                         common_suffix: raw.common_suffix,
+                        compact_common_suffix: raw.compact_common_suffix,
+                        compact_dwarf_common_suffix: raw.compact_dwarf_common_suffix,
+                        dwarf_common_suffix: raw.dwarf_common_suffix,
                         pc_match: raw.pc_match,
                         stitchable: raw.stitchable,
                         used_framehop: raw.used_framehop,
@@ -1268,12 +1448,20 @@ fn build_probe_diff_update(
         probe_augmented_kperf: probe_augmented,
         probe_walked_deeper: probe_deeper,
         common_suffix_hist: hist,
+        compact_suffix_hist: compact_hist,
+        compact_dwarf_suffix_hist: compact_dwarf_hist,
+        dwarf_suffix_hist: dwarf_hist,
         depth_match: depth_cells,
         drift_buckets,
         timing: timing.finish(),
         pc_match: pc_match_n,
         stitchable: stitchable_n,
+        compact_stitchable: compact_stitchable_n,
+        compact_dwarf_stitchable: compact_dwarf_stitchable_n,
+        dwarf_stitchable: dwarf_stitchable_n,
         framehop_used: framehop_n,
+        compact_used: compact_n,
+        compact_dwarf_used: compact_dwarf_n,
         fp_walk_used: fp_walk_n,
         threads: threads_summary,
         recent,
@@ -1289,28 +1477,42 @@ struct RawEntry {
     timing: ProbeTimingBreakdown,
     queue: ProbeQueueStats,
     common_suffix: u32,
+    compact_common_suffix: u32,
+    compact_dwarf_common_suffix: u32,
+    dwarf_common_suffix: u32,
     pc_match: bool,
     stitchable: bool,
     used_framehop: bool,
     kperf_stack: Box<[u64]>,
     kperf_kernel_stack: Box<[u64]>,
-    probe_pc: u64,
-    probe_walked: Box<[u64]>,
+    probe_stack: Box<[u64]>,
+    compact_stack: Box<[u64]>,
+    compact_dwarf_stack: Box<[u64]>,
+    dwarf_stack: Box<[u64]>,
 }
 
-/// Length of the longest matching suffix between two address
-/// slices. `a[a.len()-1]` lines up with `b[b.len()-1]`; the count
-/// is how many trailing frames match.
-fn longest_common_suffix(a: &[u64], b: &[u64]) -> usize {
-    let mut k = 0;
-    let max_k = a.len().min(b.len());
-    while k < max_k {
-        if a[a.len() - 1 - k] != b[b.len() - 1 - k] {
-            break;
+fn longest_common_run(a: &[u64], b: &[u64]) -> usize {
+    let mut best = 0usize;
+    for i in 0..a.len() {
+        for j in 0..b.len() {
+            let mut k = 0usize;
+            while i + k < a.len() && j + k < b.len() && a[i + k] == b[j + k] {
+                k += 1;
+            }
+            best = best.max(k);
         }
-        k += 1;
     }
-    k
+    best
+}
+
+fn logical_probe_stack(pc: u64, lr: u64, walked: &[u64]) -> Vec<u64> {
+    let mut stack = Vec::with_capacity(1 + usize::from(lr != 0) + walked.len());
+    stack.push(pc);
+    if lr != 0 && lr != pc && walked.first().copied() != Some(lr) {
+        stack.push(lr);
+    }
+    stack.extend_from_slice(walked);
+    stack
 }
 
 /// Render one address as a `ResolvedFrame` using the live registry.
@@ -1339,6 +1541,222 @@ fn resolve_frame(bins: &BinaryRegistry, address: u64) -> ResolvedFrame {
             binary: String::new(),
             function: String::new(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ticks_for_ns(ns: u64) -> u64 {
+        let (numer, denom) = mach_timebase_numer_denom();
+        if numer == 0 {
+            ns
+        } else {
+            ((u128::from(ns) * u128::from(denom)).div_ceil(u128::from(numer)))
+                .min(u128::from(u64::MAX)) as u64
+        }
+    }
+
+    #[test]
+    fn probe_diff_pairs_correlation_probe_with_nearest_pet_not_first_in_window() {
+        let mut agg = Aggregator::default();
+        let tid = 7;
+
+        for i in 0..=10u64 {
+            agg.record_pet_sample(
+                tid,
+                ticks_for_ns(i * 1_000_000),
+                &[0x1000 + i],
+                &[],
+                PmuSample::default(),
+            );
+        }
+
+        agg.record_probe_result(ProbeResultRecord {
+            tid,
+            timing: ProbeTiming {
+                kperf_ts: ticks_for_ns(9_100_000),
+                state_done: ticks_for_ns(9_100_000),
+                ..ProbeTiming::default()
+            },
+            queue: ProbeQueueStats::default(),
+            mach_pc: 0x2000,
+            mach_lr: 0,
+            mach_fp: 0,
+            mach_sp: 0,
+            mach_walked: Box::new([]),
+            compact_walked: Box::new([]),
+            compact_dwarf_walked: Box::new([]),
+            dwarf_walked: Box::new([]),
+            used_framehop: true,
+        });
+
+        let bins = BinaryRegistry::new();
+        let update = build_probe_diff_update(&agg, &bins, Some(tid));
+
+        assert_eq!(update.paired, 1);
+        assert_eq!(update.kperf_only, 10);
+        assert_eq!(update.probe_only, 0);
+        assert_eq!(update.recent.len(), 1);
+        assert_eq!(update.recent[0].kperf_stack[0].address, 0x1009);
+        assert!(update.recent[0].drift_ns.abs() <= 101_000);
+    }
+
+    #[test]
+    fn probe_diff_rejects_correlation_probe_outside_strict_window() {
+        let mut agg = Aggregator::default();
+        let tid = 7;
+
+        agg.record_pet_sample(
+            tid,
+            ticks_for_ns(9_000_000),
+            &[0x1009],
+            &[],
+            PmuSample::default(),
+        );
+        agg.record_pet_sample(
+            tid,
+            ticks_for_ns(11_000_000),
+            &[0x100b],
+            &[],
+            PmuSample::default(),
+        );
+
+        agg.record_probe_result(ProbeResultRecord {
+            tid,
+            timing: ProbeTiming {
+                kperf_ts: ticks_for_ns(10_000_000),
+                state_done: ticks_for_ns(10_000_000),
+                ..ProbeTiming::default()
+            },
+            queue: ProbeQueueStats::default(),
+            mach_pc: 0x2000,
+            mach_lr: 0,
+            mach_fp: 0,
+            mach_sp: 0,
+            mach_walked: Box::new([]),
+            compact_walked: Box::new([]),
+            compact_dwarf_walked: Box::new([]),
+            dwarf_walked: Box::new([]),
+            used_framehop: true,
+        });
+
+        let bins = BinaryRegistry::new();
+        let update = build_probe_diff_update(&agg, &bins, Some(tid));
+
+        assert_eq!(update.paired, 0);
+        assert_eq!(update.kperf_only, 2);
+        assert_eq!(update.probe_only, 1);
+        assert!(update.recent.is_empty());
+    }
+
+    #[test]
+    fn probe_diff_validates_with_fp_and_stitches_with_dwarf() {
+        let mut agg = Aggregator::default();
+        let tid = 7;
+
+        agg.record_pet_sample(
+            tid,
+            ticks_for_ns(1_000_000),
+            &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70],
+            &[0xa0, 0xb0],
+            PmuSample::default(),
+        );
+
+        agg.record_probe_result(ProbeResultRecord {
+            tid,
+            timing: ProbeTiming {
+                kperf_ts: ticks_for_ns(1_000_000),
+                state_done: ticks_for_ns(1_000_000),
+                ..ProbeTiming::default()
+            },
+            queue: ProbeQueueStats::default(),
+            mach_pc: 0x10,
+            mach_lr: 0,
+            mach_fp: 0,
+            mach_sp: 0,
+            mach_walked: Box::new([0x20, 0x30, 0x40, 0x50]),
+            compact_walked: Box::new([0x20, 0x30, 0x40, 0x50]),
+            compact_dwarf_walked: Box::new([0x20, 0x30, 0x40, 0x50]),
+            dwarf_walked: Box::new([0x20, 0x30, 0x40, 0x50, 0x80]),
+            used_framehop: true,
+        });
+
+        let bins = BinaryRegistry::new();
+        let update = build_probe_diff_update(&agg, &bins, Some(tid));
+
+        assert_eq!(update.paired, 1);
+        assert_eq!(update.pc_match, 1);
+        assert_eq!(update.stitchable, 1);
+        assert_eq!(update.framehop_used, 1);
+        assert_eq!(update.fp_walk_used, 1);
+        assert_eq!(update.recent.len(), 1);
+
+        let entry = &update.recent[0];
+        let probe_addrs: Vec<_> = entry
+            .probe_stack
+            .iter()
+            .map(|frame| frame.address)
+            .collect();
+        let stitched_addrs: Vec<_> = entry
+            .stitched_stack
+            .iter()
+            .map(|frame| frame.address)
+            .collect();
+        let kernel_addrs: Vec<_> = entry
+            .kperf_kernel_stack
+            .iter()
+            .map(|frame| frame.address)
+            .collect();
+        assert_eq!(probe_addrs, [0x10, 0x20, 0x30, 0x40, 0x50]);
+        assert_eq!(kernel_addrs, [0xa0, 0xb0]);
+        assert_eq!(
+            stitched_addrs,
+            [0xa0, 0xb0, 0x10, 0x20, 0x30, 0x40, 0x50, 0x80]
+        );
+    }
+
+    #[test]
+    fn probe_diff_does_not_ship_dwarf_when_only_fp_matches() {
+        let mut agg = Aggregator::default();
+        let tid = 7;
+
+        agg.record_pet_sample(
+            tid,
+            ticks_for_ns(1_000_000),
+            &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            &[],
+            PmuSample::default(),
+        );
+
+        agg.record_probe_result(ProbeResultRecord {
+            tid,
+            timing: ProbeTiming {
+                kperf_ts: ticks_for_ns(1_000_000),
+                state_done: ticks_for_ns(1_000_000),
+                ..ProbeTiming::default()
+            },
+            queue: ProbeQueueStats::default(),
+            mach_pc: 0x10,
+            mach_lr: 0,
+            mach_fp: 0,
+            mach_sp: 0,
+            mach_walked: Box::new([0x20, 0x30, 0x40, 0x50]),
+            compact_walked: Box::new([]),
+            compact_dwarf_walked: Box::new([]),
+            dwarf_walked: Box::new([0x90, 0x91]),
+            used_framehop: true,
+        });
+
+        let bins = BinaryRegistry::new();
+        let update = build_probe_diff_update(&agg, &bins, Some(tid));
+
+        assert_eq!(update.paired, 1);
+        assert_eq!(update.common_suffix_hist[4], 1);
+        assert_eq!(update.dwarf_suffix_hist[0], 1);
+        assert_eq!(update.stitchable, 0);
+        assert!(update.recent[0].stitched_stack.is_empty());
     }
 }
 

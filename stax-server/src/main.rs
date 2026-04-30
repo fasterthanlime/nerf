@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use metrix::{CounterHandle, GaugeHandle, HistogramHandle, PhaseHandle, TelemetryRegistry};
 use parking_lot::{Mutex, RwLock};
 use stax_live::source::SourceResolver;
 use stax_live::{
@@ -29,7 +30,6 @@ use stax_live_proto::{
 use stax_shade_proto::{
     ShadeAck, ShadeCommand, ShadeError, ShadeInfo, ShadeRegistry, ShadeRegistryDispatcher,
 };
-use stax_telemetry::{CounterHandle, GaugeHandle, HistogramHandle, PhaseHandle, TelemetryRegistry};
 use vox::VoxListener;
 
 const DEFAULT_SOCK_NAME: &str = "stax-server.sock";
@@ -545,7 +545,9 @@ impl ServerState {
         run_id: RunId,
         target: ShadeTarget,
         frequency_hz: u32,
+        correlate_frequency_hz: u32,
         race_kperf: bool,
+        correlate_kperf: bool,
         daemon_socket: String,
         time_limit_secs: Option<u64>,
     ) -> Result<(), String> {
@@ -602,8 +604,15 @@ impl ServerState {
             .arg(daemon_socket)
             .arg("--frequency")
             .arg(frequency_hz.to_string());
+        if correlate_kperf {
+            cmd.arg("--correlate-frequency")
+                .arg(correlate_frequency_hz.to_string());
+        }
         if race_kperf {
             cmd.arg("--race-kperf");
+        }
+        if correlate_kperf {
+            cmd.arg("--correlate-kperf");
         }
         if let Some(limit) = time_limit_secs {
             cmd.arg("--time-limit").arg(limit.to_string());
@@ -696,6 +705,32 @@ impl ServerState {
     }
 
     fn shade_child_exited(&self, run_id: RunId, shade_pid: u32, status: std::process::ExitStatus) {
+        let should_finalize = {
+            let mut inner = self.inner.lock();
+            if let Some(child) = inner.shade_child.as_ref()
+                && child.pid == shade_pid
+            {
+                inner.shade_child = None;
+            }
+            matches!(inner.active.as_ref(), Some(active) if active.id == run_id)
+        };
+        if !should_finalize {
+            return;
+        }
+
+        let reason = if status.success() {
+            tracing::info!(run_id = run_id.0, shade_pid, ?status, "stax-shade exited");
+            StopReason::TargetExited
+        } else {
+            tracing::warn!(run_id = run_id.0, shade_pid, ?status, "stax-shade exited");
+            StopReason::RecorderError {
+                message: format!("stax-shade exited: {status}"),
+            }
+        };
+        self.finalize_run(run_id, reason);
+    }
+
+    fn detach_ingest(&self, run_id: RunId, reason: &'static str) {
         let mut inner = self.inner.lock();
         let Some(active) = inner.active.as_ref() else {
             return;
@@ -703,30 +738,12 @@ impl ServerState {
         if active.id != run_id {
             return;
         }
-        tracing::warn!(run_id = run_id.0, shade_pid, ?status, "stax-shade exited");
-        if let Some(child) = inner.shade_child.as_ref()
-            && child.pid == shade_pid
-        {
-            inner.shade_child = None;
-        }
-        if inner.ingest_attached {
-            return;
-        }
-        if inner.cancel.is_none() {
-            return;
-        }
-        let mut summary = inner.active.take().expect("checked above");
-        summary.state = RunState::Stopped;
-        summary.stop_reason = Some(StopReason::RecorderError {
-            message: format!("stax-shade exited: {status}"),
-        });
-        summary.stopped_at_unix_ns = Some(now_unix_ns());
-        inner.cancel = None;
-        inner.active_shade = None;
-        inner.active_shade_commands = None;
         inner.ingest_attached = false;
-        inner.history.push(summary);
-        self.terminal.lock().pending.remove(&run_id.0);
+        tracing::warn!(
+            run_id = run_id.0,
+            reason,
+            "ingest channel detached; keeping run alive until shade exits or explicit stop"
+        );
     }
 
     /// Belt-and-suspenders for the case where vox's session
@@ -820,16 +837,20 @@ impl ServerState {
         self.attach_local_shared_cache();
 
         tracing::info!(
-            "stax-server: run {} started (frequency_hz={})",
+            "stax-server: run {} started (frequency_hz={} correlate_frequency_hz={})",
             id.0,
-            config.frequency_hz
+            config.frequency_hz,
+            config.correlate_frequency_hz
         );
         self.telemetry.runs_started.inc(1);
         self.telemetry.active_run_id.set(saturating_i64(id.0));
         self.telemetry.set_active_counts(0, 0);
         self.telemetry.run_phase.enter(
             "recording",
-            format!("run_id={} frequency_hz={}", id.0, config.frequency_hz),
+            format!(
+                "run_id={} frequency_hz={} correlate_frequency_hz={}",
+                id.0, config.frequency_hz, config.correlate_frequency_hz
+            ),
         );
         self.telemetry.registry.event(
             "run.started",
@@ -959,7 +980,11 @@ impl ServerState {
                 format!("run_id={} reason={exit_reason}", id.0),
             );
             drop(events);
-            state.finalize_run(id, StopReason::TargetExited);
+            if exit_reason == "cancel" {
+                state.finalize_run(id, StopReason::UserStop);
+            } else {
+                state.detach_ingest(id, exit_reason);
+            }
         });
     }
 
@@ -1286,13 +1311,17 @@ impl RunControl for ServerState {
         time_limit_secs: Option<u64>,
     ) -> Result<RunId, RunControlError> {
         let frequency_hz = config.frequency_hz;
+        let correlate_frequency_hz = config.correlate_frequency_hz;
         let race_kperf = config.race_kperf;
+        let correlate_kperf = config.correlate_kperf;
         let (run_id, _) = self.begin_run(config)?;
         if let Err(e) = self.spawn_shade(
             run_id,
             ShadeTarget::Attach(pid),
             frequency_hz,
+            correlate_frequency_hz,
             race_kperf,
+            correlate_kperf,
             daemon_socket,
             time_limit_secs,
         ) {
@@ -1314,7 +1343,9 @@ impl RunControl for ServerState {
             });
         }
         let frequency_hz = request.config.frequency_hz;
+        let correlate_frequency_hz = request.config.correlate_frequency_hz;
         let race_kperf = request.config.race_kperf;
+        let correlate_kperf = request.config.correlate_kperf;
         let daemon_socket = request.daemon_socket.clone();
         let time_limit_secs = request.time_limit_secs;
         let (run_id, _) = self.begin_run(request.config.clone())?;
@@ -1329,7 +1360,9 @@ impl RunControl for ServerState {
             run_id,
             ShadeTarget::Launch(request),
             frequency_hz,
+            correlate_frequency_hz,
             race_kperf,
+            correlate_kperf,
             daemon_socket,
             time_limit_secs,
         ) {
@@ -1759,6 +1792,9 @@ impl ServerState {
                         mach_fp: p.mach_fp,
                         mach_sp: p.mach_sp,
                         mach_walked: p.mach_walked.into_boxed_slice(),
+                        compact_walked: p.compact_walked.into_boxed_slice(),
+                        compact_dwarf_walked: p.compact_dwarf_walked.into_boxed_slice(),
+                        dwarf_walked: p.dwarf_walked.into_boxed_slice(),
                         used_framehop: p.used_framehop,
                     });
                 self.bump_revision();

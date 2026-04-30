@@ -8,7 +8,7 @@
 //! that `stax-live` pulls in.
 
 use facet::Facet;
-pub use stax_telemetry::{
+pub use metrix::{
     CounterSnapshot, GaugeSnapshot, HistogramBucketSnapshot, HistogramSnapshot, PhaseSnapshot,
     RecentEventSnapshot, TelemetrySnapshot,
 };
@@ -505,26 +505,48 @@ pub struct ProbeDiffEntry {
     /// when kperf interrupted user code (no kstack to walk) or
     /// when the kernel walk failed.
     pub kperf_kernel_stack: Vec<ResolvedFrame>,
-    /// Suspended-thread leaf PC + walked return addresses,
-    /// leaf-most first (probe_stack[0] = mach_pc).
+    /// Suspended-thread FP validator stack, leaf-most first:
+    /// `mach_pc`, then FP-walked return addresses.
     pub probe_stack: Vec<ResolvedFrame>,
+    /// Compact-unwind-only comparator stack, leaf-most first.
+    pub compact_stack: Vec<ResolvedFrame>,
+    /// Compact-unwind comparator that follows compact entries pointing
+    /// at an eh_frame FDE, leaf-most first.
+    pub compact_dwarf_stack: Vec<ResolvedFrame>,
+    /// Full DWARF/metadata candidate stack, leaf-most first.
+    pub dwarf_stack: Vec<ResolvedFrame>,
     /// Synthesised stack the runtime would ship if we adopted the
-    /// race-against-return technique for this sample. Currently
-    /// = `probe_stack` when `stitchable`, otherwise empty.
+    /// race-against-return technique for this sample. When FP validation
+    /// made the pair `stitchable`, this is kperf's kernel stack
+    /// followed by the DWARF-unwound user stack, leaf-most first;
+    /// otherwise empty.
     /// Populated server-side from the same address resolver as
     /// the other stacks so the UI can render it directly.
     pub stitched_stack: Vec<ResolvedFrame>,
-    /// How many trailing frames of kperf and probe matched after
-    /// PAC-strip, comparing only the FP-walked portions.
+    /// Longest contiguous run shared by kperf and the FP validator
+    /// stack. Historical field name; suffix was too strict because
+    /// kperf can include outer runtime frames the probe does not reach.
     pub common_suffix: u32,
+    /// Longest contiguous run shared by kperf and the compact-only
+    /// comparator. Metadata unwinders can miss one outer runtime frame,
+    /// so suffix is too strict for these comparators.
+    pub compact_common_suffix: u32,
+    /// Longest contiguous run shared by kperf and the compact+FDE
+    /// comparator.
+    pub compact_dwarf_common_suffix: u32,
+    /// Longest contiguous run shared by kperf and the full
+    /// DWARF/metadata comparator.
+    pub dwarf_common_suffix: u32,
     /// `true` if the PAC-stripped leaf PC matched between the
     /// two views.
     pub pc_match: bool,
-    /// `true` if `pc_match && common_suffix >= STITCH_MIN_SUFFIX`.
-    /// When set, `stitched_stack` is populated.
+    /// `true` if the enriched DWARF candidate shares a contiguous run
+    /// of at least `STITCH_MIN_SUFFIX` frames with kperf.
+    /// When set, `stitched_stack` is populated from kperf kernel frames
+    /// plus the enriched user stack.
     pub stitchable: bool,
-    /// `true` if the probe walked via framehop, `false` for the
-    /// FP-walk fallback.
+    /// `true` if a DWARF candidate stack was available for this
+    /// paired probe.
     pub used_framehop: bool,
 }
 
@@ -568,6 +590,8 @@ pub struct ProbeTimingBreakdown {
     pub kperf_to_enqueue_ns: u64,
     /// kperf sample timestamp -> daemon read start.
     pub kperf_to_staxd_read_ns: u64,
+    /// kperf sample timestamp -> daemon read complete.
+    pub kperf_to_staxd_drain_ns: u64,
     /// Daemon KERN_KDREADTR syscall duration.
     pub staxd_read_ns: u64,
     /// Daemon post-read batch build / pre-send delay.
@@ -601,6 +625,8 @@ pub struct ProbeTimingSummary {
     pub max_kperf_to_enqueue_ns: u64,
     pub avg_kperf_to_staxd_read_ns: u64,
     pub max_kperf_to_staxd_read_ns: u64,
+    pub avg_kperf_to_staxd_drain_ns: u64,
+    pub max_kperf_to_staxd_drain_ns: u64,
     pub avg_staxd_read_ns: u64,
     pub max_staxd_read_ns: u64,
     pub avg_staxd_drain_to_send_ns: u64,
@@ -633,10 +659,20 @@ pub struct ProbeTimingSummary {
 #[derive(Clone, Debug, Facet)]
 pub struct ProbeDiffThread {
     pub tid: u32,
+    pub kperf_samples: u64,
+    pub probe_results: u64,
     pub paired: u64,
+    pub kperf_only: u64,
+    pub probe_only: u64,
     pub pc_match: u64,
     pub stitchable: u64,
+    pub compact_stitchable: u64,
+    pub compact_dwarf_stitchable: u64,
+    pub dwarf_stitchable: u64,
     pub avg_common_suffix: f32,
+    pub avg_compact_common_suffix: f32,
+    pub avg_compact_dwarf_common_suffix: f32,
+    pub avg_dwarf_common_suffix: f32,
     pub thread_name: Option<String>,
 }
 
@@ -663,9 +699,14 @@ pub struct ProbeDiffUpdate {
     /// Paired samples where probe walked strictly deeper than
     /// kperf (probe.len > kperf.walked.len + 1, +1 for the leaf).
     pub probe_walked_deeper: u64,
-    /// Distribution of common-suffix lengths. Index = exact
-    /// suffix length (0..=32).
+    /// Distribution of FP common-run lengths. Index = exact run
+    /// length (0..=32). Historical field name.
     pub common_suffix_hist: Vec<u64>,
+    /// Distributions of longest-common-run lengths for metadata
+    /// comparator stacks. Index = exact run length (0..=32).
+    pub compact_suffix_hist: Vec<u64>,
+    pub compact_dwarf_suffix_hist: Vec<u64>,
+    pub dwarf_suffix_hist: Vec<u64>,
     /// Match rate at each frame depth counted from the leaf.
     /// Index 0 = leaf PC. Bounded to 32 entries.
     pub depth_match: Vec<ProbeDiffDepthCell>,
@@ -674,12 +715,18 @@ pub struct ProbeDiffUpdate {
     /// Self-profiled timing breakdown for paired probe results.
     pub timing: ProbeTimingSummary,
     pub pc_match: u64,
-    /// Paired samples where `pc_match && common_suffix >=
-    /// STITCH_MIN_SUFFIX`. The "deliverable" count: how many
-    /// samples a future race-against-return shipping mode would
-    /// produce a high-confidence stitched stack for.
+    /// Paired samples where the enriched DWARF candidate shared at
+    /// least `STITCH_MIN_SUFFIX` contiguous frames with kperf. The
+    /// "deliverable" count: how many samples a future
+    /// race-against-return shipping mode would produce a
+    /// high-confidence enriched stack for.
     pub stitchable: u64,
+    pub compact_stitchable: u64,
+    pub compact_dwarf_stitchable: u64,
+    pub dwarf_stitchable: u64,
     pub framehop_used: u64,
+    pub compact_used: u64,
+    pub compact_dwarf_used: u64,
     pub fp_walk_used: u64,
     pub threads: Vec<ProbeDiffThread>,
     /// The N most recent paired entries for drill-down. Ordered
@@ -1033,11 +1080,12 @@ pub struct WireWakeup {
     pub waker_kernel_stack: Vec<u64>,
 }
 
-/// One race-against-return probe result, correlated with a kperf
-/// sample by `(tid, kperf_ts_mach)`. This is produced by the
-/// attachment-side target helper, not by staxd. Server resolves
-/// addresses through the same BinaryRegistry path it uses for
-/// kperf samples.
+/// One race/correlation probe result. Triggered probes correlate
+/// exactly by `(tid, kperf_ts_mach)`; independent correlation probes
+/// use `kperf_ts` as the probe request timestamp and pair by nearest
+/// kperf sample at query time. This is produced by the attachment-side
+/// target helper, not by staxd. Server resolves addresses through the
+/// same BinaryRegistry path it uses for kperf samples.
 #[derive(Clone, Debug, Facet)]
 pub struct WireProbeResult {
     pub tid: u32,
@@ -1051,18 +1099,31 @@ pub struct WireProbeResult {
     pub mach_fp: u64,
     /// Stack pointer at suspend.
     pub mach_sp: u64,
-    /// Walked return addresses from the suspended thread, leaf-most
-    /// first; PAC-stripped; does not include the leaf PC.
+    /// Frame-pointer walked return addresses from the suspended
+    /// thread, leaf-most first; PAC-stripped; does not include the
+    /// leaf PC. Used as the validator against kperf's user stack.
     pub mach_walked: Vec<u64>,
-    /// `true` if framehop produced the walk, `false` for FP-walk
-    /// fallback. Lets the server label "DWARF-accurate" vs
-    /// "best-effort" frames in the UI.
+    /// Compact-unwind-only return addresses from the same captured
+    /// stack, leaf-most first; PAC-stripped; does not include the
+    /// leaf PC.
+    pub compact_walked: Vec<u64>,
+    /// Compact-unwind return addresses where compact DWARF FDE entries
+    /// are followed, leaf-most first; PAC-stripped; does not include
+    /// the leaf PC.
+    pub compact_dwarf_walked: Vec<u64>,
+    /// DWARF-unwound return addresses from the same captured stack,
+    /// leaf-most first; PAC-stripped; does not include the leaf PC.
+    /// Used as the candidate stitched stack when FP validation passes.
+    pub dwarf_walked: Vec<u64>,
+    /// `true` if `dwarf_walked` is available for this capture.
     pub used_framehop: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Facet)]
 pub struct ProbeTiming {
-    /// Kdebug timestamp of the matching kperf sample (mach ticks).
+    /// Pairing key in mach ticks. For triggered probes this is the
+    /// matching kperf timestamp; for independent correlation probes
+    /// this is the probe request timestamp.
     pub kperf_ts: u64,
     /// mach_absolute_time immediately before staxd called KERN_KDREADTR.
     pub staxd_read_started: u64,
@@ -1139,10 +1200,20 @@ pub struct RunConfig {
     /// PET sampling frequency the recorder requested, Hz. Surfaced in
     /// `RunSummary` so the UI can label samples.
     pub frequency_hz: u32,
+    /// Total process-wide shade-side probe frequency for correlated
+    /// kperf/probe evaluation. Usually equal to `frequency_hz`; split
+    /// out so kperf and user-stack probe rates can be varied
+    /// independently.
+    pub correlate_frequency_hz: u32,
     /// Evaluation mode: shade probes each parsed kperf PET sample by
     /// suspending the sampled thread and emitting a paired
     /// `ProbeResult`. Off by default because it perturbs the target.
     pub race_kperf: bool,
+    /// Evaluation mode: shade samples target threads independently
+    /// at `correlate_frequency_hz` and `probe_diff` correlates
+    /// nearest probe/kperf samples by timestamp. Off by default
+    /// because it perturbs the target.
+    pub correlate_kperf: bool,
 }
 
 #[derive(Clone, Debug, Facet)]
