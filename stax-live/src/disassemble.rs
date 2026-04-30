@@ -11,14 +11,14 @@ use yaxpeax_arm::armv8::a64::InstDecoder as Aarch64Decoder;
 use yaxpeax_x86::amd64::InstDecoder as Amd64Decoder;
 
 use crate::binaries::ResolvedAddress;
-use crate::highlight::AsmHighlighter;
+use crate::highlight::TokenHighlighter;
 
 /// Disassemble `resolved`'s bytes and look up per-instruction stats
 /// via `self_lookup`, which returns `(self_on_cpu_ns, self_pet_samples)`
 /// for the address at each line.
 pub fn disassemble(
     resolved: &ResolvedAddress,
-    hl: &mut AsmHighlighter,
+    hl: &mut TokenHighlighter,
     mut self_lookup: impl FnMut(u64) -> (u64, u64),
 ) -> Vec<AnnotatedLine> {
     let arch = resolved.arch.as_deref().unwrap_or(host_arch());
@@ -41,7 +41,7 @@ fn host_arch() -> &'static str {
 
 fn disassemble_aarch64(
     resolved: &ResolvedAddress,
-    hl: &mut AsmHighlighter,
+    hl: &mut TokenHighlighter,
     self_lookup: &mut dyn FnMut(u64) -> (u64, u64),
 ) -> Vec<AnnotatedLine> {
     let decoder = Aarch64Decoder::default();
@@ -60,7 +60,7 @@ fn disassemble_aarch64(
         let (on_cpu_ns, pet_samples) = self_lookup(address);
         out.push(AnnotatedLine {
             address,
-            html: hl.highlight_line(&asm),
+            tokens: hl.highlight_line(&asm),
             self_on_cpu_ns: on_cpu_ns,
             self_pet_samples: pet_samples,
             source_header: None,
@@ -72,7 +72,7 @@ fn disassemble_aarch64(
 
 fn disassemble_amd64(
     resolved: &ResolvedAddress,
-    hl: &mut AsmHighlighter,
+    hl: &mut TokenHighlighter,
     self_lookup: &mut dyn FnMut(u64) -> (u64, u64),
 ) -> Vec<AnnotatedLine> {
     let decoder = Amd64Decoder::default();
@@ -89,7 +89,7 @@ fn disassemble_amd64(
                 let asm = format!("{}", instr);
                 out.push(AnnotatedLine {
                     address,
-                    html: hl.highlight_line(&asm),
+                    tokens: hl.highlight_line(&asm),
                     self_on_cpu_ns: on_cpu_ns,
                     self_pet_samples: pet_samples,
                     source_header: None,
@@ -99,7 +99,7 @@ fn disassemble_amd64(
             Err(err) => {
                 out.push(AnnotatedLine {
                     address,
-                    html: hl.highlight_line(&format!("<decode error: {}>", err)),
+                    tokens: hl.highlight_line(&format!("<decode error: {}>", err)),
                     self_on_cpu_ns: on_cpu_ns,
                     self_pet_samples: pet_samples,
                     source_header: None,

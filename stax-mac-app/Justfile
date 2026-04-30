@@ -1,6 +1,12 @@
 project := "stax.xcodeproj"
 scheme := "stax"
 config := "Debug"
+# Pin DerivedData to a project-local path. Lets `only-run` resolve the
+# .app location with a static string instead of asking xcodebuild
+# (`-showBuildSettings` re-loads the project + SwiftPM graph and is
+# multi-second).
+derived := "./DerivedData"
+app := derived + "/Build/Products/" + config + "/stax.app"
 
 list:
     just --list
@@ -11,7 +17,7 @@ gen:
 
 # Build the app (regenerates project first)
 build: gen
-    xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} build 2>&1 | xcbeautify
+    xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -derivedDataPath {{ derived }} build 2>&1 | xcbeautify
 
 # Build, then launch from DerivedData (kills any prior instance first)
 run: build
@@ -20,17 +26,15 @@ run: build
     just only-run
 
 only-run:
-    @build_dir="$(xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -showBuildSettings 2>/dev/null | awk '/^ *BUILT_PRODUCTS_DIR =/ { print $3 }')"; \
-      open "$build_dir/stax.app"
+    open {{ app }}
 
 # Build, copy to /Applications, launch from there
 install: build
     pkill -f /stax.app/Contents/MacOS/stax || true
     @sleep 0.2
-    @build_dir="$(xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -showBuildSettings 2>/dev/null | awk '/^ *BUILT_PRODUCTS_DIR =/ { print $3 }')"; \
-      rm -rf /Applications/stax.app; \
-      cp -R "$build_dir/stax.app" /Applications/stax.app; \
-      echo "installed to /Applications/stax.app"
+    rm -rf /Applications/stax.app
+    cp -R {{ app }} /Applications/stax.app
+    @echo "installed to /Applications/stax.app"
     open /Applications/stax.app
 
 # Open the project in Xcode
@@ -38,5 +42,5 @@ xcode: gen
     open {{ project }}
 
 clean:
-    xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} clean
-    rm -rf .build build DerivedData
+    xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -derivedDataPath {{ derived }} clean
+    rm -rf .build build {{ derived }}

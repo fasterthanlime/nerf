@@ -23,14 +23,35 @@ On macOS, `cargo xtask install` prefers `Developer ID Application` and then
 `STAX_CODESIGN_IDENTITY=<identity-or-hash>`; set it to `-` only when you
 explicitly want ad-hoc signing.
 
-After that, one privileged step (the only `sudo` you'll ever do):
+After that, one privileged step installs `staxd` as a LaunchDaemon:
 
 ```
-sudo stax setup
+sudo -n /usr/local/sbin/stax-agent setup --yes
 ```
 
 …installs `staxd` (the privileged kperf/kdebug owner) as a LaunchDaemon. From
-this point on, `stax record …` is unprivileged.
+this point on, `stax record …` is unprivileged. Human operators without the
+agent wrapper can run `sudo stax setup` manually.
+
+### Privileged agent commands
+
+On Amos's development machine, agents have a passwordless privileged wrapper:
+
+```
+sudo -n /usr/local/sbin/stax-agent setup --yes
+sudo -n /usr/local/sbin/stax-agent dump
+```
+
+Use `stax-agent` instead of interactive `sudo stax` for privileged stax
+operations. The `-n` is intentional: if sudo would ask for a password, fail
+fast and ask the user rather than blocking in an interactive prompt.
+
+`log` is also configured for passwordless sudo on this machine. Use:
+
+```
+sudo -n log show --last 5m --predicate 'subsystem == "eu.bearcove.staxd"'
+sudo -n log stream --predicate 'subsystem == "eu.bearcove.staxd"'
+```
 
 ### What runs where
 
@@ -59,7 +80,7 @@ disk — view live with:
 log stream --predicate 'subsystem == "eu.bearcove.stax-server"'
 
 # staxd (root LaunchDaemon — needs sudo)
-sudo log stream --predicate 'subsystem == "eu.bearcove.staxd"'
+sudo -n log stream --predicate 'subsystem == "eu.bearcove.staxd"'
 ```
 
 Or open **Console.app** → Action menu → *Include Info Messages* /
@@ -70,7 +91,7 @@ queryable with `log show --last 10m --predicate '…'`.
 
 ```
 stax status            # talks to stax-server, reports active run
-launchctl list eu.bearcove.staxd        # should show pid + 0
+test -S /var/run/staxd.sock              # staxd socket exists
 launchctl list eu.bearcove.stax-server  # should show pid + 0
 ```
 
@@ -323,8 +344,9 @@ stax: matched "translate" → vox_jit::translate (3812 self samples)
 
 ### `stax setup`
 
-Privileged install of `staxd` (LaunchDaemon). Run once with `sudo`.
-Not part of the routine agent flow.
+Privileged install of `staxd` (LaunchDaemon). Agents should use
+`sudo -n /usr/local/sbin/stax-agent setup --yes` on Amos's machine, not
+interactive `sudo stax setup`. Not part of the routine agent flow.
 
 ## Wire / RPC services
 

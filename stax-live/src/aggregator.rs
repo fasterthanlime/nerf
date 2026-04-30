@@ -24,10 +24,13 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use stax_live_proto::OffCpuReason;
+use stax_live_proto::{OffCpuReason, STITCH_MIN_SUFFIX};
 
 use crate::binaries::BinaryRegistry;
 use crate::classify::classify_offcpu;
+use crate::probe_match::{
+    PROBE_PAIR_WINDOW_NS, abs_tick_delta_ns, logical_probe_stack, longest_common_run,
+};
 
 #[derive(Clone, Copy, Default)]
 pub struct PmcAccum {
@@ -148,10 +151,8 @@ pub struct PetSample {
     pub pmc: PmuSample,
 }
 
-/// Race/correlation probe output. Triggered probes pair exactly with
-/// one kperf `PetSample` by `(tid, timestamp_ns == kperf_ts)`;
-/// correlation probes use `kperf_ts` as the probe request timestamp
-/// and pair by nearest timestamp at query time.
+/// Correlation probe output. `kperf_ts` is the independent probe
+/// request timestamp and pairs by nearest PET timestamp at query time.
 pub struct ProbeResultRecord {
     pub tid: u32,
     pub timing: ProbeTiming,
@@ -560,6 +561,7 @@ impl Aggregator {
                 Some(s) => s,
                 None => continue,
             };
+            let enriched_stacks = build_enriched_stack_map(stats);
 
             for interval in &stats.intervals {
                 let start = interval.start_ns;
@@ -602,10 +604,14 @@ impl Aggregator {
                         }
                         total_on_cpu_ns = total_on_cpu_ns.saturating_add(duration);
                         for s in samples {
+                            let stack = enriched_stacks
+                                .get(&s.timestamp_ns)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&s.stack);
                             credit_on_cpu_to_tree(
                                 &mut flame_root,
                                 &mut by_address,
-                                &s.stack,
+                                stack,
                                 credit_ns,
                                 &s.pmc,
                             );
@@ -668,6 +674,77 @@ pub enum EventCtx<'a> {
         interval: &'a RawInterval,
         binaries: &'a BinaryRegistry,
     },
+}
+
+fn build_enriched_stack_map(stats: &ThreadStats) -> HashMap<u64, Vec<u64>> {
+    if stats.pet_samples.is_empty() || stats.probe_results.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut out = HashMap::new();
+    let mut pets: Vec<_> = stats.pet_samples.iter().collect();
+    pets.sort_by_key(|pet| pet.timestamp_ns);
+    let mut probes: Vec<_> = stats.probe_results.iter().collect();
+    probes.sort_by_key(|probe| probe.timing.kperf_ts);
+
+    let mut pet_idx = 0usize;
+    for probe in probes {
+        while let Some(pet) = pets.get(pet_idx) {
+            if pet.timestamp_ns < probe.timing.kperf_ts
+                && abs_tick_delta_ns(pet.timestamp_ns, probe.timing.kperf_ts) > PROBE_PAIR_WINDOW_NS
+            {
+                pet_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut best_idx = None;
+        let mut best_delta_ns = u64::MAX;
+        let mut scan_idx = pet_idx;
+        while let Some(pet) = pets.get(scan_idx) {
+            let delta_ns = abs_tick_delta_ns(pet.timestamp_ns, probe.timing.kperf_ts);
+            if pet.timestamp_ns > probe.timing.kperf_ts && delta_ns > PROBE_PAIR_WINDOW_NS {
+                break;
+            }
+            if delta_ns <= PROBE_PAIR_WINDOW_NS && delta_ns < best_delta_ns {
+                best_idx = Some(scan_idx);
+                best_delta_ns = delta_ns;
+            }
+            scan_idx += 1;
+        }
+
+        let Some(best_idx) = best_idx else {
+            continue;
+        };
+        let pet = pets[best_idx];
+        pet_idx = best_idx + 1;
+
+        if let Some(stack) = validated_enriched_user_stack(pet, probe) {
+            out.insert(pet.timestamp_ns, stack);
+        }
+    }
+
+    out
+}
+
+fn validated_enriched_user_stack(pet: &PetSample, probe: &ProbeResultRecord) -> Option<Vec<u64>> {
+    if pet.stack.is_empty() || probe.dwarf_walked.is_empty() {
+        return None;
+    }
+
+    let dwarf_stack = logical_probe_stack(probe.mach_pc, 0, &probe.dwarf_walked);
+    if dwarf_stack.len() < pet.stack.len() {
+        return None;
+    }
+
+    let kperf_walk = &pet.stack[1..];
+    let dwarf_walk = &dwarf_stack[1..];
+    if (longest_common_run(kperf_walk, dwarf_walk) as u32) < STITCH_MIN_SUFFIX {
+        return None;
+    }
+
+    Some(dwarf_stack)
 }
 
 /// Walk a leaf-first stack and credit `credit_ns` of on-CPU time to

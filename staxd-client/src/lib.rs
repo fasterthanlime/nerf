@@ -51,8 +51,6 @@ pub struct RemoteOptions {
     /// Optional process-wide telemetry registry to receive Vox transport
     /// counters for the staxd records stream.
     pub telemetry: Option<TelemetryRegistry>,
-    /// Which kdebug classes/subclasses to subscribe to.
-    pub kdebug_filter: KdebugFilter,
 }
 
 impl std::fmt::Debug for RemoteOptions {
@@ -64,16 +62,8 @@ impl std::fmt::Debug for RemoteOptions {
             .field("duration", &self.duration)
             .field("buf_records", &self.buf_records)
             .field("telemetry", &self.telemetry.is_some())
-            .field("kdebug_filter", &self.kdebug_filter)
             .finish()
     }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub enum KdebugFilter {
-    #[default]
-    Live,
-    RaceKperfOnly,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -102,19 +92,8 @@ impl Default for RemoteOptions {
             duration: None,
             buf_records: 1_000_000,
             telemetry: None,
-            kdebug_filter: KdebugFilter::Live,
         }
     }
-}
-
-fn typefilter_cscs(filter: KdebugFilter) -> Vec<u16> {
-    let mut cscs: Vec<u16> = (0..=u8::MAX)
-        .map(|subclass| kdebug::kdbg_csc(DBG_PERF, subclass))
-        .collect();
-    if matches!(filter, KdebugFilter::Live) {
-        cscs.push(kdebug::kdbg_csc(DBG_MACH, DBG_MACH_SCHED));
-    }
-    cscs
 }
 
 #[derive(Clone)]
@@ -184,10 +163,9 @@ pub async fn drive_session<S: SampleSink + Send + 'static>(
 
 /// Like [`drive_session`], but calls `on_kperf_sample_start` from a
 /// dedicated scanner thread as soon as the raw kperf records show that
-/// the current sample has a user stack. This hook exists for
-/// race-kperf: stack capture must not wait behind the heavier parser /
-/// symbol / image pipeline, and the records receive loop must not scan
-/// batches inline.
+/// the current sample has a user stack. This hook keeps probe demand
+/// tracking off the heavier parser / symbol / image pipeline, and the
+/// records receive loop must not scan batches inline.
 pub async fn drive_session_with_hooks<S, Stop, FirstBatch, SampleStart>(
     opts: RemoteOptions,
     sink: S,
@@ -319,9 +297,9 @@ where
         phase_start.elapsed()
     );
 
-    // Ask the kernel only for the class/subclass pairs this mode needs.
-    // The old debugid range admitted every class between DBG_MACH
-    // and DBG_PERF, which inflated the ring with unrelated traffic.
+    // Use the broad range filter again while validating the live
+    // profiler path; this keeps MACH_SCHED records present in
+    // correlation mode.
     let session_config = SessionConfig {
         target_pid: opts.pid,
         frequency_hz: opts.frequency_hz,
@@ -332,7 +310,7 @@ where
         class_mask: stax_mac_kperf_sys::bindings::KPC_CLASS_FIXED_MASK,
         filter_range_value1: kdebug::kdbg_eventid(DBG_MACH, DBG_MACH_SCHED, 0),
         filter_range_value2: kdebug::kdbg_eventid(DBG_PERF, 0xff, 0x3fff),
-        typefilter_cscs: typefilter_cscs(opts.kdebug_filter),
+        typefilter_cscs: Vec::new(),
     };
 
     // Server→client streaming: we construct the channel, hand `tx` to
@@ -843,7 +821,7 @@ fn probe_scanner_thread<SampleStart>(
             if !first_probe_trigger_logged {
                 first_probe_trigger_logged = true;
                 info!(
-                    "staxd-client: first race-kperf probe trigger tid={tid} kperf_ts={ts} trigger_count={} since_client_start={:?} since_record_rpc_spawn={:?}",
+                    "staxd-client: first kperf probe trigger tid={tid} kperf_ts={ts} trigger_count={} since_client_start={:?} since_record_rpc_spawn={:?}",
                     trigger_count,
                     client_start.elapsed(),
                     record_rpc_start.elapsed()

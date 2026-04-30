@@ -9,5 +9,4 @@ description = "Dev-only entrypoints (cargo xtask install, ...)."
 [dependencies]
 stax-live-proto = { path = "../stax-live-proto" }
 vox-codegen = { path = "/Users/amos/bearcove/vox/rust/vox-codegen" }
-arborium-theme = "2.16"
 libc = "0.2"

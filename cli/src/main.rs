@@ -202,7 +202,6 @@ async fn run_record_async(args: RecordArgs) -> Result<(), Box<dyn Error>> {
         label,
         frequency_hz: args.frequency,
         correlate_frequency_hz: args.correlate_frequency.unwrap_or(args.frequency),
-        race_kperf: args.race_kperf,
         correlate_kperf: args.correlate_kperf,
     };
 
@@ -653,9 +652,9 @@ async fn run_annotate(args: AnnotateArgs) -> Result<(), Box<dyn Error>> {
         {
             println!("; {}:{}", hdr.file, hdr.line);
         }
-        // .html carries arborium-tagged HTML; strip the tags for a
-        // plain-text terminal view.
-        let plain = strip_html_tags(&line.html);
+        // Token classes don't carry colour info on the terminal path;
+        // just concatenate the text runs for a plain-text view.
+        let plain: String = line.tokens.iter().map(|t| t.text.as_str()).collect();
         println!(
             "  {:#x}  {:>5} samples  {}",
             line.address, line.self_pet_samples, plain
@@ -1555,23 +1554,6 @@ async fn resolve_target(
             Err(format!("no symbol matching {target:?} in the current run{hint}").into())
         }
     }
-}
-
-/// Naive HTML-tag stripper for arborium output. Arborium emits things
-/// like `<a-k>mov</a-k>` (custom elements, no attributes); this drops
-/// every `<…>` run without trying to be clever.
-fn strip_html_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out
 }
 
 fn print_server_status(status: &ServerStatus) {

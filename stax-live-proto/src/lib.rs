@@ -381,6 +381,56 @@ pub struct NeighborsUpdate {
     pub callees_tree: FlameNode,
 }
 
+/// One classified run of text in highlighted output. Adjacent tokens
+/// with the same `class_` are coalesced server-side; gaps the
+/// highlighter didn't classify (whitespace, plain identifiers, …) ride
+/// in their own `Plain` token. Frontends translate `class_` → their
+/// own styling.
+#[derive(Clone, Debug, Facet)]
+pub struct Token {
+    pub text: String,
+    pub kind: TokenClass,
+}
+
+/// Canonical syntax-highlight class. Mirrors arborium's `ThemeSlot`
+/// vocabulary; `Plain` is the implicit "no styling" class for text
+/// between styled spans.
+///
+/// `repr(u8)` and append-only — older clients should treat unknown
+/// variants as `Plain`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Facet)]
+#[repr(u8)]
+pub enum TokenClass {
+    Plain = 0,
+    Keyword,
+    Function,
+    String,
+    Comment,
+    Type,
+    Variable,
+    Constant,
+    Number,
+    Operator,
+    Punctuation,
+    Property,
+    Attribute,
+    Tag,
+    Macro,
+    Label,
+    Namespace,
+    Constructor,
+    Title,
+    Strong,
+    Emphasis,
+    Link,
+    Literal,
+    Strikethrough,
+    DiffAdd,
+    DiffDelete,
+    Embedded,
+    Error,
+}
+
 /// Source-line header attached to the first instruction generated from
 /// a given (file, line) pair. The frontend renders one of these as a
 /// banner row above the asm row whenever the source location changes
@@ -389,21 +439,18 @@ pub struct NeighborsUpdate {
 pub struct SourceHeader {
     pub file: String,
     pub line: u32,
-    /// Highlighted source-line snippet (arborium custom-tag HTML); empty
-    /// when the file couldn't be loaded (build-machine-relative paths,
-    /// missing source on this box, etc.).
-    pub html: String,
+    /// Highlighted source-line snippet, as classified token runs.
+    /// Empty when the file couldn't be loaded (build-machine-relative
+    /// paths, missing source on this box, etc.).
+    pub tokens: Vec<Token>,
 }
 
 /// One disassembled instruction with its sampled hit data.
 #[derive(Clone, Debug, Facet)]
 pub struct AnnotatedLine {
     pub address: u64,
-    /// HTML-highlighted assembly text. Uses arborium's default
-    /// `CustomElements` format (`<a-k>mov</a-k>` etc.); the frontend
-    /// styles those tags via the generated theme.css. Render with
-    /// `dangerouslySetInnerHTML`.
-    pub html: String,
+    /// Highlighted assembly text, as classified token runs.
+    pub tokens: Vec<Token>,
     /// On-CPU time attributed to this instruction as a leaf, ns.
     /// Heatmap source.
     pub self_on_cpu_ns: u64,
@@ -1108,12 +1155,11 @@ pub struct WireWakeup {
     pub waker_kernel_stack: Vec<u64>,
 }
 
-/// One race/correlation probe result. Triggered probes correlate
-/// exactly by `(tid, kperf_ts_mach)`; independent correlation probes
-/// use `kperf_ts` as the probe request timestamp and pair by nearest
-/// kperf sample at query time. This is produced by the attachment-side
-/// target helper, not by staxd. Server resolves addresses through the
-/// same BinaryRegistry path it uses for kperf samples.
+/// One correlation probe result. `kperf_ts` is the probe request
+/// timestamp and probe_diff pairs by nearest kperf sample at query
+/// time. This is produced by the attachment-side target helper, not by
+/// staxd. Server resolves addresses through the same BinaryRegistry
+/// path it uses for kperf samples.
 #[derive(Clone, Debug, Facet)]
 pub struct WireProbeResult {
     pub tid: u32,
@@ -1233,10 +1279,6 @@ pub struct RunConfig {
     /// out so kperf and user-stack probe rates can be varied
     /// independently.
     pub correlate_frequency_hz: u32,
-    /// Evaluation mode: shade probes each parsed kperf PET sample by
-    /// suspending the sampled thread and emitting a paired
-    /// `ProbeResult`. Off by default because it perturbs the target.
-    pub race_kperf: bool,
     /// Evaluation mode: shade samples target threads independently
     /// at `correlate_frequency_hz` and `probe_diff` correlates
     /// nearest probe/kperf samples by timestamp. Off by default

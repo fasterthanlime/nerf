@@ -12,6 +12,7 @@ tracing = "0.1"
 parking_lot = "0.12"
 memchr = "2"
 arborium = { version = "2.16", features = ["lang-asm", "lang-rust", "lang-c", "lang-cpp"] }
+arborium-theme = "2.16"
 addr2line = { version = "0.21", default-features = false, features = ["std"] }
 yaxpeax-arch = { version = "0.3", default-features = false, features = ["std"] }
 yaxpeax-x86 = { version = "2", default-features = false, features = ["std", "fmt"] }

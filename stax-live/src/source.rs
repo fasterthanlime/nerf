@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::binaries::CodeImage;
-use crate::highlight::AsmHighlighter;
+use crate::highlight::TokenHighlighter;
+use stax_live_proto::Token;
 
 pub struct SourceResolver {
     /// addr2line contexts, keyed by binary path. `addr2line::Context`
@@ -26,7 +27,7 @@ pub struct SourceResolver {
     sources: HashMap<String, Option<Arc<Vec<String>>>>,
     /// Highlighter reused across resolves; arborium grammars are
     /// expensive to instantiate per-call.
-    hl: AsmHighlighter,
+    hl: TokenHighlighter,
 }
 
 /// `addr2line::Context<R>` borrows from an `object::File<'a>` which
@@ -335,7 +336,7 @@ impl SourceResolver {
         Self {
             contexts: HashMap::new(),
             sources: HashMap::new(),
-            hl: AsmHighlighter::new_for_source(),
+            hl: TokenHighlighter::new_for_source(),
         }
     }
 
@@ -367,15 +368,15 @@ impl SourceResolver {
     }
 
     /// Highlighted snippet for `(file, line_1based)`. Returns an empty
-    /// string when the file isn't loadable from disk.
-    pub fn snippet(&mut self, file: &str, line: u32) -> String {
+    /// vector when the file isn't loadable from disk.
+    pub fn snippet(&mut self, file: &str, line: u32) -> Vec<Token> {
         let lines = self.source_lines(file);
         let raw = match lines
             .as_ref()
             .and_then(|v| v.get(line.saturating_sub(1) as usize))
         {
             Some(s) => s.trim().to_owned(),
-            None => return String::new(),
+            None => return Vec::new(),
         };
         let lang = arborium::detect_language(file).unwrap_or("rust");
         self.hl.highlight_in(lang, &raw)

@@ -138,28 +138,69 @@ public struct TopUpdate: Codable, Sendable {
     }
 }
 
+public enum TokenClass: Codable, Sendable {
+    case plain
+    case keyword
+    case function
+    case string
+    case comment
+    case type
+    case variable
+    case constant
+    case number
+    case `operator`
+    case punctuation
+    case property
+    case attribute
+    case tag
+    case macro
+    case label
+    case namespace
+    case constructor
+    case title
+    case strong
+    case emphasis
+    case link
+    case literal
+    case strikethrough
+    case diffAdd
+    case diffDelete
+    case embedded
+    case error
+}
+
+public struct Token: Codable, Sendable {
+    public var text: String
+    public var kind: TokenClass
+
+    nonisolated public init(text: String, kind: TokenClass) {
+        self.text = text
+        self.kind = kind
+    }
+}
+
 public struct SourceHeader: Codable, Sendable {
     public var file: String
     public var line: UInt32
-    public var html: String
+    public var tokens: [Token]
 
-    nonisolated public init(file: String, line: UInt32, html: String) {
+    nonisolated public init(file: String, line: UInt32, tokens: [Token]) {
         self.file = file
         self.line = line
-        self.html = html
+        self.tokens = tokens
     }
 }
 
 public struct AnnotatedLine: Codable, Sendable {
     public var address: UInt64
-    public var html: String
+    public var tokens: [Token]
     public var selfOnCpuNs: UInt64
     public var selfPetSamples: UInt64
     public var sourceHeader: SourceHeader?
 
-    nonisolated public init(address: UInt64, html: String, selfOnCpuNs: UInt64, selfPetSamples: UInt64, sourceHeader: SourceHeader?) {
+    nonisolated public init(address: UInt64, tokens: [Token], selfOnCpuNs: UInt64, selfPetSamples: UInt64, sourceHeader: SourceHeader?) {
         self.address = address
-        self.html = html
+        self.tokens = tokens
         self.selfOnCpuNs = selfOnCpuNs
         self.selfPetSamples = selfPetSamples
         self.sourceHeader = sourceHeader
@@ -925,14 +966,12 @@ public struct RunConfig: Codable, Sendable {
     public var label: String
     public var frequencyHz: UInt32
     public var correlateFrequencyHz: UInt32
-    public var raceKperf: Bool
     public var correlateKperf: Bool
 
-    nonisolated public init(label: String, frequencyHz: UInt32, correlateFrequencyHz: UInt32, raceKperf: Bool, correlateKperf: Bool) {
+    nonisolated public init(label: String, frequencyHz: UInt32, correlateFrequencyHz: UInt32, correlateKperf: Bool) {
         self.label = label
         self.frequencyHz = frequencyHz
         self.correlateFrequencyHz = correlateFrequencyHz
-        self.raceKperf = raceKperf
         self.correlateKperf = correlateKperf
     }
 }
@@ -1290,15 +1329,81 @@ nonisolated internal func encodeTopUpdate(_ value: TopUpdate, into buffer: inout
     encodeVec(value.entries, into: &buffer, encoder: { val, buf in encodeTopEntry(val, into: &buf) })
 }
 
+nonisolated internal func encodeTokenClass(_ value: TokenClass, into buffer: inout ByteBuffer) {
+    switch value {
+    case .plain:
+        encodeVarint(UInt64(0), into: &buffer)
+    case .keyword:
+        encodeVarint(UInt64(1), into: &buffer)
+    case .function:
+        encodeVarint(UInt64(2), into: &buffer)
+    case .string:
+        encodeVarint(UInt64(3), into: &buffer)
+    case .comment:
+        encodeVarint(UInt64(4), into: &buffer)
+    case .type:
+        encodeVarint(UInt64(5), into: &buffer)
+    case .variable:
+        encodeVarint(UInt64(6), into: &buffer)
+    case .constant:
+        encodeVarint(UInt64(7), into: &buffer)
+    case .number:
+        encodeVarint(UInt64(8), into: &buffer)
+    case .`operator`:
+        encodeVarint(UInt64(9), into: &buffer)
+    case .punctuation:
+        encodeVarint(UInt64(10), into: &buffer)
+    case .property:
+        encodeVarint(UInt64(11), into: &buffer)
+    case .attribute:
+        encodeVarint(UInt64(12), into: &buffer)
+    case .tag:
+        encodeVarint(UInt64(13), into: &buffer)
+    case .macro:
+        encodeVarint(UInt64(14), into: &buffer)
+    case .label:
+        encodeVarint(UInt64(15), into: &buffer)
+    case .namespace:
+        encodeVarint(UInt64(16), into: &buffer)
+    case .constructor:
+        encodeVarint(UInt64(17), into: &buffer)
+    case .title:
+        encodeVarint(UInt64(18), into: &buffer)
+    case .strong:
+        encodeVarint(UInt64(19), into: &buffer)
+    case .emphasis:
+        encodeVarint(UInt64(20), into: &buffer)
+    case .link:
+        encodeVarint(UInt64(21), into: &buffer)
+    case .literal:
+        encodeVarint(UInt64(22), into: &buffer)
+    case .strikethrough:
+        encodeVarint(UInt64(23), into: &buffer)
+    case .diffAdd:
+        encodeVarint(UInt64(24), into: &buffer)
+    case .diffDelete:
+        encodeVarint(UInt64(25), into: &buffer)
+    case .embedded:
+        encodeVarint(UInt64(26), into: &buffer)
+    case .error:
+        encodeVarint(UInt64(27), into: &buffer)
+    }
+}
+
+nonisolated internal func encodeToken(_ value: Token, into buffer: inout ByteBuffer) {
+    encodeString(value.text, into: &buffer)
+    encodeTokenClass(value.kind, into: &buffer)
+}
+
 nonisolated internal func encodeSourceHeader(_ value: SourceHeader, into buffer: inout ByteBuffer) {
     encodeString(value.file, into: &buffer)
     encodeU32(value.line, into: &buffer)
-    encodeString(value.html, into: &buffer)
+    encodeVec(value.tokens, into: &buffer, encoder: { val, buf in encodeToken(val, into: &buf) })
 }
 
 nonisolated internal func encodeAnnotatedLine(_ value: AnnotatedLine, into buffer: inout ByteBuffer) {
     encodeVarint(value.address, into: &buffer)
-    encodeString(value.html, into: &buffer)
+    encodeVec(value.tokens, into: &buffer, encoder: { val, buf in encodeToken(val, into: &buf) })
     encodeVarint(value.selfOnCpuNs, into: &buffer)
     encodeVarint(value.selfPetSamples, into: &buffer)
     encodeOption(value.sourceHeader, into: &buffer, encoder: { val, buf in encodeSourceHeader(val, into: &buf) })
@@ -1721,7 +1826,6 @@ nonisolated internal func encodeRunConfig(_ value: RunConfig, into buffer: inout
     encodeString(value.label, into: &buffer)
     encodeU32(value.frequencyHz, into: &buffer)
     encodeU32(value.correlateFrequencyHz, into: &buffer)
-    encodeBool(value.raceKperf, into: &buffer)
     encodeBool(value.correlateKperf, into: &buffer)
 }
 
@@ -2058,20 +2162,92 @@ nonisolated internal func decodeTopUpdate(from buffer: inout ByteBuffer) throws 
     return TopUpdate(totalOnCpuNs: _totalOnCpuNs, totalOffCpu: _totalOffCpu, entries: _entries)
 }
 
+nonisolated internal func decodeTokenClass(from buffer: inout ByteBuffer) throws -> TokenClass {
+    let disc = try decodeVarint(from: &buffer)
+    let result: TokenClass
+    switch disc {
+    case 0:
+        result = .plain
+    case 1:
+        result = .keyword
+    case 2:
+        result = .function
+    case 3:
+        result = .string
+    case 4:
+        result = .comment
+    case 5:
+        result = .type
+    case 6:
+        result = .variable
+    case 7:
+        result = .constant
+    case 8:
+        result = .number
+    case 9:
+        result = .`operator`
+    case 10:
+        result = .punctuation
+    case 11:
+        result = .property
+    case 12:
+        result = .attribute
+    case 13:
+        result = .tag
+    case 14:
+        result = .macro
+    case 15:
+        result = .label
+    case 16:
+        result = .namespace
+    case 17:
+        result = .constructor
+    case 18:
+        result = .title
+    case 19:
+        result = .strong
+    case 20:
+        result = .emphasis
+    case 21:
+        result = .link
+    case 22:
+        result = .literal
+    case 23:
+        result = .strikethrough
+    case 24:
+        result = .diffAdd
+    case 25:
+        result = .diffDelete
+    case 26:
+        result = .embedded
+    case 27:
+        result = .error
+    default:
+        throw VoxError.decodeError("unknown enum variant")
+    }
+    return result
+}
+
+nonisolated internal func decodeToken(from buffer: inout ByteBuffer) throws -> Token {
+    let _text = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _kind = try ({ buf in try decodeTokenClass(from: &buf) })(&buffer)
+    return Token(text: _text, kind: _kind)
+}
+
 nonisolated internal func decodeSourceHeader(from buffer: inout ByteBuffer) throws -> SourceHeader {
     let _file = try ({ buf in try decodeString(from: &buf) })(&buffer)
     let _line = try ({ buf in try decodeU32(from: &buf) })(&buffer)
-    let _html = try ({ buf in try decodeString(from: &buf) })(&buffer)
-    return SourceHeader(file: _file, line: _line, html: _html)
+    let _tokens = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeToken(from: &buf) }) })(&buffer)
+    return SourceHeader(file: _file, line: _line, tokens: _tokens)
 }
 
 nonisolated internal func decodeAnnotatedLine(from buffer: inout ByteBuffer) throws -> AnnotatedLine {
     let _address = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
-    let _html = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _tokens = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeToken(from: &buf) }) })(&buffer)
     let _selfOnCpuNs = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _selfPetSamples = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _sourceHeader = try ({ buf in try decodeOption(from: &buf, decoder: { buf in try decodeSourceHeader(from: &buf) }) })(&buffer)
-    return AnnotatedLine(address: _address, html: _html, selfOnCpuNs: _selfOnCpuNs, selfPetSamples: _selfPetSamples, sourceHeader: _sourceHeader)
+    return AnnotatedLine(address: _address, tokens: _tokens, selfOnCpuNs: _selfOnCpuNs, selfPetSamples: _selfPetSamples, sourceHeader: _sourceHeader)
 }
 
 nonisolated internal func decodeAnnotatedView(from buffer: inout ByteBuffer) throws -> AnnotatedView {
@@ -2540,9 +2716,8 @@ nonisolated internal func decodeRunConfig(from buffer: inout ByteBuffer) throws 
     let _label = try ({ buf in try decodeString(from: &buf) })(&buffer)
     let _frequencyHz = try ({ buf in try decodeU32(from: &buf) })(&buffer)
     let _correlateFrequencyHz = try ({ buf in try decodeU32(from: &buf) })(&buffer)
-    let _raceKperf = try ({ buf in try decodeBool(from: &buf) })(&buffer)
     let _correlateKperf = try ({ buf in try decodeBool(from: &buf) })(&buffer)
-    return RunConfig(label: _label, frequencyHz: _frequencyHz, correlateFrequencyHz: _correlateFrequencyHz, raceKperf: _raceKperf, correlateKperf: _correlateKperf)
+    return RunConfig(label: _label, frequencyHz: _frequencyHz, correlateFrequencyHz: _correlateFrequencyHz, correlateKperf: _correlateKperf)
 }
 
 nonisolated internal func decodeRunControlError(from buffer: inout ByteBuffer) throws -> RunControlError {

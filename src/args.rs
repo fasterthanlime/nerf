@@ -178,13 +178,6 @@ pub struct RecordArgs {
     #[facet(args::named, args::short = 'l', default)]
     pub time_limit: Option<u64>,
 
-    /// For each parsed PET sample, have stax-shade suspend that
-    /// sampled thread and emit a paired user-stack probe. This is an
-    /// evaluation mode for kperf/probe stitching latency, not the
-    /// default profiler path.
-    #[facet(args::named, default)]
-    pub race_kperf: bool,
-
     /// Evaluation mode: independently sample shade-side user stacks
     /// at `--correlate-frequency` (or PET frequency by default),
     /// then correlate with nearest kperf samples by `(tid, timestamp)`.

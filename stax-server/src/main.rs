@@ -546,7 +546,6 @@ impl ServerState {
         target: ShadeTarget,
         frequency_hz: u32,
         correlate_frequency_hz: u32,
-        race_kperf: bool,
         correlate_kperf: bool,
         daemon_socket: String,
         time_limit_secs: Option<u64>,
@@ -607,9 +606,6 @@ impl ServerState {
         if correlate_kperf {
             cmd.arg("--correlate-frequency")
                 .arg(correlate_frequency_hz.to_string());
-        }
-        if race_kperf {
-            cmd.arg("--race-kperf");
         }
         if correlate_kperf {
             cmd.arg("--correlate-kperf");
@@ -1312,7 +1308,6 @@ impl RunControl for ServerState {
     ) -> Result<RunId, RunControlError> {
         let frequency_hz = config.frequency_hz;
         let correlate_frequency_hz = config.correlate_frequency_hz;
-        let race_kperf = config.race_kperf;
         let correlate_kperf = config.correlate_kperf;
         let (run_id, _) = self.begin_run(config)?;
         if let Err(e) = self.spawn_shade(
@@ -1320,7 +1315,6 @@ impl RunControl for ServerState {
             ShadeTarget::Attach(pid),
             frequency_hz,
             correlate_frequency_hz,
-            race_kperf,
             correlate_kperf,
             daemon_socket,
             time_limit_secs,
@@ -1344,7 +1338,6 @@ impl RunControl for ServerState {
         }
         let frequency_hz = request.config.frequency_hz;
         let correlate_frequency_hz = request.config.correlate_frequency_hz;
-        let race_kperf = request.config.race_kperf;
         let correlate_kperf = request.config.correlate_kperf;
         let daemon_socket = request.daemon_socket.clone();
         let time_limit_secs = request.time_limit_secs;
@@ -1361,7 +1354,6 @@ impl RunControl for ServerState {
             ShadeTarget::Launch(request),
             frequency_hz,
             correlate_frequency_hz,
-            race_kperf,
             correlate_kperf,
             daemon_socket,
             time_limit_secs,

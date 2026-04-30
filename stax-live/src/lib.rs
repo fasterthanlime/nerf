@@ -18,6 +18,10 @@ use stax_live_proto::{
 
 use crate::aggregator::{Aggregation, EventCtx, OffCpuBreakdown, PmcAccum, StackNode};
 pub use crate::aggregator::{IntervalKind, PmuSample};
+use crate::probe_match::{
+    PROBE_PAIR_WINDOW_NS, abs_tick_delta_ns, elapsed_ticks_to_ns, elapsed_ticks_to_ns_if_set,
+    logical_probe_stack, longest_common_run, ticks_to_ns,
+};
 
 mod aggregator;
 mod binaries;
@@ -26,6 +30,7 @@ mod disassemble;
 mod highlight;
 #[cfg(target_os = "macos")]
 mod kernel_symbols;
+mod probe_match;
 pub mod source;
 
 pub use aggregator::{Aggregator, ProbeQueueStats, ProbeResultRecord, ProbeTiming};
@@ -750,68 +755,11 @@ fn build_pet_samples_update(
 const PROBE_DRIFT_BUCKETS_NS: &[u64] =
     &[1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
 
-const PROBE_PAIR_WINDOW_NS: u64 = 600_000;
 const PROBE_RECENT_CAP: usize = 64;
 const PROBE_RICH_EXAMPLES_CAP: usize = 4096;
 const PROBE_DEPTH_CAP: usize = 32;
 const PROBE_THREADS_CAP: usize = 32;
 const INFERIOR_HELPER_THREAD_NAME: &str = "stax-inferior-helper";
-
-/// Look up the host's mach_timebase ratio once. Apple Silicon
-/// reports 1:1 (so ticks == ns) but x86 macOS uses different
-/// numer/denom. Cached per-process.
-#[cfg(target_os = "macos")]
-fn mach_timebase_numer_denom() -> (u32, u32) {
-    use std::sync::OnceLock;
-    static TB: OnceLock<(u32, u32)> = OnceLock::new();
-    *TB.get_or_init(|| {
-        let mut info = mach2::mach_time::mach_timebase_info { numer: 0, denom: 0 };
-        // SAFETY: leaf libc-ish call writing two u32s into our stack local.
-        let _ = unsafe { mach2::mach_time::mach_timebase_info(&mut info) };
-        if info.denom == 0 {
-            (1, 1)
-        } else {
-            (info.numer, info.denom)
-        }
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn mach_timebase_numer_denom() -> (u32, u32) {
-    (1, 1)
-}
-
-fn ticks_to_ns(ticks: i128) -> i128 {
-    let (numer, denom) = mach_timebase_numer_denom();
-    if denom == 0 {
-        ticks
-    } else {
-        ticks * (numer as i128) / (denom as i128)
-    }
-}
-
-fn elapsed_ticks_to_ns(later: u64, earlier: u64) -> u64 {
-    if later < earlier {
-        return 0;
-    }
-    ticks_to_ns((later - earlier) as i128)
-        .max(0)
-        .min(u64::MAX as i128) as u64
-}
-
-fn abs_tick_delta_ns(a: u64, b: u64) -> u64 {
-    ticks_to_ns((a as i128) - (b as i128))
-        .unsigned_abs()
-        .min(u128::from(u64::MAX)) as u64
-}
-
-fn elapsed_ticks_to_ns_if_set(later: u64, earlier: u64) -> u64 {
-    if later == 0 || earlier == 0 {
-        0
-    } else {
-        elapsed_ticks_to_ns(later, earlier)
-    }
-}
 
 fn probe_timing_breakdown(probe: &ProbeResultRecord, kperf_ts: u64) -> ProbeTimingBreakdown {
     ProbeTimingBreakdown {
@@ -1579,30 +1527,6 @@ fn raw_is_dwarf_richer_than_fp(raw: &RawEntry) -> bool {
             .any(|pc| !raw.probe_stack.contains(pc))
 }
 
-fn longest_common_run(a: &[u64], b: &[u64]) -> usize {
-    let mut best = 0usize;
-    for i in 0..a.len() {
-        for j in 0..b.len() {
-            let mut k = 0usize;
-            while i + k < a.len() && j + k < b.len() && a[i + k] == b[j + k] {
-                k += 1;
-            }
-            best = best.max(k);
-        }
-    }
-    best
-}
-
-fn logical_probe_stack(pc: u64, lr: u64, walked: &[u64]) -> Vec<u64> {
-    let mut stack = Vec::with_capacity(1 + usize::from(lr != 0) + walked.len());
-    stack.push(pc);
-    if lr != 0 && lr != pc && walked.first().copied() != Some(lr) {
-        stack.push(lr);
-    }
-    stack.extend_from_slice(walked);
-    stack
-}
-
 /// Render one address as a `ResolvedFrame` using the live registry.
 /// Falls back to `<unmapped:0xaddr>` when no module covers the
 /// address (typical for jit code that didn't fire a BinaryLoaded
@@ -1637,13 +1561,115 @@ mod tests {
     use super::*;
 
     fn ticks_for_ns(ns: u64) -> u64 {
-        let (numer, denom) = mach_timebase_numer_denom();
+        let (numer, denom) = crate::probe_match::mach_timebase_numer_denom();
         if numer == 0 {
             ns
         } else {
             ((u128::from(ns) * u128::from(denom)).div_ceil(u128::from(numer)))
                 .min(u128::from(u64::MAX)) as u64
         }
+    }
+
+    #[test]
+    fn aggregation_uses_validated_enriched_probe_stack() {
+        let mut agg = Aggregator::default();
+        let tid = 7;
+        let ts = ticks_for_ns(1_000_000);
+        let start = ticks_for_ns(900_000);
+        let end = ticks_for_ns(1_100_000);
+
+        agg.record_pet_sample(
+            tid,
+            ts,
+            &[0x10, 0x20, 0x30, 0x40],
+            &[],
+            PmuSample::default(),
+        );
+        agg.record_probe_result(ProbeResultRecord {
+            tid,
+            timing: ProbeTiming {
+                kperf_ts: ts,
+                state_done: ts,
+                ..ProbeTiming::default()
+            },
+            queue: ProbeQueueStats::default(),
+            mach_pc: 0x10,
+            mach_lr: 0,
+            mach_fp: 0,
+            mach_sp: 0,
+            mach_walked: Box::new([0x20, 0x30, 0x40]),
+            compact_walked: Box::new([]),
+            compact_dwarf_walked: Box::new([]),
+            dwarf_walked: Box::new([0x20, 0x30, 0x40, 0x80]),
+            used_framehop: true,
+        });
+        agg.record_interval(tid, start, end, IntervalKind::OnCpu);
+
+        let bins = BinaryRegistry::new();
+        let aggregation = agg.aggregate_all(&bins);
+        let credit = end.saturating_sub(start);
+
+        assert_eq!(aggregation.total_on_cpu_ns, credit);
+        assert_eq!(
+            aggregation.by_address[&0x80].total_on_cpu_ns, credit,
+            "new DWARF caller should receive total attribution"
+        );
+        assert!(
+            aggregation.flame_root.children.contains_key(&0x80),
+            "flame root should start at the enriched caller-most frame"
+        );
+        assert!(
+            !aggregation.flame_root.children.contains_key(&0x40),
+            "raw kperf caller-most frame should not be the root child once enriched"
+        );
+    }
+
+    #[test]
+    fn aggregation_rejects_unvalidated_probe_stack() {
+        let mut agg = Aggregator::default();
+        let tid = 7;
+        let ts = ticks_for_ns(1_000_000);
+        let start = ticks_for_ns(900_000);
+        let end = ticks_for_ns(1_100_000);
+
+        agg.record_pet_sample(
+            tid,
+            ts,
+            &[0x10, 0x20, 0x30, 0x40],
+            &[],
+            PmuSample::default(),
+        );
+        agg.record_probe_result(ProbeResultRecord {
+            tid,
+            timing: ProbeTiming {
+                kperf_ts: ts,
+                state_done: ts,
+                ..ProbeTiming::default()
+            },
+            queue: ProbeQueueStats::default(),
+            mach_pc: 0x10,
+            mach_lr: 0,
+            mach_fp: 0,
+            mach_sp: 0,
+            mach_walked: Box::new([0x20, 0x30, 0x40]),
+            compact_walked: Box::new([]),
+            compact_dwarf_walked: Box::new([]),
+            dwarf_walked: Box::new([0x90, 0x91, 0x92, 0x93]),
+            used_framehop: true,
+        });
+        agg.record_interval(tid, start, end, IntervalKind::OnCpu);
+
+        let bins = BinaryRegistry::new();
+        let aggregation = agg.aggregate_all(&bins);
+
+        assert!(
+            !aggregation.by_address.contains_key(&0x93),
+            "unvalidated DWARF frames must not enter flame/top attribution"
+        );
+        assert!(
+            aggregation.flame_root.children.contains_key(&0x40),
+            "fallback should keep the raw kperf caller-most frame"
+        );
     }
 
     #[test]
@@ -2736,7 +2762,7 @@ fn compute_annotated_view(
 ) -> AnnotatedView {
     let resolved = binaries.write().resolve(address);
 
-    let mut hl = highlight::AsmHighlighter::new();
+    let mut hl = highlight::TokenHighlighter::new();
     let mut lines: Vec<AnnotatedLine> = match &resolved {
         Some(r) => disassemble::disassemble(r, &mut hl, |addr| self_lookup(addr)),
         None => Vec::new(),
@@ -2752,11 +2778,11 @@ fn compute_annotated_view(
             let here = src.locate(&r.binary_path, image, svma);
             if here != last {
                 if let Some((ref file, ln)) = here {
-                    let html = src.snippet(file, ln);
+                    let tokens = src.snippet(file, ln);
                     line.source_header = Some(stax_live_proto::SourceHeader {
                         file: file.clone(),
                         line: ln,
-                        html,
+                        tokens,
                     });
                 }
                 last = here;

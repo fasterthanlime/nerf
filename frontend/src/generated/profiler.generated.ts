@@ -74,15 +74,50 @@ export interface TopUpdate {
   entries: TopEntry[];
 }
 
+export type TokenClass =
+  | { tag: 'Plain' }
+  | { tag: 'Keyword' }
+  | { tag: 'Function' }
+  | { tag: 'String' }
+  | { tag: 'Comment' }
+  | { tag: 'Type' }
+  | { tag: 'Variable' }
+  | { tag: 'Constant' }
+  | { tag: 'Number' }
+  | { tag: 'Operator' }
+  | { tag: 'Punctuation' }
+  | { tag: 'Property' }
+  | { tag: 'Attribute' }
+  | { tag: 'Tag' }
+  | { tag: 'Macro' }
+  | { tag: 'Label' }
+  | { tag: 'Namespace' }
+  | { tag: 'Constructor' }
+  | { tag: 'Title' }
+  | { tag: 'Strong' }
+  | { tag: 'Emphasis' }
+  | { tag: 'Link' }
+  | { tag: 'Literal' }
+  | { tag: 'Strikethrough' }
+  | { tag: 'DiffAdd' }
+  | { tag: 'DiffDelete' }
+  | { tag: 'Embedded' }
+  | { tag: 'Error' };
+
+export interface Token {
+  text: string;
+  kind: TokenClass;
+}
+
 export interface SourceHeader {
   file: string;
   line: number;
-  html: string;
+  tokens: Token[];
 }
 
 export interface AnnotatedLine {
   address: bigint;
-  html: string;
+  tokens: Token[];
   self_on_cpu_ns: bigint;
   self_pet_samples: bigint;
   source_header: SourceHeader | null;
@@ -1410,9 +1445,11 @@ export const profiler_send_schemas: import("@bearcove/vox-core").ServiceSendSche
     [0x915c6fb5b64f270bn, { id: 0x915c6fb5b64f270bn, type_params: ['T0', 'T1', 'T2', 'T3'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }, { tag: 'var', name: 'T2' }, { tag: 'var', name: 'T3' }] } }],
     [0xbc5c33249a2dc720n, { id: 0xbc5c33249a2dc720n, type_params: [], kind: { tag: 'primitive', primitive_type: 'unit' } }],
     [0xba0496aa8cee7a4cn, { id: 0xba0496aa8cee7a4cn, type_params: ['T0', 'T1'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }] } }],
-    [0xa8c9da7259d0084cn, { id: 0xa8c9da7259d0084cn, type_params: [], kind: { tag: 'struct', name: 'SourceHeader', fields: [{ name: 'file', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'line', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'html', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }],
-    [0x221c376d3d0775c7n, { id: 0x221c376d3d0775c7n, type_params: [], kind: { tag: 'struct', name: 'AnnotatedLine', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'html', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'self_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'source_header', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xa8c9da7259d0084cn, args: [] }] }, required: true }] } }],
-    [0xcac80352e0417711n, { id: 0xcac80352e0417711n, type_params: [], kind: { tag: 'struct', name: 'AnnotatedView', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'base_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'queried_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'lines', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x221c376d3d0775c7n, args: [] }] }, required: true }] } }],
+    [0x1c34189e29fa175dn, { id: 0x1c34189e29fa175dn, type_params: [], kind: { tag: 'enum', name: 'TokenClass', variants: [{ name: 'Plain', index: 0, payload: { tag: 'unit' } }, { name: 'Keyword', index: 1, payload: { tag: 'unit' } }, { name: 'Function', index: 2, payload: { tag: 'unit' } }, { name: 'String', index: 3, payload: { tag: 'unit' } }, { name: 'Comment', index: 4, payload: { tag: 'unit' } }, { name: 'Type', index: 5, payload: { tag: 'unit' } }, { name: 'Variable', index: 6, payload: { tag: 'unit' } }, { name: 'Constant', index: 7, payload: { tag: 'unit' } }, { name: 'Number', index: 8, payload: { tag: 'unit' } }, { name: 'Operator', index: 9, payload: { tag: 'unit' } }, { name: 'Punctuation', index: 10, payload: { tag: 'unit' } }, { name: 'Property', index: 11, payload: { tag: 'unit' } }, { name: 'Attribute', index: 12, payload: { tag: 'unit' } }, { name: 'Tag', index: 13, payload: { tag: 'unit' } }, { name: 'Macro', index: 14, payload: { tag: 'unit' } }, { name: 'Label', index: 15, payload: { tag: 'unit' } }, { name: 'Namespace', index: 16, payload: { tag: 'unit' } }, { name: 'Constructor', index: 17, payload: { tag: 'unit' } }, { name: 'Title', index: 18, payload: { tag: 'unit' } }, { name: 'Strong', index: 19, payload: { tag: 'unit' } }, { name: 'Emphasis', index: 20, payload: { tag: 'unit' } }, { name: 'Link', index: 21, payload: { tag: 'unit' } }, { name: 'Literal', index: 22, payload: { tag: 'unit' } }, { name: 'Strikethrough', index: 23, payload: { tag: 'unit' } }, { name: 'DiffAdd', index: 24, payload: { tag: 'unit' } }, { name: 'DiffDelete', index: 25, payload: { tag: 'unit' } }, { name: 'Embedded', index: 26, payload: { tag: 'unit' } }, { name: 'Error', index: 27, payload: { tag: 'unit' } }] } }],
+    [0x95417231062e40c8n, { id: 0x95417231062e40c8n, type_params: [], kind: { tag: 'struct', name: 'Token', fields: [{ name: 'text', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'kind', type_ref: { tag: 'concrete', type_id: 0x1c34189e29fa175dn, args: [] }, required: true }] } }],
+    [0x6ad4e5d6d2c71282n, { id: 0x6ad4e5d6d2c71282n, type_params: [], kind: { tag: 'struct', name: 'SourceHeader', fields: [{ name: 'file', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'line', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'tokens', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x95417231062e40c8n, args: [] }] }, required: true }] } }],
+    [0x93275aeab6d29116n, { id: 0x93275aeab6d29116n, type_params: [], kind: { tag: 'struct', name: 'AnnotatedLine', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'tokens', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x95417231062e40c8n, args: [] }] }, required: true }, { name: 'self_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'source_header', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6ad4e5d6d2c71282n, args: [] }] }, required: true }] } }],
+    [0xa1273c4df9ab491an, { id: 0xa1273c4df9ab491an, type_params: [], kind: { tag: 'struct', name: 'AnnotatedView', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'base_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'queried_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'lines', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x93275aeab6d29116n, args: [] }] }, required: true }] } }],
     [0x6847ab90feda71c1n, { id: 0x6847ab90feda71c1n, type_params: ['T0'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }] } }],
     [0xacd4834091495bcen, { id: 0xacd4834091495bcen, type_params: [], kind: { tag: 'struct', name: 'FlameNode', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu_intervals', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'children', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xacd4834091495bcen, args: [] }] }, required: true }] } }],
     [0x240883a6784a0dden, { id: 0x240883a6784a0dden, type_params: [], kind: { tag: 'struct', name: 'FlamegraphUpdate', fields: [{ name: 'total_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'strings', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'root', type_ref: { tag: 'concrete', type_id: 0xacd4834091495bcen, args: [] }, required: true }] } }],
@@ -1445,8 +1482,8 @@ export const profiler_send_schemas: import("@bearcove/vox-core").ServiceSendSche
     [0x7d9fe97f38add11fn, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xf37cef8f274712ban, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x5e5b065bf333971bn, { argsRootRef: { tag: 'concrete', type_id: 0x915c6fb5b64f270bn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, { tag: 'concrete', type_id: 0xa9bc52fb11aa78c0n, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xf37cef8f274712ban, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xe2829a21383119b4n, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0xf202b32106aebf48n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xcac80352e0417711n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
-    [0xbd08d48f35f68c69n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xcac80352e0417711n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xf202b32106aebf48n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xa1273c4df9ab491an, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xbd08d48f35f68c69n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xa1273c4df9ab491an, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x4daac56b194b862fn, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x240883a6784a0dden, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x6889c2c730466af0n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x240883a6784a0dden, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x33fb58adecb28dean, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x2c384616cb5c3aden, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],

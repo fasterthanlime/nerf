@@ -65,20 +65,11 @@ pub struct RaceKperfSink<S> {
 
 #[derive(Clone, Copy, Debug)]
 pub enum RaceProbeMode {
-    Triggered,
     /// Independently issue at most `frequency_hz` probe requests per
     /// second across the target process. Kperf observations maintain a
     /// decaying per-tid demand score, and each tick probes the tid with
     /// the highest current demand.
-    Correlated {
-        frequency_hz: u32,
-    },
-}
-
-impl RaceProbeMode {
-    fn is_correlated(self) -> bool {
-        matches!(self, Self::Correlated { .. })
-    }
+    Correlated { frequency_hz: u32 },
 }
 
 impl<S> RaceKperfSink<S> {
@@ -375,30 +366,26 @@ impl RaceProbeWorker {
                 );
             })
             .expect("spawn race probe worker");
-        if let RaceProbeMode::Correlated { frequency_hz } = mode {
-            let sampler_requests = requests.clone();
-            let sampler_thread_demands = thread_demands.clone();
-            let sampler_enqueued = Arc::new(AtomicU64::new(0));
-            let sampler_enqueued_for_thread = sampler_enqueued.clone();
-            std::thread::Builder::new()
-                .name("stax-corr-probe-timer".to_owned())
-                .spawn(move || {
-                    periodic_probe_sampler(
-                        sampler_requests,
-                        sampler_thread_demands,
-                        sampler_enqueued_for_thread,
-                        frequency_hz,
-                    )
-                })
-                .expect("spawn correlated probe sampler");
-        }
+        let RaceProbeMode::Correlated { frequency_hz } = mode;
+        let sampler_requests = requests.clone();
+        let sampler_thread_demands = thread_demands.clone();
+        let sampler_enqueued = Arc::new(AtomicU64::new(0));
+        let sampler_enqueued_for_thread = sampler_enqueued.clone();
+        std::thread::Builder::new()
+            .name("stax-corr-probe-timer".to_owned())
+            .spawn(move || {
+                periodic_probe_sampler(
+                    sampler_requests,
+                    sampler_thread_demands,
+                    sampler_enqueued_for_thread,
+                    frequency_hz,
+                )
+            })
+            .expect("spawn correlated probe sampler");
         Self {
             trigger: RaceProbeTrigger {
                 requests,
                 thread_demands,
-                mode,
-                enqueued_probe_requests: Arc::new(AtomicU64::new(0)),
-                coalesced_probe_requests: Arc::new(AtomicU64::new(0)),
             },
             res_rx,
             image_tx,
@@ -458,60 +445,14 @@ impl Drop for RaceProbeWorker {
 pub struct RaceProbeTrigger {
     requests: Arc<LatestProbeRequests>,
     thread_demands: Arc<ThreadDemandTracker>,
-    mode: RaceProbeMode,
-    enqueued_probe_requests: Arc<AtomicU64>,
-    coalesced_probe_requests: Arc<AtomicU64>,
 }
 
 impl RaceProbeTrigger {
-    /// Enqueue immediately when the raw kdebug stream shows a kperf
-    /// sample start. Returns true when this replaced an older pending
-    /// request for the same tid; that is intentional because
-    /// race-kperf wants fresh observations, not FIFO delivery.
-    pub fn enqueue(&self, tid: u32, trigger: KperfProbeTriggerTiming) -> bool {
-        if !self.thread_demands.observe(tid) {
-            return false;
-        }
-        if self.mode.is_correlated() {
-            return false;
-        }
-        let enqueued = self
-            .enqueued_probe_requests
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let enqueued_ticks = unsafe { mach_absolute_time() };
-        let replaced = self.requests.push(ProbeRequest {
-            tid,
-            timing: probe_timing_from_trigger(trigger, enqueued_ticks),
-            coalesced_requests: 0,
-        });
-        if enqueued == 1 {
-            tracing::info!(
-                tid,
-                kperf_ts = trigger.kperf_ts,
-                replaced,
-                "race-kperf first probe request enqueued"
-            );
-        } else if enqueued.is_multiple_of(1024) {
-            tracing::debug!(
-                enqueued,
-                coalesced = self.coalesced_probe_requests.load(Ordering::Relaxed),
-                "race-kperf probe requests enqueued"
-            );
-        }
-        if replaced {
-            let coalesced = self
-                .coalesced_probe_requests
-                .fetch_add(1, Ordering::Relaxed)
-                .saturating_add(1);
-            if coalesced.is_multiple_of(1024) {
-                tracing::warn!(
-                    coalesced,
-                    "race-kperf probe worker lagging; replacing stale pending requests"
-                );
-            }
-        }
-        replaced
+    /// Record demand for this tid; the correlated sampler decides
+    /// when to issue the actual probe.
+    pub fn enqueue(&self, tid: u32, _trigger: KperfProbeTriggerTiming) -> bool {
+        self.thread_demands.observe(tid);
+        false
     }
 
     fn close(&self) {
@@ -903,19 +844,6 @@ struct ProbeRequest {
     tid: u32,
     timing: ProbeTiming,
     coalesced_requests: u64,
-}
-
-fn probe_timing_from_trigger(trigger: KperfProbeTriggerTiming, enqueued: u64) -> ProbeTiming {
-    ProbeTiming {
-        kperf_ts: trigger.kperf_ts,
-        staxd_read_started: trigger.staxd_read_started,
-        staxd_drained: trigger.staxd_drained,
-        staxd_queued_for_send: trigger.staxd_queued_for_send,
-        staxd_send_started: trigger.staxd_send_started,
-        client_received: trigger.client_received,
-        enqueued,
-        ..ProbeTiming::default()
-    }
 }
 
 fn correlated_probe_timing(request_ticks: u64) -> ProbeTiming {

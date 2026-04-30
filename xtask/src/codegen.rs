@@ -52,14 +52,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let common = vox_codegen::targets::swift::generate_common_types(&services);
     write_if_changed(&swift_dir.join("Common.generated.swift"), common)?;
 
-    // Theme CSS: catppuccin-mocha, scoped to anywhere we render
-    // arborium-highlighted content (asm pane + interleaved source
-    // snippets). `:where()` keeps specificity at zero so explicit
-    // overrides in index.css still win.
-    let theme = arborium_theme::theme::builtin::catppuccin_mocha();
-    let css = theme.to_css(":where(.asm-line, .src-snip)");
-    write_if_changed(&ts_dir.join("theme.css"), css)?;
-
     Ok(())
 }
 

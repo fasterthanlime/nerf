@@ -99,11 +99,6 @@ struct Cli {
     #[facet(args::named, default)]
     time_limit: Option<u64>,
 
-    /// Evaluation mode: for each parsed kperf sample, suspend that
-    /// exact Mach thread and emit a paired probe result.
-    #[facet(args::named, default)]
-    race_kperf: bool,
-
     /// Evaluation mode: independently sample target threads at the
     /// correlation frequency, then correlate with nearest kperf samples.
     #[facet(args::named, default)]
@@ -268,7 +263,6 @@ async fn run_recording(
         launched_pid,
         has_pre_resume = pre_resume.is_some(),
         has_terminal = terminal.is_some(),
-        race_kperf = cli.race_kperf,
         correlate_kperf = cli.correlate_kperf,
         frequency_hz = cli.frequency,
         correlate_frequency_hz = cli.correlate_frequency.unwrap_or(cli.frequency),
@@ -316,8 +310,6 @@ async fn run_recording(
         Some(probe::RaceProbeMode::Correlated {
             frequency_hz: cli.correlate_frequency.unwrap_or(cli.frequency),
         })
-    } else if cli.race_kperf {
-        Some(probe::RaceProbeMode::Triggered)
     } else {
         None
     };
@@ -335,11 +327,6 @@ async fn run_recording(
         frequency_hz: cli.frequency,
         duration: cli.time_limit.map(Duration::from_secs),
         telemetry: Some(telemetry.clone()),
-        kdebug_filter: if cli.race_kperf || cli.correlate_kperf {
-            staxd_client::KdebugFilter::RaceKperfOnly
-        } else {
-            staxd_client::KdebugFilter::Live
-        },
         ..Default::default()
     };
     let drive_pid = opts.pid;
