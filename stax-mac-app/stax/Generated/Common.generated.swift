@@ -223,6 +223,55 @@ public struct AnnotatedView: Codable, Sendable {
     }
 }
 
+public struct BasicBlock: Codable, Sendable {
+    public var id: UInt32
+    public var startAddress: UInt64
+    public var lines: [AnnotatedLine]
+
+    nonisolated public init(id: UInt32, startAddress: UInt64, lines: [AnnotatedLine]) {
+        self.id = id
+        self.startAddress = startAddress
+        self.lines = lines
+    }
+}
+
+public enum CfgEdgeKind: Codable, Sendable {
+    case `fallthrough`
+    case branch
+    case conditionalBranch
+    case call
+}
+
+public struct CfgEdge: Codable, Sendable {
+    public var fromId: UInt32
+    public var toId: UInt32
+    public var kind: CfgEdgeKind
+
+    nonisolated public init(fromId: UInt32, toId: UInt32, kind: CfgEdgeKind) {
+        self.fromId = fromId
+        self.toId = toId
+        self.kind = kind
+    }
+}
+
+public struct CfgUpdate: Codable, Sendable {
+    public var functionName: String
+    public var language: String
+    public var baseAddress: UInt64
+    public var queriedAddress: UInt64
+    public var blocks: [BasicBlock]
+    public var edges: [CfgEdge]
+
+    nonisolated public init(functionName: String, language: String, baseAddress: UInt64, queriedAddress: UInt64, blocks: [BasicBlock], edges: [CfgEdge]) {
+        self.functionName = functionName
+        self.language = language
+        self.baseAddress = baseAddress
+        self.queriedAddress = queriedAddress
+        self.blocks = blocks
+        self.edges = edges
+    }
+}
+
 public struct FlameNode: Codable, Sendable {
     public var address: UInt64
     public var functionName: UInt32?
@@ -1417,6 +1466,40 @@ nonisolated internal func encodeAnnotatedView(_ value: AnnotatedView, into buffe
     encodeVec(value.lines, into: &buffer, encoder: { val, buf in encodeAnnotatedLine(val, into: &buf) })
 }
 
+nonisolated internal func encodeBasicBlock(_ value: BasicBlock, into buffer: inout ByteBuffer) {
+    encodeU32(value.id, into: &buffer)
+    encodeVarint(value.startAddress, into: &buffer)
+    encodeVec(value.lines, into: &buffer, encoder: { val, buf in encodeAnnotatedLine(val, into: &buf) })
+}
+
+nonisolated internal func encodeCfgEdgeKind(_ value: CfgEdgeKind, into buffer: inout ByteBuffer) {
+    switch value {
+    case .`fallthrough`:
+        encodeVarint(UInt64(0), into: &buffer)
+    case .branch:
+        encodeVarint(UInt64(1), into: &buffer)
+    case .conditionalBranch:
+        encodeVarint(UInt64(2), into: &buffer)
+    case .call:
+        encodeVarint(UInt64(3), into: &buffer)
+    }
+}
+
+nonisolated internal func encodeCfgEdge(_ value: CfgEdge, into buffer: inout ByteBuffer) {
+    encodeU32(value.fromId, into: &buffer)
+    encodeU32(value.toId, into: &buffer)
+    encodeCfgEdgeKind(value.kind, into: &buffer)
+}
+
+nonisolated internal func encodeCfgUpdate(_ value: CfgUpdate, into buffer: inout ByteBuffer) {
+    encodeString(value.functionName, into: &buffer)
+    encodeString(value.language, into: &buffer)
+    encodeVarint(value.baseAddress, into: &buffer)
+    encodeVarint(value.queriedAddress, into: &buffer)
+    encodeVec(value.blocks, into: &buffer, encoder: { val, buf in encodeBasicBlock(val, into: &buf) })
+    encodeVec(value.edges, into: &buffer, encoder: { val, buf in encodeCfgEdge(val, into: &buf) })
+}
+
 nonisolated internal func encodeFlameNode(_ value: FlameNode, into buffer: inout ByteBuffer) {
     encodeVarint(value.address, into: &buffer)
     encodeOption(value.functionName, into: &buffer, encoder: { val, buf in encodeU32(val, into: &buf) })
@@ -2257,6 +2340,48 @@ nonisolated internal func decodeAnnotatedView(from buffer: inout ByteBuffer) thr
     let _queriedAddress = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
     let _lines = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeAnnotatedLine(from: &buf) }) })(&buffer)
     return AnnotatedView(functionName: _functionName, language: _language, baseAddress: _baseAddress, queriedAddress: _queriedAddress, lines: _lines)
+}
+
+nonisolated internal func decodeBasicBlock(from buffer: inout ByteBuffer) throws -> BasicBlock {
+    let _id = try ({ buf in try decodeU32(from: &buf) })(&buffer)
+    let _startAddress = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _lines = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeAnnotatedLine(from: &buf) }) })(&buffer)
+    return BasicBlock(id: _id, startAddress: _startAddress, lines: _lines)
+}
+
+nonisolated internal func decodeCfgEdgeKind(from buffer: inout ByteBuffer) throws -> CfgEdgeKind {
+    let disc = try decodeVarint(from: &buffer)
+    let result: CfgEdgeKind
+    switch disc {
+    case 0:
+        result = .`fallthrough`
+    case 1:
+        result = .branch
+    case 2:
+        result = .conditionalBranch
+    case 3:
+        result = .call
+    default:
+        throw VoxError.decodeError("unknown enum variant")
+    }
+    return result
+}
+
+nonisolated internal func decodeCfgEdge(from buffer: inout ByteBuffer) throws -> CfgEdge {
+    let _fromId = try ({ buf in try decodeU32(from: &buf) })(&buffer)
+    let _toId = try ({ buf in try decodeU32(from: &buf) })(&buffer)
+    let _kind = try ({ buf in try decodeCfgEdgeKind(from: &buf) })(&buffer)
+    return CfgEdge(fromId: _fromId, toId: _toId, kind: _kind)
+}
+
+nonisolated internal func decodeCfgUpdate(from buffer: inout ByteBuffer) throws -> CfgUpdate {
+    let _functionName = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _language = try ({ buf in try decodeString(from: &buf) })(&buffer)
+    let _baseAddress = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _queriedAddress = try ({ buf in try decodeVarint(from: &buf) })(&buffer)
+    let _blocks = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeBasicBlock(from: &buf) }) })(&buffer)
+    let _edges = try ({ buf in try decodeVec(from: &buf, decoder: { buf in try decodeCfgEdge(from: &buf) }) })(&buffer)
+    return CfgUpdate(functionName: _functionName, language: _language, baseAddress: _baseAddress, queriedAddress: _queriedAddress, blocks: _blocks, edges: _edges)
 }
 
 nonisolated internal func decodeFlameNode(from buffer: inout ByteBuffer) throws -> FlameNode {

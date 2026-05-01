@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::RwLock;
 
 use stax_live_proto::{
-    AnnotatedLine, AnnotatedView, FlameNode, FlamegraphUpdate, IntervalEntry, IntervalListUpdate,
-    LiveFilter, NeighborsUpdate, PetSampleEntry, PetSampleListUpdate, ProbeDiffBucket,
-    ProbeDiffDepthCell, ProbeDiffEntry, ProbeDiffThread, ProbeDiffUpdate, ProbeTimingBreakdown,
-    ProbeTimingSummary, Profiler, ResolvedFrame, STITCH_MIN_SUFFIX, ThreadInfo, ThreadsUpdate,
-    TimelineBucket, TimelineUpdate, TopEntry, TopSort, TopUpdate, ViewParams,
+    AnnotatedLine, AnnotatedView, CfgUpdate, FlameNode, FlamegraphUpdate, IntervalEntry,
+    IntervalListUpdate, LiveFilter, NeighborsUpdate, PetSampleEntry, PetSampleListUpdate,
+    ProbeDiffBucket, ProbeDiffDepthCell, ProbeDiffEntry, ProbeDiffThread, ProbeDiffUpdate,
+    ProbeTimingBreakdown, ProbeTimingSummary, Profiler, ResolvedFrame, STITCH_MIN_SUFFIX,
+    ThreadInfo, ThreadsUpdate, TimelineBucket, TimelineUpdate, TopEntry, TopSort, TopUpdate,
+    ViewParams,
 };
 
 use crate::aggregator::{Aggregation, EventCtx, OffCpuBreakdown, PmcAccum, StackNode};
@@ -25,6 +26,7 @@ use crate::probe_match::{
 
 mod aggregator;
 mod binaries;
+mod cfg;
 mod classify;
 mod disassemble;
 mod highlight;
@@ -221,6 +223,62 @@ impl Profiler for LiveServer {
                         address = format!("{:#x}", address),
                         ?tid,
                         "subscribe_annotated: stream ended: {e:?}"
+                    );
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn cfg(&self, address: u64, params: ViewParams) -> CfgUpdate {
+        let ViewParams { tid, filter } = params;
+        let by_address = {
+            let agg = self.aggregator.read();
+            let bins = self.binaries.read();
+            aggregate_with_filter(&agg, &bins, tid, &filter).by_address
+        };
+        compute_cfg_view(&self.binaries, address, |a| {
+            by_address
+                .get(&a)
+                .map(|s| (s.self_on_cpu_ns, s.self_pet_samples))
+                .unwrap_or((0, 0))
+        })
+    }
+
+    async fn subscribe_cfg(&self, address: u64, params: ViewParams, output: vox::Tx<CfgUpdate>) {
+        let ViewParams { tid, filter } = params;
+        tracing::info!(
+            address = format!("{:#x}", address),
+            ?tid,
+            "subscribe_cfg: starting stream"
+        );
+        let aggregator = self.aggregator.clone();
+        let binaries = self.binaries.clone();
+        let revision = self.revision.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            let mut last_seen = None;
+            loop {
+                interval.tick().await;
+                if !should_publish_revision(&revision, &mut last_seen) {
+                    continue;
+                }
+                let by_address = {
+                    let agg = aggregator.read();
+                    let bins = binaries.read();
+                    aggregate_with_filter(&agg, &bins, tid, &filter).by_address
+                };
+                let view = compute_cfg_view(&binaries, address, |a| {
+                    by_address
+                        .get(&a)
+                        .map(|s| (s.self_on_cpu_ns, s.self_pet_samples))
+                        .unwrap_or((0, 0))
+                });
+                if let Err(e) = output.send(view).await {
+                    tracing::info!(
+                        address = format!("{:#x}", address),
+                        ?tid,
+                        "subscribe_cfg: stream ended: {e:?}"
                     );
                     break;
                 }
@@ -2750,6 +2808,31 @@ fn build_children(
         });
     }
     visible
+}
+
+/// `self_lookup` returns `(self_on_cpu_ns, self_pet_samples)` for an
+/// address, used to populate the CFG block heatmap.
+fn compute_cfg_view(
+    binaries: &Arc<RwLock<binaries::BinaryRegistry>>,
+    address: u64,
+    self_lookup: impl Fn(u64) -> (u64, u64),
+) -> CfgUpdate {
+    let resolved = binaries.write().resolve(address);
+    match resolved {
+        Some(r) => {
+            let function_name = r.function_name.clone();
+            let language = r.language.as_str().to_owned();
+            cfg::compute_cfg_update(&r, address, function_name, language, self_lookup)
+        }
+        None => CfgUpdate {
+            function_name: format!("(no binary mapped at {:#x})", address),
+            language: stax_demangle::Language::Unknown.as_str().to_owned(),
+            base_address: address,
+            queried_address: address,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+        },
+    }
 }
 
 /// `self_lookup` returns `(self_on_cpu_ns, self_pet_samples)` for an

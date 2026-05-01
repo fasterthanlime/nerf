@@ -38,6 +38,7 @@ final class AppModel {
             guard oldValue != focusedAddress else { return }
             restartAnnotatedSubscription()
             restartNeighborsSubscription()
+            restartCfgSubscription()
         }
     }
 
@@ -108,6 +109,11 @@ final class AppModel {
     /// Populated by `subscribe_annotated` while a function is focused;
     /// nil while the flame graph is the top pane.
     var annotated: AnnotatedView? = nil
+
+    /// Live CFG (basic blocks + edges) for the focused function.
+    /// Populated by `subscribe_cfg` while a function is focused;
+    /// nil otherwise. Heatmap stats live on each block's `lines`.
+    var cfg: CfgUpdate? = nil
 
     /// Time-bucketed activity for the minimap. Always relative to
     /// the full recording (no filter); brush selection happens on
@@ -307,12 +313,14 @@ final class AppModel {
         var timeline: Int = 0
         var neighbors: Int = 0
         var annotated: Int = 0
+        var cfg: Int = 0
     }
     /// Restartable subscriptions: cancel + relaunch every time
-    /// `focusedFunctionId` changes. Both hold nil while the flame
+    /// `focusedFunctionId` changes. All hold nil while the flame
     /// graph is the top pane.
     private var annotatedTask: Task<Void, Never>?
     private var neighborsTask: Task<Void, Never>?
+    private var cfgTask: Task<Void, Never>?
 
     /// Connect to stax-server, then start polling tasks that drive
     /// live-data fields (`threads`, `functions`, total stats, …).
@@ -497,6 +505,43 @@ final class AppModel {
 
         annotatedTask = Task { [weak self] in
             await self?.runAnnotatedSubscription(client: client, address: address)
+        }
+    }
+
+    /// Cancel any in-flight CFG subscription and start a new one for
+    /// the currently-focused address (if any).
+    private func restartCfgSubscription() {
+        cfgTask?.cancel()
+        cfgTask = nil
+        cfg = nil
+        guard let address = focusedAddress else { return }
+        guard case .ready(let client) = service.state else { return }
+
+        cfgTask = Task { [weak self] in
+            await self?.runCfgSubscription(client: client, address: address)
+        }
+    }
+
+    private func runCfgSubscription(client: ProfilerClient, address: UInt64) async {
+        while !Task.isCancelled {
+            let params = ViewParams(
+                tid: model_tidFilterAsU32(),
+                filter: LiveFilter(timeRange: nil, excludeSymbols: [])
+            )
+            do {
+                let update = try await client.cfg(address: address, params: params)
+                NSLog(
+                    "stax: cfg update for %@ (%d blocks, %d edges)",
+                    update.functionName,
+                    update.blocks.count,
+                    update.edges.count
+                )
+                self.streamStats.cfg += 1
+                self.cfg = update
+            } catch {
+                NSLog("stax: cfg poll failed: %@", "\(error)")
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
     }
 

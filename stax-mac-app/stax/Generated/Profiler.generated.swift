@@ -14,6 +14,8 @@ public enum ProfilerMethodId {
     public static let totalOnCpuNs: UInt64 = 0xe2829a21383119b4
     public static let annotated: UInt64 = 0xf202b32106aebf48
     public static let subscribeAnnotated: UInt64 = 0xbd08d48f35f68c69
+    public static let cfg: UInt64 = 0xa51313779f167012
+    public static let subscribeCfg: UInt64 = 0x0d1944323567b370
     public static let flamegraph: UInt64 = 0x4daac56b194b862f
     public static let subscribeFlamegraph: UInt64 = 0x6889c2c730466af0
     public static let threads: UInt64 = 0x33fb58adecb28dea
@@ -51,6 +53,12 @@ public protocol ProfilerCaller {
     func totalOnCpuNs() async throws -> UInt64
     func annotated(address: UInt64, params: ViewParams) async throws -> AnnotatedView
     func subscribeAnnotated(address: UInt64, params: ViewParams, output: UnboundTx<AnnotatedView>) async throws
+    ///  Function-scoped CFG (basic blocks + edges) for the function
+    ///  containing `address`. Heatmap stats live on each block's
+    ///  `lines`, so subscribers can keep colours fresh as samples
+    ///  land.
+    func cfg(address: UInt64, params: ViewParams) async throws -> CfgUpdate
+    func subscribeCfg(address: UInt64, params: ViewParams, output: UnboundTx<CfgUpdate>) async throws
     func flamegraph(params: ViewParams) async throws -> FlamegraphUpdate
     func subscribeFlamegraph(params: ViewParams, output: UnboundTx<FlamegraphUpdate>) async throws
     func threads() async throws -> ThreadsUpdate
@@ -249,6 +257,50 @@ public final class ProfilerClient: ProfilerCaller, Sendable {
         let prepared = await prepareRetry()
 
         let response = try await connection.call(methodId: 0xbd08d48f35f68c69, metadata: [], payload: prepared.payload, retry: .volatile, timeout: timeout, prepareRetry: prepareRetry, finalizeChannels: { finalizeBoundChannels(argsRoot: profiler_method_schemas[0xbd08d48f35f68c69]!.argsRoot, schemaRegistry: profiler_schema_registry, args: [address, params, output]) }, schemaInfo: schemaInfo)
+        try decodeInfallibleResponse(response) { _ in }
+    }
+
+    public func cfg(address: UInt64, params: ViewParams) async throws -> CfgUpdate {
+        var buffer = ByteBufferAllocator().buffer(capacity: 64)
+        encodeVarint(address, into: &buffer)
+        encodeViewParams(params, into: &buffer)
+        let payload = buffer.readBytes(length: buffer.readableBytes) ?? []
+        let schemaInfo = ClientSchemaInfo(methodInfo: profiler_method_schemas[0xa51313779f167012]!, schemaRegistry: profiler_schema_registry)
+        let response = try await connection.call(methodId: 0xa51313779f167012, metadata: [], payload: payload, retry: .volatile, timeout: timeout, prepareRetry: nil, finalizeChannels: nil, schemaInfo: schemaInfo)
+        return try decodeInfallibleResponse(response) { buf in
+            let _result_functionName = try decodeString(from: &buf)
+            let _result_language = try decodeString(from: &buf)
+            let _result_baseAddress = try decodeVarint(from: &buf)
+            let _result_queriedAddress = try decodeVarint(from: &buf)
+            let _result_blocks = try decodeVec(from: &buf, decoder: { buf in try decodeBasicBlock(from: &buf) })
+            let _result_edges = try decodeVec(from: &buf, decoder: { buf in try decodeCfgEdge(from: &buf) })
+            let result = CfgUpdate(functionName: _result_functionName, language: _result_language, baseAddress: _result_baseAddress, queriedAddress: _result_queriedAddress, blocks: _result_blocks, edges: _result_edges)
+            return result
+        }
+    }
+
+    public func subscribeCfg(address: UInt64, params: ViewParams, output: UnboundTx<CfgUpdate>) async throws {
+        let schemaInfo = ClientSchemaInfo(methodInfo: profiler_method_schemas[0x0d1944323567b370]!, schemaRegistry: profiler_schema_registry)
+        let prepareRetry: @Sendable () async -> PreparedRetryRequest = { [connection] in
+            await bindChannels(
+                argsRoot: profiler_method_schemas[0x0d1944323567b370]!.argsRoot,
+                schemaRegistry: profiler_schema_registry,
+                args: [address, params, output],
+                allocator: connection.channelAllocator,
+                incomingRegistry: connection.incomingChannelRegistry,
+                taskSender: connection.taskSender,
+            )
+
+            var buffer = ByteBufferAllocator().buffer(capacity: 64)
+            encodeVarint(address, into: &buffer)
+            encodeViewParams(params, into: &buffer)
+            encodeVarint(output.channelId, into: &buffer)
+            let payload = buffer.readBytes(length: buffer.readableBytes) ?? []
+            return PreparedRetryRequest(payload: payload)
+        }
+        let prepared = await prepareRetry()
+
+        let response = try await connection.call(methodId: 0x0d1944323567b370, metadata: [], payload: prepared.payload, retry: .volatile, timeout: timeout, prepareRetry: prepareRetry, finalizeChannels: { finalizeBoundChannels(argsRoot: profiler_method_schemas[0x0d1944323567b370]!.argsRoot, schemaRegistry: profiler_schema_registry, args: [address, params, output]) }, schemaInfo: schemaInfo)
         try decodeInfallibleResponse(response) { _ in }
     }
 
@@ -771,6 +823,7 @@ extension ProfilerClient: ExpectedRootClient {
 /// Global schema registry containing all schemas for this service.
 nonisolated(unsafe) public let profiler_schema_registry: [UInt64: Schema] = [
     0x0a96b404b4d79d67: Schema(id: 0x0a96b404b4d79d67, typeParams: ["T"], kind: .list(element: .var(name: "T"))),
+    0x13e828c618057e03: Schema(id: 0x13e828c618057e03, typeParams: [], kind: .struct(name: "CfgEdge", fields: [FieldSchema(name: "from_id", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "to_id", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "kind", typeRef: .concrete(0x770a32f131a3e58d), required: true)])),
     0x178367a87f66fb46: Schema(id: 0x178367a87f66fb46, typeParams: [], kind: .primitive(.bool)),
     0x1c34189e29fa175d: Schema(id: 0x1c34189e29fa175d, typeParams: [], kind: .enum(name: "TokenClass", variants: [VariantSchema(name: "Plain", index: 0, payload: .unit), VariantSchema(name: "Keyword", index: 1, payload: .unit), VariantSchema(name: "Function", index: 2, payload: .unit), VariantSchema(name: "String", index: 3, payload: .unit), VariantSchema(name: "Comment", index: 4, payload: .unit), VariantSchema(name: "Type", index: 5, payload: .unit), VariantSchema(name: "Variable", index: 6, payload: .unit), VariantSchema(name: "Constant", index: 7, payload: .unit), VariantSchema(name: "Number", index: 8, payload: .unit), VariantSchema(name: "Operator", index: 9, payload: .unit), VariantSchema(name: "Punctuation", index: 10, payload: .unit), VariantSchema(name: "Property", index: 11, payload: .unit), VariantSchema(name: "Attribute", index: 12, payload: .unit), VariantSchema(name: "Tag", index: 13, payload: .unit), VariantSchema(name: "Macro", index: 14, payload: .unit), VariantSchema(name: "Label", index: 15, payload: .unit), VariantSchema(name: "Namespace", index: 16, payload: .unit), VariantSchema(name: "Constructor", index: 17, payload: .unit), VariantSchema(name: "Title", index: 18, payload: .unit), VariantSchema(name: "Strong", index: 19, payload: .unit), VariantSchema(name: "Emphasis", index: 20, payload: .unit), VariantSchema(name: "Link", index: 21, payload: .unit), VariantSchema(name: "Literal", index: 22, payload: .unit), VariantSchema(name: "Strikethrough", index: 23, payload: .unit), VariantSchema(name: "DiffAdd", index: 24, payload: .unit), VariantSchema(name: "DiffDelete", index: 25, payload: .unit), VariantSchema(name: "Embedded", index: 26, payload: .unit), VariantSchema(name: "Error", index: 27, payload: .unit)])),
     0x240883a6784a0dde: Schema(id: 0x240883a6784a0dde, typeParams: [], kind: .struct(name: "FlamegraphUpdate", fields: [FieldSchema(name: "total_on_cpu_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "total_off_cpu", typeRef: .concrete(0xa6544bf68ad6b55c), required: true), FieldSchema(name: "strings", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x6d7dce914ee150e8)]), required: true), FieldSchema(name: "root", typeRef: .concrete(0xacd4834091495bce), required: true)])),
@@ -796,6 +849,7 @@ nonisolated(unsafe) public let profiler_schema_registry: [UInt64: Schema] = [
     0x6ad4e5d6d2c71282: Schema(id: 0x6ad4e5d6d2c71282, typeParams: [], kind: .struct(name: "SourceHeader", fields: [FieldSchema(name: "file", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "line", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "tokens", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x95417231062e40c8)]), required: true)])),
     0x6d7dce914ee150e8: Schema(id: 0x6d7dce914ee150e8, typeParams: [], kind: .primitive(.string)),
     0x6f5fed68b5ace623: Schema(id: 0x6f5fed68b5ace623, typeParams: [], kind: .struct(name: "ViewParams", fields: [FieldSchema(name: "tid", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x281c5be4f2ee63b4)]), required: true), FieldSchema(name: "filter", typeRef: .concrete(0xce2c9daef1e9c914), required: true)])),
+    0x770a32f131a3e58d: Schema(id: 0x770a32f131a3e58d, typeParams: [], kind: .enum(name: "CfgEdgeKind", variants: [VariantSchema(name: "Fallthrough", index: 0, payload: .unit), VariantSchema(name: "Branch", index: 1, payload: .unit), VariantSchema(name: "ConditionalBranch", index: 2, payload: .unit), VariantSchema(name: "Call", index: 3, payload: .unit)])),
     0x850d6eed797249ff: Schema(id: 0x850d6eed797249ff, typeParams: [], kind: .struct(name: "TimelineUpdate", fields: [FieldSchema(name: "bucket_size_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "recording_duration_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "total_on_cpu_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "total_off_cpu_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "buckets", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x32ec7bb903ef97dd)]), required: true)])),
     0x8599bb895806a3a2: Schema(id: 0x8599bb895806a3a2, typeParams: [], kind: .struct(name: "ProbeDiffEntry", fields: [FieldSchema(name: "tid", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "timestamp_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "drift_ns", typeRef: .concrete(0xc6eb8c46f1e17fba), required: true), FieldSchema(name: "timing", typeRef: .concrete(0xa4898f014ca93f92), required: true), FieldSchema(name: "queue", typeRef: .concrete(0x34ae3055219d9613), required: true), FieldSchema(name: "kperf_stack", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa24a048785643f31)]), required: true), FieldSchema(name: "kperf_kernel_stack", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa24a048785643f31)]), required: true), FieldSchema(name: "probe_stack", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa24a048785643f31)]), required: true), FieldSchema(name: "compact_stack", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa24a048785643f31)]), required: true), FieldSchema(name: "compact_dwarf_stack", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa24a048785643f31)]), required: true), FieldSchema(name: "dwarf_stack", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa24a048785643f31)]), required: true), FieldSchema(name: "stitched_stack", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xa24a048785643f31)]), required: true), FieldSchema(name: "common_suffix", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "compact_common_suffix", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "compact_dwarf_common_suffix", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "dwarf_common_suffix", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "pc_match", typeRef: .concrete(0x178367a87f66fb46), required: true), FieldSchema(name: "stitchable", typeRef: .concrete(0x178367a87f66fb46), required: true), FieldSchema(name: "used_framehop", typeRef: .concrete(0x178367a87f66fb46), required: true)])),
     0x8e02f623d1b2310c: Schema(id: 0x8e02f623d1b2310c, typeParams: [], kind: .primitive(.f32)),
@@ -813,6 +867,7 @@ nonisolated(unsafe) public let profiler_schema_registry: [UInt64: Schema] = [
     0xba0496aa8cee7a4c: Schema(id: 0xba0496aa8cee7a4c, typeParams: ["T0", "T1"], kind: .tuple(elements: [.var(name: "T0"), .var(name: "T1")])),
     0xbc5c33249a2dc720: Schema(id: 0xbc5c33249a2dc720, typeParams: [], kind: .primitive(.unit)),
     0xbc88382e830f9c36: Schema(id: 0xbc88382e830f9c36, typeParams: [], kind: .struct(name: "SymbolRef", fields: [FieldSchema(name: "function_name", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x6d7dce914ee150e8)]), required: true), FieldSchema(name: "binary", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x6d7dce914ee150e8)]), required: true)])),
+    0xc1e82f1345ebaccf: Schema(id: 0xc1e82f1345ebaccf, typeParams: [], kind: .struct(name: "BasicBlock", fields: [FieldSchema(name: "id", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "start_address", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "lines", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x93275aeab6d29116)]), required: true)])),
     0xc6eb8c46f1e17fba: Schema(id: 0xc6eb8c46f1e17fba, typeParams: [], kind: .primitive(.i64)),
     0xc886545a493d06eb: Schema(id: 0xc886545a493d06eb, typeParams: ["T"], kind: .channel(direction: .tx, element: .var(name: "T"))),
     0xce2c9daef1e9c914: Schema(id: 0xce2c9daef1e9c914, typeParams: [], kind: .struct(name: "LiveFilter", fields: [FieldSchema(name: "time_range", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x68892f74829bd154)]), required: true), FieldSchema(name: "exclude_symbols", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xbc88382e830f9c36)]), required: true)])),
@@ -822,6 +877,7 @@ nonisolated(unsafe) public let profiler_schema_registry: [UInt64: Schema] = [
     0xdcafd4de6b7969bb: Schema(id: 0xdcafd4de6b7969bb, typeParams: ["T"], kind: .option(element: .var(name: "T"))),
     0xdd37b6551b52fb4f: Schema(id: 0xdd37b6551b52fb4f, typeParams: [], kind: .struct(name: "WakerEntry", fields: [FieldSchema(name: "waker_tid", typeRef: .concrete(0x281c5be4f2ee63b4), required: true), FieldSchema(name: "waker_address", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "waker_function_name", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x6d7dce914ee150e8)]), required: true), FieldSchema(name: "waker_binary", typeRef: .generic(0xdcafd4de6b7969bb, args: [.concrete(0x6d7dce914ee150e8)]), required: true), FieldSchema(name: "language", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "count", typeRef: .concrete(0xd9356298b81639ac), required: true)])),
     0xe0dc192175c3c123: Schema(id: 0xe0dc192175c3c123, typeParams: [], kind: .struct(name: "IntervalListUpdate", fields: [FieldSchema(name: "strings", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x6d7dce914ee150e8)]), required: true), FieldSchema(name: "total_intervals", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "total_duration_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "by_reason", typeRef: .concrete(0xa6544bf68ad6b55c), required: true), FieldSchema(name: "entries", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x697260434424b795)]), required: true)])),
+    0xef67c6ec3e72a790: Schema(id: 0xef67c6ec3e72a790, typeParams: [], kind: .struct(name: "CfgUpdate", fields: [FieldSchema(name: "function_name", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "language", typeRef: .concrete(0x6d7dce914ee150e8), required: true), FieldSchema(name: "base_address", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "queried_address", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "blocks", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0xc1e82f1345ebaccf)]), required: true), FieldSchema(name: "edges", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x13e828c618057e03)]), required: true)])),
     0xf37cef8f274712ba: Schema(id: 0xf37cef8f274712ba, typeParams: [], kind: .struct(name: "TopUpdate", fields: [FieldSchema(name: "total_on_cpu_ns", typeRef: .concrete(0xd9356298b81639ac), required: true), FieldSchema(name: "total_off_cpu", typeRef: .concrete(0xa6544bf68ad6b55c), required: true), FieldSchema(name: "entries", typeRef: .generic(0x0a96b404b4d79d67, args: [.concrete(0x5973fe57ec11dd2f)]), required: true)])),
 ]
 
@@ -860,6 +916,18 @@ nonisolated(unsafe) public let profiler_method_schemas: [UInt64: MethodSchemaInf
     0xbd08d48f35f68c69: MethodSchemaInfo(
         argsSchemaIds: [0xd9356298b81639ac, 0x281c5be4f2ee63b4, 0xdcafd4de6b7969bb, 0x68892f74829bd154, 0x6d7dce914ee150e8, 0xbc88382e830f9c36, 0x0a96b404b4d79d67, 0xce2c9daef1e9c914, 0x6f5fed68b5ace623, 0x1c34189e29fa175d, 0x95417231062e40c8, 0x6ad4e5d6d2c71282, 0x93275aeab6d29116, 0xa1273c4df9ab491a, 0xc886545a493d06eb, 0xaa510ab07d34f141],
         argsRoot: .generic(0xaa510ab07d34f141, args: [.concrete(0xd9356298b81639ac), .concrete(0x6f5fed68b5ace623), .generic(0xc886545a493d06eb, args: [.concrete(0xa1273c4df9ab491a)])]),
+        responseSchemaIds: [0x178367a87f66fb46, 0x281c5be4f2ee63b4, 0x42046de663beeef0, 0x5db70a394660f3e6, 0x6d7dce914ee150e8, 0x4cf4b2aeb98a1939, 0xbc5c33249a2dc720],
+        responseRoot: .generic(0x42046de663beeef0, args: [.concrete(0xbc5c33249a2dc720), .generic(0x4cf4b2aeb98a1939, args: [.concrete(0x5db70a394660f3e6)])])
+    ),
+    0xa51313779f167012: MethodSchemaInfo(
+        argsSchemaIds: [0xd9356298b81639ac, 0x281c5be4f2ee63b4, 0xdcafd4de6b7969bb, 0x68892f74829bd154, 0x6d7dce914ee150e8, 0xbc88382e830f9c36, 0x0a96b404b4d79d67, 0xce2c9daef1e9c914, 0x6f5fed68b5ace623, 0xba0496aa8cee7a4c],
+        argsRoot: .generic(0xba0496aa8cee7a4c, args: [.concrete(0xd9356298b81639ac), .concrete(0x6f5fed68b5ace623)]),
+        responseSchemaIds: [0x178367a87f66fb46, 0x281c5be4f2ee63b4, 0x42046de663beeef0, 0x5db70a394660f3e6, 0x6d7dce914ee150e8, 0x4cf4b2aeb98a1939, 0xd9356298b81639ac, 0x1c34189e29fa175d, 0x95417231062e40c8, 0x0a96b404b4d79d67, 0x6ad4e5d6d2c71282, 0xdcafd4de6b7969bb, 0x93275aeab6d29116, 0xc1e82f1345ebaccf, 0x770a32f131a3e58d, 0x13e828c618057e03, 0xef67c6ec3e72a790],
+        responseRoot: .generic(0x42046de663beeef0, args: [.concrete(0xef67c6ec3e72a790), .generic(0x4cf4b2aeb98a1939, args: [.concrete(0x5db70a394660f3e6)])])
+    ),
+    0x0d1944323567b370: MethodSchemaInfo(
+        argsSchemaIds: [0xd9356298b81639ac, 0x281c5be4f2ee63b4, 0xdcafd4de6b7969bb, 0x68892f74829bd154, 0x6d7dce914ee150e8, 0xbc88382e830f9c36, 0x0a96b404b4d79d67, 0xce2c9daef1e9c914, 0x6f5fed68b5ace623, 0x1c34189e29fa175d, 0x95417231062e40c8, 0x6ad4e5d6d2c71282, 0x93275aeab6d29116, 0xc1e82f1345ebaccf, 0x770a32f131a3e58d, 0x13e828c618057e03, 0xef67c6ec3e72a790, 0xc886545a493d06eb, 0xaa510ab07d34f141],
+        argsRoot: .generic(0xaa510ab07d34f141, args: [.concrete(0xd9356298b81639ac), .concrete(0x6f5fed68b5ace623), .generic(0xc886545a493d06eb, args: [.concrete(0xef67c6ec3e72a790)])]),
         responseSchemaIds: [0x178367a87f66fb46, 0x281c5be4f2ee63b4, 0x42046de663beeef0, 0x5db70a394660f3e6, 0x6d7dce914ee150e8, 0x4cf4b2aeb98a1939, 0xbc5c33249a2dc720],
         responseRoot: .generic(0x42046de663beeef0, args: [.concrete(0xbc5c33249a2dc720), .generic(0x4cf4b2aeb98a1939, args: [.concrete(0x5db70a394660f3e6)])])
     ),

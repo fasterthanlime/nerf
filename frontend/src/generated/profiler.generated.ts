@@ -131,6 +131,33 @@ export interface AnnotatedView {
   lines: AnnotatedLine[];
 }
 
+export interface BasicBlock {
+  id: number;
+  start_address: bigint;
+  lines: AnnotatedLine[];
+}
+
+export type CfgEdgeKind =
+  | { tag: 'Fallthrough' }
+  | { tag: 'Branch' }
+  | { tag: 'ConditionalBranch' }
+  | { tag: 'Call' };
+
+export interface CfgEdge {
+  from_id: number;
+  to_id: number;
+  kind: CfgEdgeKind;
+}
+
+export interface CfgUpdate {
+  function_name: string;
+  language: string;
+  base_address: bigint;
+  queried_address: bigint;
+  blocks: BasicBlock[];
+  edges: CfgEdge[];
+}
+
 export interface FlameNode {
   address: bigint;
   function_name: number | null;
@@ -464,6 +491,19 @@ export type SubscribeAnnotatedRequest = [
 ];
 export type SubscribeAnnotatedResponse = void;
 
+export type CfgRequest = [
+  bigint, // address
+  ViewParams, // params
+];
+export type CfgResponse = CfgUpdate;
+
+export type SubscribeCfgRequest = [
+  bigint, // address
+  ViewParams, // params
+  Tx<CfgUpdate>, // output
+];
+export type SubscribeCfgResponse = void;
+
 export type FlamegraphRequest = [ViewParams];
 export type FlamegraphResponse = FlamegraphUpdate;
 
@@ -573,6 +613,14 @@ export interface ProfilerCaller {
   totalOnCpuNs(): Promise<bigint>;
   annotated(address: bigint, params: ViewParams): Promise<AnnotatedView>;
   subscribeAnnotated(address: bigint, params: ViewParams, output: Tx<AnnotatedView>): Promise<void>;
+  /**
+   * Function-scoped CFG (basic blocks + edges) for the function
+   * containing `address`. Heatmap stats live on each block's
+   * `lines`, so subscribers can keep colours fresh as samples
+   * land.
+   */
+  cfg(address: bigint, params: ViewParams): Promise<CfgUpdate>;
+  subscribeCfg(address: bigint, params: ViewParams, output: Tx<CfgUpdate>): Promise<void>;
   flamegraph(params: ViewParams): Promise<FlamegraphUpdate>;
   subscribeFlamegraph(params: ViewParams, output: Tx<FlamegraphUpdate>): Promise<void>;
   threads(): Promise<ThreadsUpdate>;
@@ -780,6 +828,50 @@ export class ProfilerClient implements ProfilerCaller {
     };
       const value = await this.caller.call({
         method: "Profiler.subscribeAnnotated",
+        args: { address, params, output },
+        descriptor,
+        sendSchemas,
+        prepareRetry,
+        finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [address, params, output], sendSchemas.schemas),
+      });
+      return value as void;
+  }
+
+  /**
+   * Function-scoped CFG (basic blocks + edges) for the function
+   * containing `address`. Heatmap stats live on each block's
+   * `lines`, so subscribers can keep colours fresh as samples
+   * land.
+   */
+  async cfg(address: bigint, params: ViewParams): Promise<CfgUpdate> {
+    const descriptor = profiler_cfg_method;
+    const sendSchemas = profiler_descriptor.send_schemas;
+      const value = await this.caller.call({
+        method: "Profiler.cfg",
+        args: { address, params },
+        descriptor,
+        sendSchemas,
+      });
+      return value as CfgUpdate;
+  }
+
+  async subscribeCfg(address: bigint, params: ViewParams, output: Tx<CfgUpdate>): Promise<void> {
+    const descriptor = profiler_subscribeCfg_method;
+    const sendSchemas = profiler_descriptor.send_schemas;
+    const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
+    const prepareRetry = () => {
+      const channels = bindChannelsForTypeRefs(
+        argTypeRefs,
+        [address, params, output],
+        this.caller.getChannelAllocator(),
+        this.caller.getChannelRegistry(),
+        sendSchemas.schemas,
+      );
+      const payload = new Uint8Array(0);
+      return { payload, channels };
+    };
+      const value = await this.caller.call({
+        method: "Profiler.subscribeCfg",
         args: { address, params, output },
         descriptor,
         sendSchemas,
@@ -1214,6 +1306,8 @@ export interface ProfilerHandler {
   totalOnCpuNs(): Promise<bigint> | bigint;
   annotated(address: bigint, params: ViewParams): Promise<AnnotatedView> | AnnotatedView;
   subscribeAnnotated(address: bigint, params: ViewParams, output: Tx<AnnotatedView>): Promise<void> | void;
+  cfg(address: bigint, params: ViewParams): Promise<CfgUpdate> | CfgUpdate;
+  subscribeCfg(address: bigint, params: ViewParams, output: Tx<CfgUpdate>): Promise<void> | void;
   flamegraph(params: ViewParams): Promise<FlamegraphUpdate> | FlamegraphUpdate;
   subscribeFlamegraph(params: ViewParams, output: Tx<FlamegraphUpdate>): Promise<void> | void;
   threads(): Promise<ThreadsUpdate> | ThreadsUpdate;
@@ -1285,6 +1379,20 @@ export class ProfilerDispatcher implements Dispatcher {
     } else if (method.id === 0xbd08d48f35f68c69n) {
       try {
         const result = await this.handler.subscribeAnnotated(args[0] as bigint, args[1] as ViewParams, args[2] as Tx<AnnotatedView>);
+        call.reply(result);
+      } catch (error) {
+        call.replyInternalError(error instanceof Error ? error.message : String(error));
+      }
+    } else if (method.id === 0xa51313779f167012n) {
+      try {
+        const result = await this.handler.cfg(args[0] as bigint, args[1] as ViewParams);
+        call.reply(result);
+      } catch (error) {
+        call.replyInternalError(error instanceof Error ? error.message : String(error));
+      }
+    } else if (method.id === 0x0d1944323567b370n) {
+      try {
+        const result = await this.handler.subscribeCfg(args[0] as bigint, args[1] as ViewParams, args[2] as Tx<CfgUpdate>);
         call.reply(result);
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
@@ -1450,6 +1558,10 @@ export const profiler_send_schemas: import("@bearcove/vox-core").ServiceSendSche
     [0x6ad4e5d6d2c71282n, { id: 0x6ad4e5d6d2c71282n, type_params: [], kind: { tag: 'struct', name: 'SourceHeader', fields: [{ name: 'file', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'line', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'tokens', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x95417231062e40c8n, args: [] }] }, required: true }] } }],
     [0x93275aeab6d29116n, { id: 0x93275aeab6d29116n, type_params: [], kind: { tag: 'struct', name: 'AnnotatedLine', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'tokens', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x95417231062e40c8n, args: [] }] }, required: true }, { name: 'self_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'self_pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'source_header', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6ad4e5d6d2c71282n, args: [] }] }, required: true }] } }],
     [0xa1273c4df9ab491an, { id: 0xa1273c4df9ab491an, type_params: [], kind: { tag: 'struct', name: 'AnnotatedView', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'base_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'queried_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'lines', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x93275aeab6d29116n, args: [] }] }, required: true }] } }],
+    [0xc1e82f1345ebaccfn, { id: 0xc1e82f1345ebaccfn, type_params: [], kind: { tag: 'struct', name: 'BasicBlock', fields: [{ name: 'id', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'start_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'lines', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x93275aeab6d29116n, args: [] }] }, required: true }] } }],
+    [0x770a32f131a3e58dn, { id: 0x770a32f131a3e58dn, type_params: [], kind: { tag: 'enum', name: 'CfgEdgeKind', variants: [{ name: 'Fallthrough', index: 0, payload: { tag: 'unit' } }, { name: 'Branch', index: 1, payload: { tag: 'unit' } }, { name: 'ConditionalBranch', index: 2, payload: { tag: 'unit' } }, { name: 'Call', index: 3, payload: { tag: 'unit' } }] } }],
+    [0x13e828c618057e03n, { id: 0x13e828c618057e03n, type_params: [], kind: { tag: 'struct', name: 'CfgEdge', fields: [{ name: 'from_id', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'to_id', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'kind', type_ref: { tag: 'concrete', type_id: 0x770a32f131a3e58dn, args: [] }, required: true }] } }],
+    [0xef67c6ec3e72a790n, { id: 0xef67c6ec3e72a790n, type_params: [], kind: { tag: 'struct', name: 'CfgUpdate', fields: [{ name: 'function_name', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'base_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'queried_address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'blocks', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xc1e82f1345ebaccfn, args: [] }] }, required: true }, { name: 'edges', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x13e828c618057e03n, args: [] }] }, required: true }] } }],
     [0x6847ab90feda71c1n, { id: 0x6847ab90feda71c1n, type_params: ['T0'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }] } }],
     [0xacd4834091495bcen, { id: 0xacd4834091495bcen, type_params: [], kind: { tag: 'struct', name: 'FlameNode', fields: [{ name: 'address', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'function_name', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'binary', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'is_main', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'language', type_ref: { tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }, required: true }, { name: 'on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'pet_samples', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'off_cpu_intervals', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'cycles', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'instructions', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'l1d_misses', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'branch_mispreds', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'children', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xacd4834091495bcen, args: [] }] }, required: true }] } }],
     [0x240883a6784a0dden, { id: 0x240883a6784a0dden, type_params: [], kind: { tag: 'struct', name: 'FlamegraphUpdate', fields: [{ name: 'total_on_cpu_ns', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }, { name: 'total_off_cpu', type_ref: { tag: 'concrete', type_id: 0xa6544bf68ad6b55cn, args: [] }, required: true }, { name: 'strings', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'root', type_ref: { tag: 'concrete', type_id: 0xacd4834091495bcen, args: [] }, required: true }] } }],
@@ -1484,6 +1596,8 @@ export const profiler_send_schemas: import("@bearcove/vox-core").ServiceSendSche
     [0xe2829a21383119b4n, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xf202b32106aebf48n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xa1273c4df9ab491an, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0xbd08d48f35f68c69n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xa1273c4df9ab491an, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0xa51313779f167012n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xef67c6ec3e72a790n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
+    [0x0d1944323567b370n, { argsRootRef: { tag: 'concrete', type_id: 0xaa510ab07d34f141n, args: [{ tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, { tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0xef67c6ec3e72a790n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x4daac56b194b862fn, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x240883a6784a0dden, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x6889c2c730466af0n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x6f5fed68b5ace623n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x240883a6784a0dden, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
     [0x33fb58adecb28dean, { argsRootRef: { tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x2c384616cb5c3aden, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x5db70a394660f3e6n, args: [] }] }] } }],
@@ -1538,6 +1652,18 @@ export const profiler_annotated_method: MethodDescriptor = {
 export const profiler_subscribeAnnotated_method: MethodDescriptor = {
   name: 'subscribeAnnotated',
   id: 0xbd08d48f35f68c69n,
+  retry: { persist: false, idem: false },
+};
+
+export const profiler_cfg_method: MethodDescriptor = {
+  name: 'cfg',
+  id: 0xa51313779f167012n,
+  retry: { persist: false, idem: false },
+};
+
+export const profiler_subscribeCfg_method: MethodDescriptor = {
+  name: 'subscribeCfg',
+  id: 0x0d1944323567b370n,
   retry: { persist: false, idem: false },
 };
 
@@ -1660,6 +1786,8 @@ export const profiler_descriptor: ServiceDescriptor = {
     [profiler_totalOnCpuNs_method.id, profiler_totalOnCpuNs_method],
     [profiler_annotated_method.id, profiler_annotated_method],
     [profiler_subscribeAnnotated_method.id, profiler_subscribeAnnotated_method],
+    [profiler_cfg_method.id, profiler_cfg_method],
+    [profiler_subscribeCfg_method.id, profiler_subscribeCfg_method],
     [profiler_flamegraph_method.id, profiler_flamegraph_method],
     [profiler_subscribeFlamegraph_method.id, profiler_subscribeFlamegraph_method],
     [profiler_threads_method.id, profiler_threads_method],

@@ -828,6 +828,64 @@ pub struct AnnotatedView {
     pub lines: Vec<AnnotatedLine>,
 }
 
+/// One basic block — a maximal straight-line sequence of instructions
+/// that ends at a branch / return / call (or at a fallthrough into
+/// another block's leader). `id` is dense (0..blocks.len) so edges
+/// can index directly.
+#[derive(Clone, Debug, Facet)]
+pub struct BasicBlock {
+    pub id: u32,
+    /// Address of the first instruction.
+    pub start_address: u64,
+    /// Heatmap-bearing instructions, in program order. Same shape as
+    /// `AnnotatedView.lines` so the renderer can reuse the row.
+    pub lines: Vec<AnnotatedLine>,
+}
+
+/// One control-flow edge in the function-local CFG.
+#[derive(Clone, Debug, Facet)]
+pub struct CfgEdge {
+    pub from_id: u32,
+    pub to_id: u32,
+    pub kind: CfgEdgeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Facet)]
+#[repr(u8)]
+pub enum CfgEdgeKind {
+    /// Unconditional control flow into the next block.
+    Fallthrough = 0,
+    /// Unconditional branch (e.g. `B`, `JMP`).
+    Branch,
+    /// Conditional branch's taken arm — the not-taken arm is a
+    /// `Fallthrough` edge to the next block.
+    ConditionalBranch,
+    /// Recognised function call back to the next instruction. Only
+    /// emitted when the call has a direct, in-function target — most
+    /// calls leave the function and are not modeled.
+    Call,
+}
+
+/// Function-scoped control-flow graph for `function_name @ entry_address`.
+/// Returned by `Profiler::cfg`/`subscribe_cfg`; unlike `AnnotatedView`
+/// the per-instruction stats are split across blocks the server has
+/// already partitioned, so the client doesn't need to re-discover
+/// branch boundaries.
+#[derive(Clone, Debug, Facet)]
+pub struct CfgUpdate {
+    pub function_name: String,
+    pub language: String,
+    /// Address the function starts at. Block 0 begins here.
+    pub base_address: u64,
+    /// The address the client originally asked about; the renderer
+    /// highlights whichever block contains it.
+    pub queried_address: u64,
+    /// Dense block list. The entry block is always `blocks[0]`; other
+    /// blocks are in increasing-address order.
+    pub blocks: Vec<BasicBlock>,
+    pub edges: Vec<CfgEdge>,
+}
+
 #[vox::service]
 pub trait Profiler {
     /// Snapshot of the top-N functions, ranked by `sort`. `params`
@@ -860,6 +918,14 @@ pub trait Profiler {
         params: ViewParams,
         output: vox::Tx<AnnotatedView>,
     );
+
+    /// Function-scoped CFG (basic blocks + edges) for the function
+    /// containing `address`. Heatmap stats live on each block's
+    /// `lines`, so subscribers can keep colours fresh as samples
+    /// land.
+    async fn cfg(&self, address: u64, params: ViewParams) -> CfgUpdate;
+
+    async fn subscribe_cfg(&self, address: u64, params: ViewParams, output: vox::Tx<CfgUpdate>);
 
     async fn flamegraph(&self, params: ViewParams) -> FlamegraphUpdate;
 

@@ -27,7 +27,7 @@ struct DetailTabs: View {
             ZStack {
                 switch tab {
                 case .disassembly: DisassemblyView(model: model)
-                case .cfg:         CFGView()
+                case .cfg:         CFGView(model: model)
                 case .intervals:   IntervalsView(model: model)
                 }
             }
@@ -278,19 +278,364 @@ private struct IntervalsView: View {
     }
 }
 
-// MARK: - CFG (placeholder)
+// MARK: - CFG
 
 private struct CFGView: View {
+    @Bindable var model: AppModel
+
     var body: some View {
-        VStack(spacing: 8) {
-            Text("control flow graph not wired yet")
-                .font(.mono(.callout))
-                .foregroundStyle(.tertiary)
-            Text("needs a server-side subscribe_cfg(address)")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+        Group {
+            if let cfg = model.cfg, !cfg.blocks.isEmpty {
+                CFGCanvas(cfg: cfg)
+            } else if model.focusedAddress == nil {
+                emptyState("Select a function to drill into.")
+            } else {
+                let address = model.focusedAddress ?? 0
+                emptyState(
+                    """
+                    no CFG yet for 0x\(String(address, radix: 16))
+                    (subscribed; the server may not have a binary for this address)
+                    """
+                )
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .textBackgroundColor).opacity(0.3))
+    }
+
+    private func emptyState(_ text: String) -> some View {
+        VStack {
+            Text(text)
+                .font(.mono(.callout))
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct CFGCanvas: View {
+    let cfg: CfgUpdate
+
+    /// Pixel size of one column / one layer slot. Each block's actual
+    /// height is computed from its line count; columns are uniform.
+    private let columnWidth: CGFloat = 320
+    private let columnGap: CGFloat = 24
+    private let layerGap: CGFloat = 56
+    private let lineHeight: CGFloat = 14
+    private let blockHeader: CGFloat = 22
+    private let blockPadding: CGFloat = 6
+    /// Horizontal spacing between vertical tracks for right-routed
+    /// edges. Each long-forward / back edge claims one track.
+    private let trackSpacing: CGFloat = 12
+
+    var body: some View {
+        let layout = CFGLayout.layout(cfg)
+        let placements = computePlacements(layout)
+        let blocksWidth = max(
+            columnWidth,
+            CGFloat(layout.columns) * (columnWidth + columnGap) - columnGap
+        )
+        // Each long-forward / back edge gets its own vertical track on
+        // the right of the block area. Without per-edge tracks two
+        // edges with overlapping y-ranges would collapse onto one
+        // line; with them, every edge has a distinct path.
+        let edgeTracks = assignRightTracks(edges: layout.edges, placements: placements)
+        let trackCount = (edgeTracks.values.max() ?? -1) + 1
+        let trackStripWidth = trackCount > 0
+            ? CGFloat(trackCount) * trackSpacing + columnGap
+            : columnGap
+        let canvasWidth = blocksWidth + trackStripWidth
+        let canvasHeight = placements.totalHeight
+
+        let maxCost = max(
+            UInt64(1),
+            cfg.blocks.flatMap(\.lines).map(\.selfOnCpuNs).max() ?? 0
+        )
+
+        ScrollView([.horizontal, .vertical]) {
+            ZStack(alignment: .topLeading) {
+                Canvas { ctx, _ in
+                    for edge in layout.edges {
+                        guard let from = placements.byId[edge.edge.fromId],
+                              let to = placements.byId[edge.edge.toId]
+                        else { continue }
+                        drawEdge(
+                            ctx: ctx,
+                            from: from,
+                            to: to,
+                            edge: edge,
+                            blocksWidth: blocksWidth,
+                            trackIndex: edgeTracks[edge.id]
+                        )
+                    }
+                }
+                .frame(width: canvasWidth, height: canvasHeight)
+
+                ForEach(layout.blocks) { laidOut in
+                    if let placement = placements.byId[laidOut.id] {
+                        BlockView(
+                            block: laidOut.block,
+                            queriedAddress: cfg.queriedAddress,
+                            baseAddress: cfg.baseAddress,
+                            maxCost: maxCost
+                        )
+                        .frame(width: columnWidth)
+                        .position(
+                            x: placement.center.x,
+                            y: placement.center.y
+                        )
+                    }
+                }
+            }
+            .frame(width: canvasWidth, height: canvasHeight)
+            .padding(columnGap)
+        }
+    }
+
+    private struct Placement {
+        let frame: CGRect
+        let center: CGPoint
+        let layer: Int
+    }
+
+    private struct Placements {
+        let byId: [UInt32: Placement]
+        let totalHeight: CGFloat
+    }
+
+    /// Compute pixel rect per block. Within a layer all blocks share
+    /// the same row height (the tallest block in that layer) so edges
+    /// stay aligned.
+    private func computePlacements(_ layout: LaidOutCFG) -> Placements {
+        var placements: [UInt32: Placement] = [:]
+
+        // Group blocks by layer.
+        var byLayer: [Int: [LaidOutBlock]] = [:]
+        for b in layout.blocks {
+            byLayer[b.layer, default: []].append(b)
+        }
+
+        var y: CGFloat = 0
+        for layer in 0..<layout.layers {
+            let blocks = byLayer[layer] ?? []
+            let rowHeight = blocks
+                .map { blockHeight(linesCount: $0.block.lines.count) }
+                .max() ?? 0
+
+            for b in blocks {
+                let blockH = blockHeight(linesCount: b.block.lines.count)
+                let centerX = CGFloat(b.column) * (columnWidth + columnGap)
+                    + columnWidth / 2
+                let centerY = y + rowHeight / 2
+                let frame = CGRect(
+                    x: centerX - columnWidth / 2,
+                    y: centerY - blockH / 2,
+                    width: columnWidth,
+                    height: blockH
+                )
+                placements[b.id] = Placement(
+                    frame: frame,
+                    center: CGPoint(x: centerX, y: centerY),
+                    layer: b.layer
+                )
+            }
+
+            y += rowHeight + layerGap
+        }
+        let total = max(0, y - layerGap)
+        return Placements(byId: placements, totalHeight: total)
+    }
+
+    private func blockHeight(linesCount: Int) -> CGFloat {
+        blockHeader + CGFloat(linesCount) * lineHeight + blockPadding * 2
+    }
+
+    private func drawEdge(
+        ctx: GraphicsContext,
+        from: Placement,
+        to: Placement,
+        edge: LaidOutEdge,
+        blocksWidth: CGFloat,
+        trackIndex: Int?
+    ) {
+        let goesRight = trackIndex != nil
+
+        let start: CGPoint
+        let end: CGPoint
+        if goesRight {
+            start = CGPoint(x: from.frame.maxX, y: from.center.y)
+            end = CGPoint(x: to.frame.maxX, y: to.center.y)
+        } else {
+            start = CGPoint(x: from.center.x, y: from.frame.maxY)
+            end = CGPoint(x: to.center.x, y: to.frame.minY)
+        }
+
+        var path = Path()
+        if goesRight, let track = trackIndex {
+            // Each right-routed edge runs in its own vertical track,
+            // offset from the right edge of the block strip. Sized
+            // and positioned so the canvas reserves room for it.
+            let detour = blocksWidth + columnGap / 2 + CGFloat(track) * trackSpacing
+            path.move(to: start)
+            path.addLine(to: CGPoint(x: detour, y: start.y))
+            path.addLine(to: CGPoint(x: detour, y: end.y))
+            path.addLine(to: end)
+        } else {
+            // S-curve for adjacent-layer forward steps.
+            let mid = (start.y + end.y) / 2
+            path.move(to: start)
+            path.addCurve(
+                to: end,
+                control1: CGPoint(x: start.x, y: mid),
+                control2: CGPoint(x: end.x, y: mid)
+            )
+        }
+        let stroke = StrokeStyle(
+            lineWidth: 1,
+            lineCap: .round,
+            dash: edge.isBackEdge ? [4, 3] : []
+        )
+        ctx.stroke(path, with: .color(color(for: edge)), style: stroke)
+
+        // Arrowhead.
+        let approach: CGPoint = goesRight
+            ? CGPoint(x: end.x + 12, y: end.y)  // entering from the right
+            : CGPoint(x: end.x, y: end.y - 12)  // entering from above
+        let head = arrowhead(at: end, comingFrom: approach)
+        ctx.fill(head, with: .color(color(for: edge)))
+    }
+
+    /// Assign each right-routed edge to a vertical track on the
+    /// right of the block strip. Edges are sorted by y-span and
+    /// greedily packed into tracks so two edges that share any y
+    /// range get distinct tracks. Result keys are `LaidOutEdge.id`.
+    private func assignRightTracks(
+        edges: [LaidOutEdge],
+        placements: Placements
+    ) -> [String: Int] {
+        struct Candidate {
+            let id: String
+            let yLo: CGFloat
+            let yHi: CGFloat
+        }
+        var candidates: [Candidate] = []
+        for e in edges {
+            guard let from = placements.byId[e.edge.fromId],
+                  let to = placements.byId[e.edge.toId]
+            else { continue }
+            let layerSpan = to.layer - from.layer
+            let goesRight = e.isBackEdge || layerSpan > 1
+            guard goesRight else { continue }
+            let yLo = min(from.center.y, to.center.y)
+            let yHi = max(from.center.y, to.center.y)
+            candidates.append(Candidate(id: e.id, yLo: yLo, yHi: yHi))
+        }
+        // Long edges first — they're harder to pack later.
+        candidates.sort { ($0.yHi - $0.yLo) > ($1.yHi - $1.yLo) }
+
+        var trackHi: [CGFloat] = []  // last assigned hi-y per track
+        var trackLo: [CGFloat] = []  // first assigned lo-y per track
+        var assigned: [String: Int] = [:]
+        for c in candidates {
+            // Find the lowest-numbered track whose existing range
+            // doesn't intersect [c.yLo, c.yHi].
+            var picked = -1
+            for i in 0..<trackHi.count {
+                if c.yHi <= trackLo[i] || c.yLo >= trackHi[i] {
+                    trackLo[i] = min(trackLo[i], c.yLo)
+                    trackHi[i] = max(trackHi[i], c.yHi)
+                    picked = i
+                    break
+                }
+            }
+            if picked < 0 {
+                picked = trackHi.count
+                trackHi.append(c.yHi)
+                trackLo.append(c.yLo)
+            }
+            assigned[c.id] = picked
+        }
+        return assigned
+    }
+
+    private func arrowhead(at tip: CGPoint, comingFrom: CGPoint) -> Path {
+        let dx = tip.x - comingFrom.x
+        let dy = tip.y - comingFrom.y
+        let len = max(0.001, (dx * dx + dy * dy).squareRoot())
+        let ux = dx / len
+        let uy = dy / len
+        let size: CGFloat = 6
+        let leftX = tip.x - ux * size + uy * size * 0.5
+        let leftY = tip.y - uy * size - ux * size * 0.5
+        let rightX = tip.x - ux * size - uy * size * 0.5
+        let rightY = tip.y - uy * size + ux * size * 0.5
+        var path = Path()
+        path.move(to: tip)
+        path.addLine(to: CGPoint(x: leftX, y: leftY))
+        path.addLine(to: CGPoint(x: rightX, y: rightY))
+        path.closeSubpath()
+        return path
+    }
+
+    private func color(for edge: LaidOutEdge) -> Color {
+        switch edge.edge.kind {
+        case .fallthrough:        return .secondary.opacity(0.55)
+        case .branch:             return Color(red: 0.537, green: 0.706, blue: 0.980).opacity(0.85)
+        case .conditionalBranch:  return Color(red: 0.976, green: 0.886, blue: 0.686).opacity(0.85)
+        case .call:               return Color(red: 0.580, green: 0.886, blue: 0.835).opacity(0.85)
+        }
+    }
+}
+
+private struct BlockView: View {
+    let block: BasicBlock
+    let queriedAddress: UInt64
+    let baseAddress: UInt64
+    let maxCost: UInt64
+
+    var body: some View {
+        let containsQueried = block.lines.contains { $0.address == queriedAddress }
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text(addressOffset(block.startAddress, base: baseAddress))
+                    .font(.mono(.caption2))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(block.lines.count) instr")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .background(Color(nsColor: .underPageBackgroundColor))
+
+            ForEach(Array(block.lines.enumerated()), id: \.offset) { _, line in
+                HStack(spacing: 6) {
+                    BarTrack(ratio: Double(line.selfOnCpuNs) / Double(maxCost))
+                        .frame(width: 22, height: 2)
+                    Text(addressOffset(line.address, base: baseAddress))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 56, alignment: .trailing)
+                    tokenLine(line.tokens, fallback: .primary)
+                        .lineLimit(1)
+                }
+                .font(.mono(.caption2))
+                .padding(.horizontal, 6)
+            }
+        }
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(nsColor: .textBackgroundColor).opacity(0.9))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(
+                    containsQueried
+                        ? Color.accentColor
+                        : Color.secondary.opacity(0.35),
+                    lineWidth: containsQueried ? 1.5 : 0.75
+                )
+        )
     }
 }
