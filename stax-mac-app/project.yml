@@ -35,7 +35,7 @@ settings:
 
 packages:
   vox:
-    path: ../../vox
+    path: ../../vox/swift/vox-runtime
 
 targets:
   stax:

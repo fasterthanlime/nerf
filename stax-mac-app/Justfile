@@ -8,6 +8,8 @@ config := "Debug"
 derived := "./DerivedData"
 app := derived + "/Build/Products/" + config + "/stax.app"
 
+xcodebuild_flags := "-project " + project + " -scheme " + scheme + " -configuration " + config + " -derivedDataPath " + derived + " -destination 'platform=macOS'"
+
 list:
     just --list
 
@@ -15,12 +17,20 @@ list:
 gen:
     xcodegen generate
 
-# Build the app (regenerates project first)
-build:
-    COMPILER_INDEX_STORE_ENABLE=NO xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -derivedDataPath {{ derived }} build -skipPackageUpdates 2>&1 | xcbeautify
+# Resolve package dependencies (do this once after gen)
+resolve: gen
+    xcodebuild {{ xcodebuild_flags }} \
+        -resolvePackageDependencies
 
-resolve:
-    COMPILER_INDEX_STORE_ENABLE=NO xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -derivedDataPath {{ derived }} resolveDependencies 2>&1 | xcbeautify
+# Build the app (no project regeneration, no package resolution)
+build:
+    set -o pipefail; \
+    xcodebuild {{ xcodebuild_flags }} \
+        -disableAutomaticPackageResolution \
+        -skipPackageUpdates \
+        COMPILER_INDEX_STORE_ENABLE=NO \
+        ONLY_ACTIVE_ARCH=YES \
+        build 2>&1 | xcbeautify
 
 # Build, then launch from DerivedData (kills any prior instance first)
 run: build
