@@ -136,6 +136,10 @@ pub struct BinaryRegistry {
     /// address reaches `lookup_symbol`.
     #[cfg(target_os = "macos")]
     kernel_symbols: crate::kernel_symbols::KernelSymbolResolver,
+    /// Cache of demangled symbol names. Keyed by the raw symbol-table
+    /// bytes so repeated lookups of the same function (the common case
+    /// for hot frames) skip the demangling pipeline entirely.
+    demangle_cache: parking_lot::Mutex<lru::LruCache<Vec<u8>, stax_demangle::Demangled>>,
 }
 
 impl BinaryRegistry {
@@ -153,6 +157,9 @@ impl BinaryRegistry {
             shared_cache: None,
             #[cfg(target_os = "macos")]
             kernel_symbols: crate::kernel_symbols::KernelSymbolResolver::default(),
+            demangle_cache: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(16384).unwrap(),
+            )),
         }
     }
 
@@ -254,6 +261,18 @@ impl BinaryRegistry {
         false
     }
 
+    /// Demangle `raw_bytes` through the LRU cache so repeated lookups
+    /// of the same hot symbol skip the demangling pipeline.
+    fn cached_demangle(&self, raw_bytes: &[u8]) -> stax_demangle::Demangled {
+        let mut cache = self.demangle_cache.lock();
+        if let Some(cached) = cache.get(raw_bytes) {
+            return cached.clone();
+        }
+        let d = stax_demangle::demangle_bytes(raw_bytes);
+        cache.put(raw_bytes.to_vec(), d.clone());
+        d
+    }
+
     /// Resolve `address` to a (function name, binary basename, is-main)
     /// triple without loading any image bytes. Used by top-N rendering
     /// where we want labels but don't need disassembly.
@@ -284,7 +303,7 @@ impl BinaryRegistry {
         let demangled = if idx > 0 {
             let candidate = &binary.symbols[idx - 1];
             if svma < candidate.end_svma {
-                Some(stax_demangle::demangle_bytes(&candidate.name))
+                Some(self.cached_demangle(&candidate.name))
             } else {
                 None
             }
@@ -347,7 +366,7 @@ impl BinaryRegistry {
             .symbols
             .iter()
             .find(|s| svma >= s.start_svma && svma < s.end_svma)
-            .map(|s| stax_demangle::demangle_bytes(&s.name));
+            .map(|s| self.cached_demangle(&s.name));
         let (function_name, language) = match demangled {
             Some(d) => (d.name, d.language),
             None => (

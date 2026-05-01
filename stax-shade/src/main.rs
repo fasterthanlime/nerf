@@ -327,6 +327,7 @@ async fn run_recording(
         frequency_hz: cli.frequency,
         duration: cli.time_limit.map(Duration::from_secs),
         telemetry: Some(telemetry.clone()),
+        task: Some(task),
         ..Default::default()
     };
     let drive_pid = opts.pid;

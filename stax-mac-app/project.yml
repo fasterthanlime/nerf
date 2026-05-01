@@ -15,6 +15,23 @@ settings:
     SWIFT_APPROACHABLE_CONCURRENCY: YES
     SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
     SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY: YES
+  configs:
+    Debug:
+      SWIFT_COMPILATION_MODE: incremental
+      SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+      ONLY_ACTIVE_ARCH: YES
+      DEBUG_INFORMATION_FORMAT: dwarf
+      OTHER_SWIFT_FLAGS:
+        - "$(inherited)"
+        - "-Xfrontend"
+        - "-warn-long-function-bodies=100"
+        - "-Xfrontend"
+        - "-warn-long-expression-type-checking=100"
+    Release:
+      SWIFT_COMPILATION_MODE: wholemodule
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+      ONLY_ACTIVE_ARCH: NO
+      DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
 
 packages:
   vox:

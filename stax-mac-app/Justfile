@@ -16,8 +16,11 @@ gen:
     xcodegen generate
 
 # Build the app (regenerates project first)
-build: gen
-    xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -derivedDataPath {{ derived }} build 2>&1 | xcbeautify
+build:
+    COMPILER_INDEX_STORE_ENABLE=NO xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -derivedDataPath {{ derived }} build -skipPackageUpdates 2>&1 | xcbeautify
+
+resolve:
+    COMPILER_INDEX_STORE_ENABLE=NO xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -derivedDataPath {{ derived }} resolveDependencies 2>&1 | xcbeautify
 
 # Build, then launch from DerivedData (kills any prior instance first)
 run: build

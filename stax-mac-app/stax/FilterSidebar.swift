@@ -9,7 +9,6 @@ struct FilterSidebar: View {
                 ForEach(AppModel.CPUMode.allCases) { mode in
                     ModeRow(
                         label: mode.rawValue,
-                        detail: mode.fakeStat,
                         isOn: model.cpuMode == mode
                     ) {
                         model.cpuMode = mode
@@ -23,7 +22,6 @@ struct FilterSidebar: View {
                 ForEach(AppModel.EventMode.allCases) { mode in
                     EventRow(
                         label: mode.rawValue,
-                        detail: mode.fakeStat,
                         isOn: model.eventMode == mode
                     ) {
                         model.eventMode = (model.eventMode == mode) ? nil : mode
@@ -91,7 +89,6 @@ private struct SectionHeader: View {
 
 private struct ModeRow: View {
     let label: String
-    let detail: String
     let isOn: Bool
     let action: () -> Void
 
@@ -103,9 +100,6 @@ private struct ModeRow: View {
                 Text(label)
                     .foregroundStyle(isOn ? .primary : .secondary)
                 Spacer()
-                Text(detail)
-                    .font(.mono(.caption))
-                    .foregroundStyle(.tertiary)
             }
             .contentShape(.rect)
         }
@@ -115,7 +109,6 @@ private struct ModeRow: View {
 
 private struct EventRow: View {
     let label: String
-    let detail: String
     let isOn: Bool
     let action: () -> Void
 
@@ -127,9 +120,6 @@ private struct EventRow: View {
                 Text(label)
                     .foregroundStyle(isOn ? .primary : .secondary)
                 Spacer()
-                Text(detail)
-                    .font(.mono(.caption))
-                    .foregroundStyle(.tertiary)
             }
             .contentShape(.rect)
         }
@@ -156,9 +146,6 @@ private struct CategoryRow: View {
                 Text(category.rawValue)
                     .foregroundStyle(isOn ? .primary : .secondary)
                 Spacer()
-                Text(category.fakeCount.formatted())
-                    .font(.mono(.caption))
-                    .foregroundStyle(.tertiary)
             }
             .contentShape(.rect)
         }

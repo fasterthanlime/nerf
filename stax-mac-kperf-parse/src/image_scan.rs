@@ -12,6 +12,7 @@
 //! is a follow-up.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 
 use object::read::macho::MachOFile64;
 use object::{Endianness, Object, ObjectKind, ObjectSegment, ObjectSymbol};
@@ -21,6 +22,52 @@ use stax_mac_capture::{BinaryLoadedEvent, BinaryUnloadedEvent, SampleSink};
 use stax_mac_shared_cache::SharedCache;
 
 use crate::libproc;
+
+// ——— Mach FFI for fast dyld image-change detection ———
+
+#[allow(non_camel_case_types)]
+mod ffi {
+    pub(super) type mach_port_t = u32;
+    pub(super) type mach_vm_address_t = u64;
+    pub(super) type mach_vm_size_t = u64;
+    pub(super) type kern_return_t = i32;
+    pub(super) type natural_t = u32;
+    pub(super) type mach_msg_type_number_t = natural_t;
+    pub(super) type integer_t = i32;
+}
+use ffi::*;
+
+const KERN_SUCCESS: kern_return_t = 0;
+
+const TASK_DYLD_INFO: i32 = 17;
+const TASK_DYLD_INFO_COUNT: mach_msg_type_number_t = (std::mem::size_of::<TaskDyldInfo>()
+    / std::mem::size_of::<natural_t>())
+    as mach_msg_type_number_t;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TaskDyldInfo {
+    all_image_info_addr: mach_vm_address_t,
+    all_image_info_size: mach_vm_size_t,
+    all_image_info_format: integer_t,
+}
+
+extern "C" {
+    fn task_info(
+        task: mach_port_t,
+        flavor: i32,
+        task_info_out: *mut c_void,
+        task_info_out_cnt: *mut mach_msg_type_number_t,
+    ) -> kern_return_t;
+
+    fn mach_vm_read_overwrite(
+        target_task: mach_port_t,
+        address: mach_vm_address_t,
+        size: mach_vm_size_t,
+        data: mach_vm_address_t,
+        out_size: *mut mach_vm_size_t,
+    ) -> kern_return_t;
+}
 
 /// One loaded image, retained between scans so `BinaryLoadedEvent`
 /// can borrow `&[MachOSymbol]` from us.
@@ -45,17 +92,42 @@ pub struct LoadedImage {
 pub struct ImageScanner {
     known: HashMap<(String, u64), LoadedImage>,
     shared_cache: Option<std::sync::Arc<SharedCache>>,
+    /// Optional Mach task port for fast dyld image-change detection.
+    /// When set, `rescan` checks `task_info(TASK_DYLD_INFO)` +
+    /// `mach_vm_read_overwrite` to read the dyld image count before
+    /// falling back to the full `proc_pidinfo` walk.
+    task: Option<mach_port_t>,
+    /// Last seen `dyld_all_image_infos.all_image_info_addr`.
+    last_all_image_info_addr: u64,
+    /// Last seen `dyld_all_image_infos.infoArrayCount`.
+    last_image_count: u32,
 }
 
 impl ImageScanner {
-    pub fn new(shared_cache: Option<std::sync::Arc<SharedCache>>) -> Self {
+    pub fn new(
+        shared_cache: Option<std::sync::Arc<SharedCache>>,
+        task: Option<mach_port_t>,
+    ) -> Self {
         Self {
             known: HashMap::new(),
             shared_cache,
+            task,
+            last_all_image_info_addr: 0,
+            last_image_count: 0,
         }
     }
 
     pub fn rescan<S: SampleSink>(&mut self, pid: u32, sink: &mut S) {
+        // Fast path: if we have a task port, check whether dyld's
+        // image count changed since last scan. This avoids the full
+        // proc_pidinfo walk (~hundreds of syscalls per tick) in
+        // steady state.
+        if let Some(task) = self.task {
+            if !self.dyld_images_changed(task) {
+                return;
+            }
+        }
+
         let regions = libproc::enumerate_regions(pid);
         let exec_count = regions
             .iter()
@@ -172,6 +244,54 @@ impl ImageScanner {
                  {total_symbols} total symbols)"
             );
         }
+    }
+
+    /// Returns `true` when dyld's image list has changed (or this is
+    /// the first check). Uses `task_info(TASK_DYLD_INFO)` to find the
+    /// `dyld_all_image_infos` struct, then reads `infoArrayCount` from
+    /// the target's address space via `mach_vm_read_overwrite`.
+    fn dyld_images_changed(&mut self, task: mach_port_t) -> bool {
+        let mut info: TaskDyldInfo = TaskDyldInfo::default();
+        let mut count = TASK_DYLD_INFO_COUNT;
+        let kr = unsafe {
+            task_info(
+                task,
+                TASK_DYLD_INFO,
+                &mut info as *mut _ as *mut c_void,
+                &mut count,
+            )
+        };
+        if kr != KERN_SUCCESS {
+            // Can't read dyld info — fall back to full rescan.
+            return true;
+        }
+        if info.all_image_info_addr == 0 {
+            return true;
+        }
+
+        // Read just infoArrayCount (u32 at offset 4) from the target.
+        let mut image_count: u32 = 0;
+        let mut out_size: mach_vm_size_t = 0;
+        let kr = unsafe {
+            mach_vm_read_overwrite(
+                task,
+                info.all_image_info_addr + 4, // offsetof(infoArrayCount)
+                4,                            // sizeof(u32)
+                &mut image_count as *mut _ as mach_vm_address_t,
+                &mut out_size,
+            )
+        };
+        if kr != KERN_SUCCESS || out_size != 4 {
+            // Read failed — fall back to full rescan.
+            self.last_all_image_info_addr = 0;
+            return true;
+        }
+
+        let changed = info.all_image_info_addr != self.last_all_image_info_addr
+            || image_count != self.last_image_count;
+        self.last_all_image_info_addr = info.all_image_info_addr;
+        self.last_image_count = image_count;
+        changed
     }
 }
 

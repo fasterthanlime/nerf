@@ -51,6 +51,10 @@ pub struct RemoteOptions {
     /// Optional process-wide telemetry registry to receive Vox transport
     /// counters for the staxd records stream.
     pub telemetry: Option<TelemetryRegistry>,
+    /// Optional Mach task port for the target process. When set,
+    /// the image scanner uses `task_info(TASK_DYLD_INFO)` to detect
+    /// dlopen/dlclose without walking proc_pidinfo every tick.
+    pub task: Option<mach2::port::mach_port_t>,
 }
 
 impl std::fmt::Debug for RemoteOptions {
@@ -62,6 +66,7 @@ impl std::fmt::Debug for RemoteOptions {
             .field("duration", &self.duration)
             .field("buf_records", &self.buf_records)
             .field("telemetry", &self.telemetry.is_some())
+            .field("task", &self.task.is_some())
             .finish()
     }
 }
@@ -92,6 +97,7 @@ impl Default for RemoteOptions {
             duration: None,
             buf_records: 1_000_000,
             telemetry: None,
+            task: None,
         }
     }
 }
@@ -267,6 +273,7 @@ where
         frequency_hz: opts.frequency_hz,
         pmc_idx_l1d: None,
         pmc_idx_brmiss: None,
+        task: opts.task,
     };
 
     let parser_queue = ParserQueue::new(WORKER_QUEUE_CAPACITY);

@@ -158,25 +158,31 @@ fn classify(input: &str) -> Demangled {
         };
     }
 
-    // Some Rust v0 inputs aren't recognized by cpp_demangle; try Rust
-    // as a second attempt. Same for Swift / ObjC for non-prefixed forms.
-    if let Some(d) = try_lang(input, SymLanguage::Rust) {
-        return Demangled {
-            name: d,
-            language: Language::Rust,
-        };
-    }
-    if let Some(d) = try_lang(input, SymLanguage::Swift) {
-        return Demangled {
-            name: d,
-            language: Language::Swift,
-        };
-    }
-    if let Some(d) = try_lang(input, SymLanguage::ObjC) {
-        return Demangled {
-            name: d,
-            language: Language::ObjC,
-        };
+    // Only try secondary languages when the symbol looks mangled.
+    // Plain C names (main, pow, kevent, …) have no leading
+    // underscore and can't possibly demangle as anything else;
+    // guarding on the underscore saves three doomed attempts per
+    // lookup for every C-library and syscall symbol.
+    if input.as_bytes().first() == Some(&b'_') {
+        // Some Rust v0 inputs aren't recognized by cpp_demangle.
+        if let Some(d) = try_lang(input, SymLanguage::Rust) {
+            return Demangled {
+                name: d,
+                language: Language::Rust,
+            };
+        }
+        if let Some(d) = try_lang(input, SymLanguage::Swift) {
+            return Demangled {
+                name: d,
+                language: Language::Swift,
+            };
+        }
+        if let Some(d) = try_lang(input, SymLanguage::ObjC) {
+            return Demangled {
+                name: d,
+                language: Language::ObjC,
+            };
+        }
     }
 
     Demangled {

@@ -83,10 +83,12 @@ final class AppModel {
             guard let i = idx, Int(i) < strings.count else { return nil }
             return strings[Int(i)]
         }
-        let name = resolve(node.functionName)
+        let name =
+            resolve(node.functionName)
             ?? String(format: "0x%llx", node.address)
         let binary = resolve(node.binary) ?? "(no binary)"
-        let lang = Int(node.language) < strings.count
+        let lang =
+            Int(node.language) < strings.count
             ? strings[Int(node.language)]
             : ""
         let display = FocusedDisplay(
@@ -135,14 +137,6 @@ final class AppModel {
         case offCPU = "off-cpu"
         case wall = "wall"
         var id: String { rawValue }
-
-        var fakeStat: String {
-            switch self {
-            case .onCPU:  "3.0ms"
-            case .offCPU: "1.70s"
-            case .wall:   "1.71s"
-            }
-        }
     }
     var cpuMode: CPUMode = .onCPU
 
@@ -151,14 +145,6 @@ final class AppModel {
         case l1d = "l1d"
         case brMiss = "br-miss"
         var id: String { rawValue }
-
-        var fakeStat: String {
-            switch self {
-            case .ipc:    "1.42"
-            case .l1d:    "32k"
-            case .brMiss: "1.1k"
-            }
-        }
     }
     var eventMode: EventMode? = .ipc
 
@@ -168,19 +154,10 @@ final class AppModel {
 
         var color: Color {
             switch self {
-            case .main:   Color(red: 0.96, green: 0.78, blue: 0.27) // amber
-            case .dylib:  Color(red: 0.36, green: 0.78, blue: 0.85) // cyan
-            case .system: Color(red: 0.95, green: 0.55, blue: 0.43) // coral
-            case .other:  Color(red: 0.74, green: 0.56, blue: 0.91) // violet
-            }
-        }
-
-        var fakeCount: Int {
-            switch self {
-            case .main:   18
-            case .dylib:  24
-            case .system: 6
-            case .other:  2
+            case .main: Color(red: 0.96, green: 0.78, blue: 0.27)  // amber
+            case .dylib: Color(red: 0.36, green: 0.78, blue: 0.85)  // cyan
+            case .system: Color(red: 0.95, green: 0.55, blue: 0.43)  // coral
+            case .other: Color(red: 0.74, green: 0.56, blue: 0.91)  // violet
             }
         }
     }
@@ -215,10 +192,10 @@ final class AppModel {
         threads.first { $0.tid == tid }
     }
 
-    // Fake stats for the bottom status bar.
-    var onCPUTime: TimeInterval = 0.003
-    var offCPUTime: TimeInterval = 1.70
-    var symbolCount: Int = 50
+    // Status bar totals, populated by runTopSubscription.
+    var onCPUTime: TimeInterval = 0
+    var offCPUTime: TimeInterval = 0
+    var symbolCount: Int = 0
 
     struct FunctionEntry: Identifiable, Hashable {
         let id = UUID()
@@ -239,44 +216,23 @@ final class AppModel {
         let totalTime: TimeInterval
         let callCount: Int
     }
-    var familyCallers: [FamilyMember] = [
-        .init(name: "IOGPUCommandQueueSubmitCommandBuffers",         binary: "IOGPU",                   kind: .c, totalTime: 0.0003062, callCount: 1),
-        .init(name: "start_wqthread",                                binary: "libsystem_pthread.dylib", kind: .c, totalTime: 0.0003062, callCount: 1),
-        .init(name: "_pthread_wqthread",                             binary: "libsystem_pthread.dylib", kind: .c, totalTime: 0.0003062, callCount: 1),
-        .init(name: "_dispatch_workloop_worker_thread",              binary: "libdispatch.dylib",       kind: .c, totalTime: 0.0003062, callCount: 1),
-        .init(name: "_dispatch_root_queue_drain_deferred_wlh",       binary: "libdispatch.dylib",       kind: .c, totalTime: 0.0003062, callCount: 1),
-        .init(name: "_dispatch_lane_invoke",                         binary: "libdispatch.dylib",       kind: .c, totalTime: 0.0003062, callCount: 1),
-        .init(name: "_dispatch_lane_serial_drain",                   binary: "libdispatch.dylib",       kind: .c, totalTime: 0.0003062, callCount: 1),
-        .init(name: "_dispatch_source_invoke",                       binary: "libdispatch.dylib",       kind: .c, totalTime: 0.0003062, callCount: 1),
-    ]
+    var familyCallers: [FamilyMember] = []
     var familyFocused: FamilyMember = .init(
-        name: "_dispatch_source_latch_and_call",
-        binary: "libdispatch.dylib",
-        kind: .c,
-        totalTime: 0.0003062,
-        callCount: 1
-    )
-    var familyCallees: [FamilyMember] = [
-        .init(name: "_dispatch_continuation_pop",                                  binary: "libdispatch.dylib", kind: .c,    totalTime: 0.0000180, callCount: 1),
-        .init(name: "_dispatch_client_callout",                                    binary: "libdispatch.dylib", kind: .c,    totalTime: 0.0001800, callCount: 1),
-        .init(name: "-[_MTLCommandQueue _submitAvailableCommandBuffers]",          binary: "Metal",             kind: .objc, totalTime: 0.0001500, callCount: 1),
-        .init(name: "-[IOGPUMetalCommandQueue submitCommandBuffers:count:]",       binary: "IOGPU",             kind: .objc, totalTime: 0.0001000, callCount: 2),
-        .init(name: "-[IOGPUMetalCommandQueue _submitCommandBuffers:count:]",      binary: "IOGPU",             kind: .objc, totalTime: 0.0000800, callCount: 2),
-        .init(name: "iokit_user_client_trap",                                      binary: "IOKit",             kind: .c,    totalTime: 0.0000750, callCount: 4),
-    ]
+        name: "", binary: "", kind: .unknown, totalTime: 0, callCount: 0)
+    var familyCallees: [FamilyMember] = []
 
     enum IntervalReason: String, CaseIterable, Identifiable, Hashable {
         case ipc, read, write, ready, connect, idle, other
         var id: String { rawValue }
         var color: Color {
             switch self {
-            case .ipc:     Color(red: 0.74, green: 0.56, blue: 0.91)
-            case .read:    Color(red: 0.36, green: 0.65, blue: 0.95)
-            case .write:   Color(red: 0.36, green: 0.78, blue: 0.85)
-            case .ready:   Color(red: 0.55, green: 0.82, blue: 0.45)
+            case .ipc: Color(red: 0.74, green: 0.56, blue: 0.91)
+            case .read: Color(red: 0.36, green: 0.65, blue: 0.95)
+            case .write: Color(red: 0.36, green: 0.78, blue: 0.85)
+            case .ready: Color(red: 0.55, green: 0.82, blue: 0.45)
             case .connect: Color(red: 0.95, green: 0.65, blue: 0.30)
-            case .idle:    Color(red: 0.50, green: 0.50, blue: 0.55)
-            case .other:   Color(red: 0.95, green: 0.55, blue: 0.43)
+            case .idle: Color(red: 0.50, green: 0.50, blue: 0.55)
+            case .other: Color(red: 0.95, green: 0.55, blue: 0.43)
             }
         }
     }
@@ -337,18 +293,22 @@ final class AppModel {
             // smoke-test — if any one view is slow, the others should
             // keep refreshing, and the visible counters tell us which
             // ones woke up.
-            streamTasks.append(Task { [weak self] in
-                await self?.runThreadsSubscription(client: client)
-            })
-            streamTasks.append(Task { [weak self] in
-                await self?.runTopSubscription(client: client)
-            })
-            streamTasks.append(Task { [weak self] in
-                await self?.runTimelineSubscription(client: client)
-            })
-            streamTasks.append(Task { [weak self] in
-                await self?.runFlamegraphSubscription(client: client)
-            })
+            streamTasks.append(
+                Task { [weak self] in
+                    await self?.runThreadsSubscription(client: client)
+                })
+            streamTasks.append(
+                Task { [weak self] in
+                    await self?.runTopSubscription(client: client)
+                })
+            streamTasks.append(
+                Task { [weak self] in
+                    await self?.runTimelineSubscription(client: client)
+                })
+            streamTasks.append(
+                Task { [weak self] in
+                    await self?.runFlamegraphSubscription(client: client)
+                })
 
             Task { [weak self] in
                 guard let client = await self?.activeClient() else { return }
@@ -428,6 +388,13 @@ final class AppModel {
                 }
                 self.symbolCount = update.entries.count
                 self.onCPUTime = TimeInterval(update.totalOnCpuNs) / 1_000_000_000
+                let oc = update.totalOffCpu
+                self.offCPUTime =
+                    TimeInterval(
+                        oc.idleNs + oc.lockNs + oc.semaphoreNs + oc.ipcNs
+                            + oc.ioReadNs + oc.ioWriteNs + oc.readinessNs + oc.sleepNs
+                            + oc.connectNs + oc.otherNs
+                    ) / 1_000_000_000
             } catch {
                 NSLog("stax: top poll failed: %@", "\(error)")
             }
@@ -660,11 +627,11 @@ final class AppModel {
 
 private func symbolKind(forLanguage language: String) -> SymbolKind {
     switch language.lowercased() {
-    case "rust":           .rust
-    case "c":              .c
-    case "cpp", "c++":     .cpp
-    case "swift":          .swift
+    case "rust": .rust
+    case "c": .c
+    case "cpp", "c++": .cpp
+    case "swift": .swift
     case "objc", "objective-c", "objectivec": .objc
-    default:               .unknown
+    default: .unknown
     }
 }

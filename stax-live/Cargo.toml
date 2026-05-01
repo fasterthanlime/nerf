@@ -10,6 +10,7 @@ stax-live-proto = { path = "../stax-live-proto" }
 tokio = { version = "1", features = ["rt", "time"] }
 tracing = "0.1"
 parking_lot = "0.12"
+lru = "0.12"
 memchr = "2"
 arborium = { version = "2.16", features = ["lang-asm", "lang-rust", "lang-c", "lang-cpp"] }
 arborium-theme = "2.16"
@@ -17,7 +18,14 @@ addr2line = { version = "0.21", default-features = false, features = ["std"] }
 yaxpeax-arch = { version = "0.3", default-features = false, features = ["std"] }
 yaxpeax-x86 = { version = "2", default-features = false, features = ["std", "fmt"] }
 yaxpeax-arm = { version = "0.4.0", default-features = false, features = ["std", "fmt"] }
-object = { version = "0.39.1", default-features = false, features = ["std", "read_core", "elf", "macho", "compression", "archive"] }
+object = { version = "0.39.1", default-features = false, features = [
+  "std",
+  "read_core",
+  "elf",
+  "macho",
+  "compression",
+  "archive",
+] }
 stax-demangle = { path = "../stax-demangle" }
 nwind = { path = "../nwind", default-features = false, features = ["log"] }
 
