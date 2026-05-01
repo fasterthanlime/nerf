@@ -41,51 +41,175 @@ struct MainPane: View {
     }
 
     private var flame: some View {
-        FlameView(flamegraph: model.flamegraph) { node in
-            guard let fg = model.flamegraph else { return }
-            model.focusOnFlameNode(node, strings: fg.strings)
-        }
+        FlameView(
+            flamegraph: model.flamegraph,
+            onOpen: { node in
+                guard let fg = model.flamegraph else { return }
+                model.focusOnFlameNode(node, strings: fg.strings)
+            }
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
-/// Stacked-tree flame graph. Each level is one fixed-height row;
-/// children of a node are placed left-to-right under their parent,
-/// with widths proportional to their `on_cpu_ns`. Coloured by the
-/// node's language string. Clicking a cell calls `onTap` with the
-/// underlying FlameNode (the deepest cell containing the click point).
+// MARK: - Flame View
+
+/// Stacked-tree flame graph with highlight-on-single-click,
+/// double-click to drill into call graph, vertical scrolling, and
+/// keyboard shortcuts (Enter to open, Esc to clear highlight).
 private struct FlameView: View {
     let flamegraph: FlamegraphUpdate?
-    var onTap: (FlameNode) -> Void = { _ in }
+    var onOpen: (FlameNode) -> Void = { _ in }
+
+    @State private var highlightedAddress: UInt64? = nil
 
     var body: some View {
-        ZStack {
-            Color(nsColor: .textBackgroundColor).opacity(0.3)
-            if let flamegraph {
-                GeometryReader { geo in
-                    let cells = layoutFlame(root: flamegraph.root, in: geo.size)
-                    Canvas { ctx, _ in
-                        for cell in cells {
-                            drawFlameCell(cell, in: ctx, strings: flamegraph.strings)
+        VStack(spacing: 0) {
+            ZStack {
+                Color(nsColor: .textBackgroundColor).opacity(0.3)
+                if let flamegraph {
+                    GeometryReader { geo in
+                        let cells = layoutFlame(
+                            root: flamegraph.root, in: geo.size)
+                        let totalHeight = flameTotalHeight(cells: cells)
+                        ScrollView(.vertical) {
+                            ZStack(alignment: .topLeading) {
+                                Canvas { ctx, _ in
+                                    for cell in cells {
+                                        drawFlameCell(
+                                            cell,
+                                            highlighted: cell.node
+                                                .address
+                                                == highlightedAddress,
+                                            in: ctx,
+                                            strings: flamegraph
+                                                .strings)
+                                    }
+                                }
+                                .frame(
+                                    width: geo.size.width,
+                                    height: totalHeight)
+
+                                // Per-cell clear tap targets for
+                                // double-tap detection. SwiftUI
+                                // doesn't support simultaneously
+                                // recognising single + double tap on
+                                // the same view, so we overlay
+                                // invisible rects.
+                                ForEach(
+                                    cells, id: \.rect.debugDescription
+                                ) { cell in
+                                    Color.clear
+                                        .contentShape(.rect)
+                                        .frame(
+                                            width: cell.rect.width,
+                                            height: cell.rect.height
+                                        )
+                                        .position(
+                                            x: cell.rect.midX,
+                                            y: cell.rect.midY
+                                        )
+                                        .gesture(
+                                            TapGesture(count: 2)
+                                                .onEnded {
+                                                    onOpen(cell.node)
+                                                }
+                                                .exclusively(
+                                                    before:
+                                                        SpatialTapGesture()
+                                                        .onEnded {
+                                                            _ in
+                                                            highlightedAddress =
+                                                                cell
+                                                                .node
+                                                                .address
+                                                        }))
+                                }
+                            }
+                            .contentShape(.rect)
+                            .onTapGesture { _ in
+                                highlightedAddress = nil
+                            }
                         }
                     }
-                    .contentShape(.rect)
-                    .onTapGesture(coordinateSpace: .local) { loc in
-                        // Walk in reverse — render order is parent-first,
-                        // so the last rect containing the point is the
-                        // deepest (and thus most specific) cell.
-                        if let hit = cells.reversed().first(where: { $0.rect.contains(loc) }) {
-                            onTap(hit.node)
-                        }
-                    }
+                } else {
+                    Text("waiting for flamegraph…")
+                        .font(.mono(.callout))
+                        .foregroundStyle(.tertiary)
                 }
-            } else {
-                Text("waiting for flamegraph…")
-                    .font(.mono(.callout))
+            }
+            flameStatusBar
+        }
+        .focusable()
+        .focusEffectDisabled()
+        .onKeyPress(.return) {
+            guard
+                let addr = highlightedAddress,
+                let fg = flamegraph,
+                addr != 0,
+                let node = findNode(address: addr, in: fg.root)
+            else { return .ignored }
+            onOpen(node)
+            return .handled
+        }
+        .onKeyPress(.escape) {
+            highlightedAddress = nil
+            return .handled
+        }
+    }
+
+    private var flameStatusBar: some View {
+        HStack(spacing: 8) {
+            if let addr = highlightedAddress,
+                let fg = flamegraph,
+                let node = findNode(address: addr, in: fg.root)
+            {
+                let name =
+                    stringAt(node.functionName, in: fg.strings)
+                    ?? hex(node.address)
+                let bin =
+                    stringAt(node.binary, in: fg.strings) ?? ""
+                let onCPU = formatDuration(
+                    TimeInterval(node.onCpuNs) / 1_000_000_000)
+                let pct =
+                    fg.totalOnCpuNs > 0
+                    ? String(
+                        format: "%.1f%%",
+                        Double(node.onCpuNs)
+                            / Double(fg.totalOnCpuNs) * 100)
+                    : "0%"
+                Text(name)
+                    .font(.mono(.caption))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(bin)
+                    .font(.mono(.caption2))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                Spacer()
+                Text("\(onCPU) · \(pct)")
+                    .font(.mono(.caption2))
+                    .foregroundStyle(.secondary)
+            } else if flamegraph != nil {
+                Text("click to highlight · double-click to open")
+                    .font(.mono(.caption2))
                     .foregroundStyle(.tertiary)
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(.bar)
     }
+}
+
+private func findNode(address: UInt64, in root: FlameNode) -> FlameNode? {
+    if root.address == address { return root }
+    for child in root.children {
+        if let found = findNode(address: address, in: child) {
+            return found
+        }
+    }
+    return nil
 }
 
 private struct LaidOutFlameCell {
@@ -132,11 +256,25 @@ private func layoutFlame(root: FlameNode, in size: CGSize) -> [LaidOutFlameCell]
     return cells
 }
 
+private func flameTotalHeight(cells: [LaidOutFlameCell]) -> CGFloat {
+    cells.map(\.rect.maxY).max() ?? 0
+}
+
 private func drawFlameCell(
-    _ cell: LaidOutFlameCell, in ctx: GraphicsContext, strings: [String]
+    _ cell: LaidOutFlameCell,
+    highlighted: Bool,
+    in ctx: GraphicsContext,
+    strings: [String]
 ) {
     let fill = flameNodeColor(cell.node, strings: strings)
     ctx.fill(Path(cell.rect), with: .color(fill))
+
+    if highlighted {
+        ctx.stroke(
+            Path(cell.rect),
+            with: .color(.white.opacity(0.9)),
+            lineWidth: 1.5)
+    }
 
     if cell.rect.width >= 32 {
         let name = stringAt(cell.node.functionName, in: strings) ?? hex(cell.node.address)
@@ -160,14 +298,15 @@ private func flameNodeColor(_ node: FlameNode, strings: [String]) -> Color {
     let lang = (Int(node.language) < strings.count ? strings[Int(node.language)] : "")
         .lowercased()
     switch lang {
-    case "rust":           return Color(red: 0.74, green: 0.56, blue: 0.91).opacity(0.6)
-    case "c":              return Color(red: 0.36, green: 0.78, blue: 0.85).opacity(0.6)
-    case "cpp", "c++":     return Color(red: 0.36, green: 0.65, blue: 0.95).opacity(0.6)
-    case "swift":          return Color(red: 0.95, green: 0.55, blue: 0.43).opacity(0.6)
+    case "rust": return Color(red: 0.74, green: 0.56, blue: 0.91).opacity(0.6)
+    case "c": return Color(red: 0.36, green: 0.78, blue: 0.85).opacity(0.6)
+    case "cpp", "c++": return Color(red: 0.36, green: 0.65, blue: 0.95).opacity(0.6)
+    case "swift": return Color(red: 0.95, green: 0.55, blue: 0.43).opacity(0.6)
     case "objc",
-         "objective-c",
-         "objectivec":     return Color(red: 0.55, green: 0.82, blue: 0.45).opacity(0.6)
-    default:               return Color(red: 0.96, green: 0.78, blue: 0.27).opacity(0.6)
+        "objective-c",
+        "objectivec":
+        return Color(red: 0.55, green: 0.82, blue: 0.45).opacity(0.6)
+    default: return Color(red: 0.96, green: 0.78, blue: 0.27).opacity(0.6)
     }
 }
 
