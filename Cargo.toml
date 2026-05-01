@@ -52,6 +52,7 @@ members = [
   "stax-live",
   "stax-live-proto",
   "stax-vox-observe",
+  "stax-unwind",
   "stax-server",
   "stax-shade",
   "stax-shade-proto",

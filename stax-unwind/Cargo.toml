@@ -1,0 +1,7 @@
+[package]
+name = "stax-unwind"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nwind = { version = "0.1", path = "../nwind", default-features = false }

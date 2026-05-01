@@ -1471,13 +1471,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "metrix"
-version = "0.1.0"
-dependencies = [
- "facet",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2261,6 +2254,7 @@ dependencies = [
  "stax-mac-capture",
  "stax-shade-proto",
  "stax-target-images",
+ "stax-unwind",
  "stax-vox-observe",
  "staxd-client",
  "tokio",
@@ -2287,6 +2281,13 @@ dependencies = [
  "mach2",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "stax-unwind"
+version = "0.1.0"
+dependencies = [
+ "nwind",
 ]
 
 [[package]]
@@ -2746,7 +2747,6 @@ dependencies = [
  "facet-reflect",
  "futures-util",
  "getrandom 0.4.2",
- "metrix",
  "moire",
  "smallvec 1.15.1",
  "tokio",
@@ -2869,7 +2869,6 @@ dependencies = [
  "futures-channel",
  "heck",
  "indexmap",
- "metrix",
  "moire",
  "smallvec 1.15.1",
  "structstruck",

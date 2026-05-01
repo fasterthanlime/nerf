@@ -67,7 +67,6 @@ mod address_space;
 pub mod arch;
 mod arm_extab;
 mod binary;
-mod captured;
 mod debug_info_index;
 mod dwarf;
 mod dwarf_regs;
@@ -85,12 +84,6 @@ pub use crate::address_space::{
 };
 pub use crate::arch::{UnwindFailure, UnwindMode};
 pub use crate::binary::{BinaryData, BinaryDataReader, LoadHeader, SymbolTable};
-pub use crate::captured::{
-    captured_frame_pointer_walk, strip_code_pointer, strip_data_pointer, CapturedBridgePolicy,
-    CapturedImageMapping, CapturedLoadFailure, CapturedReload, CapturedStack,
-    CapturedStackUnwinder, CapturedThreadState, CapturedUnwindError, CapturedUnwindFailure,
-    CapturedUnwindOptions, CapturedUnwindOutcome,
-};
 pub use crate::dwarf_regs::DwarfRegs;
 pub use crate::range_map::RangeMap;
 pub use crate::symbols::Symbols;

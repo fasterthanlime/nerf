@@ -1,14 +1,13 @@
 use std::convert::TryInto;
 use std::sync::Arc;
 
-use proc_maps::Region;
+use nwind::proc_maps::Region;
 
-use crate::address_space::{AddressSpace, IAddressSpace, Primitive};
-use crate::arch::{self, Architecture, Registers, UnwindFailure, UnwindMode};
-use crate::binary::BinaryData;
-use crate::dwarf_regs::DwarfRegs;
-use crate::frame_descriptions::LoadHint;
-use crate::types::UserFrame;
+use nwind::arch::{self, Architecture, Registers};
+use nwind::{
+    AddressSpace, BinaryData, DwarfRegs, IAddressSpace, LoadHint, Primitive, UnwindFailure,
+    UnwindMode, UserFrame,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapturedImageMapping {
@@ -370,20 +369,16 @@ impl CapturedStackUnwinder<arch::native::Arch> {
         options: CapturedUnwindOptions,
     ) -> Result<CapturedUnwindOutcome, CapturedUnwindFailure> {
         match self.unwind_callers_once(state, stack, scratch, options.mode, options.max_frames) {
-            Ok(callers) => {
-                Ok(CapturedUnwindOutcome {
-                    callers,
-                    bridge_attempted: false,
-                    bridge_steps: 0,
-                })
-            }
-            Err(error) if !options.bridge.should_bridge(&error) => {
-                Err(CapturedUnwindFailure {
-                    error,
-                    bridge_attempted: false,
-                    bridge_steps: 0,
-                })
-            }
+            Ok(callers) => Ok(CapturedUnwindOutcome {
+                callers,
+                bridge_attempted: false,
+                bridge_steps: 0,
+            }),
+            Err(error) if !options.bridge.should_bridge(&error) => Err(CapturedUnwindFailure {
+                error,
+                bridge_attempted: false,
+                bridge_steps: 0,
+            }),
             Err(error) => {
                 let mut last_error = error;
                 let mut bridge_steps = 0usize;
@@ -535,7 +530,7 @@ fn dwarf_regs_from_state(state: CapturedThreadState) -> DwarfRegs {
 
 #[cfg(target_arch = "aarch64")]
 fn append_native_dwarf_regs(regs: &mut DwarfRegs, state: CapturedThreadState) {
-    use crate::arch::aarch64::dwarf;
+    use nwind::arch::aarch64::dwarf;
 
     regs.append(dwarf::PC, strip_code_pointer(state.pc));
     regs.append(dwarf::X30, strip_code_pointer(state.lr));
@@ -545,7 +540,7 @@ fn append_native_dwarf_regs(regs: &mut DwarfRegs, state: CapturedThreadState) {
 
 #[cfg(target_arch = "x86_64")]
 fn append_native_dwarf_regs(regs: &mut DwarfRegs, state: CapturedThreadState) {
-    use crate::arch::amd64::dwarf;
+    use nwind::arch::amd64::dwarf;
 
     regs.append(dwarf::RETURN_ADDRESS, strip_code_pointer(state.pc));
     regs.append(dwarf::RBP, strip_data_pointer(state.fp));

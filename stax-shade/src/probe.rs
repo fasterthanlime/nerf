@@ -19,15 +19,16 @@ use mach2::traps::mach_task_self;
 use mach2::vm::mach_vm_deallocate;
 use mach2::vm::mach_vm_read_overwrite;
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
-use nwind::{
-    CapturedImageMapping, CapturedStack, CapturedStackUnwinder, CapturedThreadState,
-    CapturedUnwindError, CapturedUnwindOptions, UnwindFailure, UnwindMode,
-    captured_frame_pointer_walk, strip_code_pointer, strip_data_pointer,
-};
+use nwind::{UnwindFailure, UnwindMode};
 use stax_mac_capture::sample_sink::CpuIntervalEvent;
 use stax_mac_capture::{
     BinaryLoadedEvent, BinaryUnloadedEvent, JitdumpEvent, MachOByteSource, ProbeQueueStats,
     ProbeResultEvent, ProbeTiming, SampleEvent, SampleSink, ThreadNameEvent, WakeupEvent,
+};
+use stax_unwind::{
+    CapturedImageMapping, CapturedStack, CapturedStackUnwinder, CapturedThreadState,
+    CapturedUnwindError, CapturedUnwindOptions, captured_frame_pointer_walk, strip_code_pointer,
+    strip_data_pointer,
 };
 use staxd_client::KperfProbeTriggerTiming;
 
