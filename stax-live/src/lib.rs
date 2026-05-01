@@ -3,6 +3,7 @@
 //! There used to be an in-process `--serve` aggregator entry point
 //! here too; that's been deleted.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -36,7 +37,7 @@ mod probe_match;
 pub mod source;
 
 pub use aggregator::{Aggregator, ProbeQueueStats, ProbeResultRecord, ProbeTiming};
-pub use binaries::{BinaryRegistry, LiveSymbolOwned, LoadedBinary};
+pub use binaries::{BinaryRegistry, LiveSymbolOwned, LoadedBinary, ResolvedSymbol};
 
 impl From<stax_live_proto::ProbeTiming> for ProbeTiming {
     fn from(t: stax_live_proto::ProbeTiming) -> Self {
@@ -2637,7 +2638,13 @@ fn compute_flame_update(aggregation: &Aggregation, binaries: &BinaryRegistry) ->
     let total_on_cpu_ns = aggregation.total_on_cpu_ns;
     let total_off_cpu = aggregation.total_off_cpu;
     let mut interner = StringInterner::new();
-    let mut children = build_children(&[&aggregation.flame_root], binaries, &mut interner);
+    let mut symbol_cache: HashMap<u64, ResolvedSymbol> = HashMap::new();
+    let mut children = build_children(
+        &[&aggregation.flame_root],
+        binaries,
+        &mut interner,
+        &mut symbol_cache,
+    );
     // build_children already returns children sorted; fold_recursion
     // only rewrites a node's children Vec, never the node's own data,
     // so the top-level order stays correct.
@@ -2715,9 +2722,8 @@ fn build_children(
     sources: &[&StackNode],
     binaries: &BinaryRegistry,
     interner: &mut StringInterner,
+    symbol_cache: &mut HashMap<u64, ResolvedSymbol>,
 ) -> Vec<FlameNode> {
-    use std::collections::HashMap;
-
     type SymbolKey = (Option<String>, Option<String>);
 
     struct Acc<'a> {
@@ -2733,15 +2739,39 @@ fn build_children(
         sub_sources: Vec<&'a StackNode>,
     }
 
+    /// Resolve an address to its (function_name, binary, is_main, language)
+    /// tuple, caching results so repeated occurrences of the same address
+    /// (common in recursive / widely-called functions) avoid redundant
+    /// binary-registry lookups and string clones.
+    fn resolve<'c>(
+        cache: &'c mut HashMap<u64, ResolvedSymbol>,
+        binaries: &BinaryRegistry,
+        addr: u64,
+    ) -> Option<&'c ResolvedSymbol> {
+        use std::collections::hash_map::Entry;
+        match cache.entry(addr) {
+            Entry::Occupied(e) => Some(e.into_mut()),
+            Entry::Vacant(e) => {
+                let resolved = binaries.lookup_symbol(addr)?;
+                Some(e.insert(resolved))
+            }
+        }
+    }
+
     let mut groups: HashMap<SymbolKey, Acc> = HashMap::new();
     for src in sources {
         for (&addr, child) in &src.children {
-            let resolved = binaries.lookup_symbol(addr);
+            let resolved = resolve(symbol_cache, binaries, addr);
             let (fname, bin, is_main, lang) = match resolved {
-                Some(r) => (Some(r.function_name), Some(r.binary), r.is_main, r.language),
+                Some(r) => (
+                    Some(&r.function_name),
+                    Some(&r.binary),
+                    r.is_main,
+                    r.language,
+                ),
                 None => (None, None, false, stax_demangle::Language::Unknown),
             };
-            let key = (fname, bin);
+            let key = (fname.cloned(), bin.cloned());
             let acc = groups.entry(key).or_insert_with(|| Acc {
                 on_cpu_ns: 0,
                 off_cpu: OffCpuBreakdown::default(),
@@ -2789,7 +2819,7 @@ fn build_children(
 
     let mut visible: Vec<FlameNode> = Vec::new();
     for ((fname, bin), acc) in entries {
-        let grandchildren = build_children(&acc.sub_sources, binaries, interner);
+        let grandchildren = build_children(&acc.sub_sources, binaries, interner, symbol_cache);
         visible.push(FlameNode {
             address: acc.rep_addr,
             on_cpu_ns: acc.on_cpu_ns,
