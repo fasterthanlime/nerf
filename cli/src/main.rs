@@ -14,10 +14,10 @@ use stax_core::{
     cmd_setup_mac,
 };
 use stax_live_proto::{
-    DiagnosticsSnapshot, FlameNode, FlamegraphUpdate, HistogramSnapshot, LaunchEnvVar,
-    LaunchRequest, LiveFilter, OffCpuBreakdown, ProbeDiffEntry, ProbeDiffUpdate, ProfilerClient,
-    RunControlClient, RunSummary, ServerStatus, StopReason, TelemetrySnapshot, TerminalInput,
-    TerminalOutput, TerminalSize, ThreadsUpdate, TopSort, ViewParams, WaitCondition, WaitOutcome,
+    DiagnosticsSnapshot, FlameNode, FlamegraphUpdate, LaunchEnvVar, LaunchRequest, LiveFilter,
+    OffCpuBreakdown, ProbeDiffEntry, ProbeDiffUpdate, ProfilerClient, RunControlClient, RunSummary,
+    ServerStatus, StopReason, TerminalInput, TerminalOutput, TerminalSize, ThreadsUpdate, TopSort,
+    ViewParams, WaitCondition, WaitOutcome,
 };
 
 fn main_impl() -> Result<(), Box<dyn Error>> {
@@ -1572,78 +1572,6 @@ fn print_diagnostics(snapshot: &DiagnosticsSnapshot) {
         print_run_one_line(active);
     } else {
         println!("active run: none");
-    }
-    print_telemetry(&snapshot.telemetry);
-}
-
-fn print_telemetry(snapshot: &TelemetrySnapshot) {
-    println!();
-    println!("telemetry: {}", snapshot.component);
-
-    if !snapshot.phases.is_empty() {
-        println!("phases:");
-        for phase in &snapshot.phases {
-            println!(
-                "  {:24} {:18} {:>8}  {}",
-                phase.name,
-                phase.state,
-                format_duration_ns(phase.elapsed_ns),
-                phase.detail
-            );
-        }
-    }
-
-    if !snapshot.gauges.is_empty() {
-        println!("gauges:");
-        for gauge in &snapshot.gauges {
-            println!("  {:32} {}", gauge.name, gauge.value);
-        }
-    }
-
-    if !snapshot.counters.is_empty() {
-        println!("counters:");
-        for counter in &snapshot.counters {
-            println!("  {:32} {}", counter.name, counter.value);
-        }
-    }
-
-    if !snapshot.histograms.is_empty() {
-        println!("histograms:");
-        for histogram in &snapshot.histograms {
-            print_histogram(histogram);
-        }
-    }
-
-    if !snapshot.recent_events.is_empty() {
-        println!("recent events:");
-        for event in &snapshot.recent_events {
-            println!("  {}  {:24} {}", event.at_unix_ns, event.name, event.detail);
-        }
-    }
-}
-
-fn print_histogram(histogram: &HistogramSnapshot) {
-    let avg = if histogram.count == 0 {
-        0
-    } else {
-        histogram.sum / histogram.count
-    };
-    println!(
-        "  {} count={} avg={} max={} overflow={}",
-        histogram.name,
-        histogram.count,
-        format_duration_ns(avg),
-        format_duration_ns(histogram.max),
-        histogram.overflow
-    );
-    for bucket in &histogram.buckets {
-        if bucket.count != 0 {
-            println!(
-                "    <= {:>8}: {}",
-                format_duration_ns(bucket.le),
-                bucket.count
-            );
-        }
     }
 }
 

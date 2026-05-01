@@ -46,9 +46,6 @@ const DEFAULT_SOCKET: &str = "/tmp/staxd.sock";
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     init_logging();
-    let telemetry = metrix::TelemetryRegistry::new("staxd");
-    let _telemetry_registration =
-        stax_vox_observe::register_global_telemetry("staxd", "daemon", telemetry.clone());
     let _vox_sigusr1_dump = stax_vox_observe::install_global_sigusr1_dump("staxd");
 
     let socket_path = parse_socket_arg();
@@ -61,7 +58,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
     }
 
-    let server = StaxdServer::new(telemetry.clone());
+    let server = StaxdServer::new();
 
     let listener =
         vox::transport::local::LocalLinkAcceptor::bind(socket_path.to_string_lossy().into_owned())
@@ -93,15 +90,14 @@ async fn main() -> Result<()> {
                 }
             };
             let server = server.clone();
-            let telemetry = telemetry.clone();
             tokio::spawn(async move {
                 let dispatcher = StaxdDispatcher::new(server);
                 let result = vox::acceptor_on(link)
                     .channel_capacity(STAXD_RECORD_CHANNEL_CAPACITY)
-                    .observer(
-                        stax_vox_observe::VoxObserverLogger::new("staxd", "staxd-records")
-                            .with_telemetry(telemetry.clone()),
-                    )
+                    .observer(stax_vox_observe::VoxObserverLogger::new(
+                        "staxd",
+                        "staxd-records",
+                    ))
                     .non_resumable()
                     // Detect dead peers without flagging legit ones.
                     // The recorder fires a giant pile of synchronous
@@ -170,7 +166,6 @@ fn parse_socket_arg() -> PathBuf {
 #[derive(Clone)]
 struct StaxdServer {
     session: Arc<Mutex<Option<SessionInfo>>>,
-    telemetry: metrix::TelemetryRegistry,
 }
 
 #[derive(Clone)]
@@ -181,10 +176,9 @@ struct SessionInfo {
 }
 
 impl StaxdServer {
-    fn new(telemetry: metrix::TelemetryRegistry) -> Self {
+    fn new() -> Self {
         Self {
             session: Arc::new(Mutex::new(None)),
-            telemetry,
         }
     }
 }
@@ -237,7 +231,7 @@ impl Staxd for StaxdServer {
             config.target_pid, config.frequency_hz, config.buf_records
         );
 
-        let result = session::run(config, records, cancel, self.telemetry.clone()).await;
+        let result = session::run(config, records).await;
 
         // Always release the slot. The session driver tore down kperf+
         // kdebug on its own when it returned; here we just release the

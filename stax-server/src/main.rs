@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use metrix::{CounterHandle, GaugeHandle, HistogramHandle, PhaseHandle, TelemetryRegistry};
 use parking_lot::{Mutex, RwLock};
 use stax_live::source::SourceResolver;
 use stax_live::{
@@ -47,11 +46,6 @@ async fn main() -> eyre::Result<()> {
     }
 
     let server = ServerState::new(socket.clone());
-    let _telemetry_registration = stax_vox_observe::register_global_telemetry(
-        "stax-server",
-        "server",
-        server.telemetry.registry.clone(),
-    );
     server.attach_local_shared_cache();
 
     let local_listener =
@@ -169,7 +163,7 @@ fn build_factory(
 fn spawn_session_local(server: ServerState, link: vox::transport::local::LocalLink) {
     let shade_slot: ShadeSlot = Arc::new(parking_lot::Mutex::new(None));
     let factory = build_factory(server.clone(), shade_slot.clone());
-    let observer = server.telemetry.vox_observer("local");
+    let observer = stax_vox_observe::VoxObserverLogger::new("stax-server", "local");
     tokio::spawn(async move {
         let result = vox::acceptor_on(link)
             .channel_capacity(STAX_SERVER_CHANNEL_CAPACITY)
@@ -207,7 +201,7 @@ fn spawn_session_local(server: ServerState, link: vox::transport::local::LocalLi
 fn spawn_session_ws(server: ServerState, link: <vox::WsListener as vox::VoxListener>::Link) {
     let shade_slot: ShadeSlot = Arc::new(parking_lot::Mutex::new(None));
     let factory = build_factory(server.clone(), shade_slot.clone());
-    let observer = server.telemetry.vox_observer("ws");
+    let observer = stax_vox_observe::VoxObserverLogger::new("stax-server", "ws");
     tokio::spawn(async move {
         let result = vox::acceptor_on(link)
             .channel_capacity(STAX_SERVER_CHANNEL_CAPACITY)
@@ -264,7 +258,6 @@ struct ServerState {
     revision: Arc<AtomicU64>,
     source: Arc<Mutex<SourceResolver>>,
     paused: Arc<AtomicBool>,
-    telemetry: ServerTelemetry,
     started_at_unix_ns: u64,
     next_run_id: Arc<AtomicU64>,
     terminal: Arc<Mutex<TerminalState>>,
@@ -274,92 +267,6 @@ struct ServerState {
 }
 
 #[derive(Clone)]
-struct ServerTelemetry {
-    registry: TelemetryRegistry,
-    run_phase: PhaseHandle,
-    ingest_phase: PhaseHandle,
-    reliable_phase: PhaseHandle,
-    runs_started: CounterHandle,
-    runs_stopped: CounterHandle,
-    ingest_recv_errors: CounterHandle,
-    ingest_channel_closed: CounterHandle,
-    ingest_samples: CounterHandle,
-    ingest_probe_results: CounterHandle,
-    ingest_on_cpu: CounterHandle,
-    ingest_off_cpu: CounterHandle,
-    ingest_binaries_loaded: CounterHandle,
-    ingest_binaries_unloaded: CounterHandle,
-    ingest_target_attached: CounterHandle,
-    ingest_thread_names: CounterHandle,
-    ingest_wakeups: CounterHandle,
-    reliable_target_attached: CounterHandle,
-    reliable_binaries_loaded: CounterHandle,
-    reliable_binaries_unloaded: CounterHandle,
-    active_run_id: GaugeHandle,
-    active_pet_samples: GaugeHandle,
-    active_off_cpu_intervals: GaugeHandle,
-    ingest_drainer_active: GaugeHandle,
-    reliable_call_latency: HistogramHandle,
-}
-
-impl ServerTelemetry {
-    fn new() -> Self {
-        let registry = TelemetryRegistry::new("stax-server");
-        Self {
-            run_phase: registry.phase("run.lifecycle"),
-            ingest_phase: registry.phase("ingest.drainer"),
-            reliable_phase: registry.phase("ingest.reliable"),
-            runs_started: registry.counter("runs.started"),
-            runs_stopped: registry.counter("runs.stopped"),
-            ingest_recv_errors: registry.counter("ingest.recv_errors"),
-            ingest_channel_closed: registry.counter("ingest.channel_closed"),
-            ingest_samples: registry.counter("ingest.events.sample"),
-            ingest_probe_results: registry.counter("ingest.events.probe_result"),
-            ingest_on_cpu: registry.counter("ingest.events.on_cpu"),
-            ingest_off_cpu: registry.counter("ingest.events.off_cpu"),
-            ingest_binaries_loaded: registry.counter("ingest.events.binary_loaded"),
-            ingest_binaries_unloaded: registry.counter("ingest.events.binary_unloaded"),
-            ingest_target_attached: registry.counter("ingest.events.target_attached"),
-            ingest_thread_names: registry.counter("ingest.events.thread_name"),
-            ingest_wakeups: registry.counter("ingest.events.wakeup"),
-            reliable_target_attached: registry.counter("ingest.reliable.target_attached"),
-            reliable_binaries_loaded: registry.counter("ingest.reliable.binary_loaded"),
-            reliable_binaries_unloaded: registry.counter("ingest.reliable.binary_unloaded"),
-            active_run_id: registry.gauge("active.run_id"),
-            active_pet_samples: registry.gauge("active.pet_samples"),
-            active_off_cpu_intervals: registry.gauge("active.off_cpu_intervals"),
-            ingest_drainer_active: registry.gauge("ingest.drainer.active"),
-            reliable_call_latency: registry.histogram("ingest.reliable.latency_ns"),
-            registry,
-        }
-    }
-
-    fn record_ingest_event(&self, event: &IngestEvent) {
-        match event {
-            IngestEvent::Sample(_) => self.ingest_samples.inc(1),
-            IngestEvent::ProbeResult(_) => self.ingest_probe_results.inc(1),
-            IngestEvent::OnCpuInterval(_) => self.ingest_on_cpu.inc(1),
-            IngestEvent::OffCpuInterval(_) => self.ingest_off_cpu.inc(1),
-            IngestEvent::BinaryLoaded(_) => self.ingest_binaries_loaded.inc(1),
-            IngestEvent::BinaryUnloaded(_) => self.ingest_binaries_unloaded.inc(1),
-            IngestEvent::TargetAttached { .. } => self.ingest_target_attached.inc(1),
-            IngestEvent::ThreadName { .. } => self.ingest_thread_names.inc(1),
-            IngestEvent::Wakeup(_) => self.ingest_wakeups.inc(1),
-        }
-    }
-
-    fn set_active_counts(&self, pet_samples: u64, off_cpu_intervals: u64) {
-        self.active_pet_samples.set(saturating_i64(pet_samples));
-        self.active_off_cpu_intervals
-            .set(saturating_i64(off_cpu_intervals));
-    }
-
-    fn vox_observer(&self, surface: &'static str) -> stax_vox_observe::VoxObserverLogger {
-        stax_vox_observe::VoxObserverLogger::new("stax-server", surface)
-            .with_telemetry(self.registry.clone())
-    }
-}
-
 struct Inner {
     active: Option<RunSummary>,
     /// Notify that wakes the active run's drainer task so it drops
@@ -374,7 +281,7 @@ struct Inner {
     /// Server->shade control channel for the active run. This is
     /// the clean stop path: server owns run lifecycle, shade owns
     /// target/staxd teardown.
-    active_shade_commands: Option<vox::Tx<ShadeCommand>>,
+    active_shade_commands: Option<Arc<vox::Tx<ShadeCommand>>>,
     ingest_attached: bool,
     /// Process handle for the server-spawned stax-shade child.
     /// Set by RunControl start calls; reaped + cleared by
@@ -385,6 +292,7 @@ struct Inner {
     history: Vec<RunSummary>,
 }
 
+#[derive(Clone)]
 struct ShadeChild {
     pid: u32,
     child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
@@ -422,7 +330,7 @@ impl ServerState {
             revision: Arc::new(AtomicU64::new(1)),
             source: Arc::new(Mutex::new(SourceResolver::new())),
             paused: Arc::new(AtomicBool::new(false)),
-            telemetry: ServerTelemetry::new(),
+
             started_at_unix_ns: now_unix_ns(),
             next_run_id: Arc::new(AtomicU64::new(1)),
             terminal: Arc::new(Mutex::new(TerminalState::default())),
@@ -510,7 +418,7 @@ impl ServerState {
             "shade registered"
         );
         inner.active_shade = Some(info);
-        inner.active_shade_commands = Some(commands);
+        inner.active_shade_commands = Some(Arc::new(commands));
         ShadeAck {
             accepted: true,
             reason: None,
@@ -838,28 +746,16 @@ impl ServerState {
             config.frequency_hz,
             config.correlate_frequency_hz
         );
-        self.telemetry.runs_started.inc(1);
-        self.telemetry.active_run_id.set(saturating_i64(id.0));
-        self.telemetry.set_active_counts(0, 0);
-        self.telemetry.run_phase.enter(
-            "recording",
-            format!(
-                "run_id={} frequency_hz={} correlate_frequency_hz={}",
-                id.0, config.frequency_hz, config.correlate_frequency_hz
-            ),
-        );
-        self.telemetry.registry.event(
-            "run.started",
-            format!(
-                "run_id={} label={}",
-                id.0,
-                self.inner
-                    .lock()
-                    .active
-                    .as_ref()
-                    .map(|run| run.label.as_str())
-                    .unwrap_or("")
-            ),
+        tracing::info!(
+            run_id = id.0,
+            label = self
+                .inner
+                .lock()
+                .active
+                .as_ref()
+                .map(|run| run.label.as_str())
+                .unwrap_or(""),
+            "run started"
         );
         Ok((id, cancel))
     }
@@ -888,26 +784,19 @@ impl ServerState {
         mut events: vox::Rx<IngestBatch>,
     ) {
         let state = self.clone();
-        let telemetry = self.telemetry.clone();
+
         tokio::spawn(async move {
             let mut counts = IngestDrainCounts::default();
             let mut first_event_logged = false;
             let mut last_log = std::time::Instant::now();
             let exit_reason: &'static str;
-            telemetry.ingest_drainer_active.set(1);
-            telemetry
-                .ingest_phase
-                .enter("waiting", format!("run_id={}", id.0));
-            telemetry
-                .registry
-                .event("ingest.drainer.started", format!("run_id={}", id.0));
+
             tracing::info!(run_id = id.0, "stax-server: ingest drainer started");
             loop {
                 tokio::select! {
                     biased;
                     _ = cancel.notified() => {
                         exit_reason = "cancel";
-                        telemetry.ingest_phase.enter("cancelled", format!("run_id={}", id.0));
                         break;
                     }
                     recv = events.recv() => match recv {
@@ -918,11 +807,8 @@ impl ServerState {
                                 for event in batch.events {
                                     let kind = ingest_event_kind(&event);
                                     counts.record(&event);
-                                    telemetry.record_ingest_event(&event);
                                     if !first_event_logged {
                                         first_event_logged = true;
-                                        telemetry.ingest_phase.enter("draining", format!("run_id={} first_kind={kind}", id.0));
-                                        telemetry.registry.event("ingest.first_event", format!("run_id={} kind={kind}", id.0));
                                         tracing::info!(
                                             run_id = id.0,
                                             kind,
@@ -945,13 +831,9 @@ impl ServerState {
                         }
                         Ok(None) => {
                             exit_reason = "channel_closed";
-                            telemetry.ingest_channel_closed.inc(1);
-                            telemetry.ingest_phase.enter("channel_closed", format!("run_id={}", id.0));
                             break;
                         }
                         Err(err) => {
-                            telemetry.ingest_recv_errors.inc(1);
-                            telemetry.ingest_phase.enter("recv_error", format!("run_id={} error={err:?}", id.0));
                             tracing::warn!(
                                 run_id = id.0,
                                 error = ?err,
@@ -969,11 +851,6 @@ impl ServerState {
                 reason = exit_reason,
                 counts = %counts.summary(),
                 "stax-server: ingest drainer exiting"
-            );
-            telemetry.ingest_drainer_active.set(0);
-            telemetry.registry.event(
-                "ingest.drainer.exiting",
-                format!("run_id={} reason={exit_reason}", id.0),
             );
             drop(events);
             if exit_reason == "cancel" {
@@ -1087,14 +964,6 @@ impl ServerState {
         inner.ingest_attached = false;
         inner.shade_child = None;
         inner.history.push(summary);
-        self.telemetry.active_run_id.set(0);
-        self.telemetry.runs_stopped.inc(1);
-        self.telemetry
-            .run_phase
-            .enter("start_failed", format!("run_id={}", run_id.0));
-        self.telemetry
-            .registry
-            .event("run.start_failed", format!("run_id={}", run_id.0));
     }
 }
 
@@ -1295,7 +1164,6 @@ impl RunControl for ServerState {
         DiagnosticsSnapshot {
             server_started_at_unix_ns: self.started_at_unix_ns,
             active: inner.active.clone().into_iter().collect(),
-            telemetry: self.telemetry.registry.snapshot(),
         }
     }
 
@@ -1431,7 +1299,10 @@ impl RunControl for ServerState {
             // tidier to actively detach via the Shade trait once
             // we have a shutdown method on it; for now best-effort.
             inner.active_shade = None;
-            let shade_commands = inner.active_shade_commands.take();
+            let shade_commands = inner
+                .active_shade_commands
+                .take()
+                .map(|arc| Arc::into_inner(arc).expect("sole reference to shade commands"));
             inner.ingest_attached = false;
             (snapshot, inner.cancel.take(), shade_commands)
         };
@@ -1443,12 +1314,7 @@ impl RunControl for ServerState {
         if let Some(cancel) = cancel {
             cancel.notify_waiters();
         }
-        self.telemetry
-            .run_phase
-            .enter("stopping", format!("run_id={}", snapshot.id.0));
-        self.telemetry
-            .registry
-            .event("run.stop_requested", format!("run_id={}", snapshot.id.0));
+
         // Reap the auto-spawned shade (if any). Has to happen
         // outside the inner lock — reap_shade_child takes it
         // again and may sleep up to 1s waiting for the child to
@@ -1523,19 +1389,8 @@ impl RunIngest for ServerState {
         pid: u32,
         task_port: u64,
     ) -> Result<(), RunIngestError> {
-        let started = std::time::Instant::now();
-        self.telemetry
-            .reliable_phase
-            .enter("target_attached", format!("run_id={}", run_id.0));
-        self.telemetry.reliable_target_attached.inc(1);
-        let result: Result<(), RunIngestError> = self
-            .apply_target_attached(run_id, pid, task_port)
-            .map_err(Into::into);
-        self.telemetry
-            .reliable_call_latency
-            .record_duration(started.elapsed());
-        self.telemetry.reliable_phase.enter("idle", "");
-        result
+        self.apply_target_attached(run_id, pid, task_port)
+            .map_err(Into::into)
     }
 
     async fn publish_binaries_loaded(
@@ -1543,23 +1398,12 @@ impl RunIngest for ServerState {
         run_id: RunId,
         binaries: Vec<WireBinaryLoaded>,
     ) -> Result<(), RunIngestError> {
-        let started = std::time::Instant::now();
-        let count = binaries.len() as u64;
-        self.telemetry.reliable_phase.enter(
-            "binaries_loaded",
-            format!("run_id={} count={count}", run_id.0),
-        );
-        self.telemetry.reliable_binaries_loaded.inc(count);
         let result: Result<(), RunIngestError> = (|| {
             for binary in binaries {
                 self.apply_binary_loaded(run_id, binary)?;
             }
             Ok(())
         })();
-        self.telemetry
-            .reliable_call_latency
-            .record_duration(started.elapsed());
-        self.telemetry.reliable_phase.enter("idle", "");
         result
     }
 
@@ -1568,23 +1412,12 @@ impl RunIngest for ServerState {
         run_id: RunId,
         binaries: Vec<WireBinaryUnloaded>,
     ) -> Result<(), RunIngestError> {
-        let started = std::time::Instant::now();
-        let count = binaries.len() as u64;
-        self.telemetry.reliable_phase.enter(
-            "binaries_unloaded",
-            format!("run_id={} count={count}", run_id.0),
-        );
-        self.telemetry.reliable_binaries_unloaded.inc(count);
         let result: Result<(), RunIngestError> = (|| {
             for binary in binaries {
                 self.apply_binary_unloaded(run_id, binary.base_avma)?;
             }
             Ok(())
         })();
-        self.telemetry
-            .reliable_call_latency
-            .record_duration(started.elapsed());
-        self.telemetry.reliable_phase.enter("idle", "");
         result
     }
 }
@@ -1700,8 +1533,6 @@ impl ServerState {
                 }
                 _ => {}
             }
-            self.telemetry
-                .set_active_counts(active.pet_samples, active.off_cpu_intervals);
         }
         match event {
             IngestEvent::Sample(s) => {
@@ -1823,16 +1654,7 @@ impl ServerState {
             summary.pet_samples,
             summary.off_cpu_intervals
         );
-        self.telemetry.runs_stopped.inc(1);
-        self.telemetry.active_run_id.set(0);
-        self.telemetry
-            .set_active_counts(summary.pet_samples, summary.off_cpu_intervals);
-        self.telemetry
-            .run_phase
-            .enter("stopped", format!("run_id={}", summary.id.0));
-        self.telemetry
-            .registry
-            .event("run.stopped", format!("run_id={}", summary.id.0));
+
         inner.history.push(summary);
         drop(inner); // release before reaping
         self.reap_shade_child();

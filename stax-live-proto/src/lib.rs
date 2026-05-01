@@ -8,10 +8,6 @@
 //! that `stax-live` pulls in.
 
 use facet::Facet;
-pub use metrix::{
-    CounterSnapshot, GaugeSnapshot, HistogramBucketSnapshot, HistogramSnapshot, PhaseSnapshot,
-    RecentEventSnapshot, TelemetrySnapshot,
-};
 
 /// Off-CPU time at a stack node, broken down by why the thread was
 /// off-CPU. Sum across all fields = total off-CPU time.
@@ -1105,7 +1101,6 @@ pub struct ServerStatus {
 pub struct DiagnosticsSnapshot {
     pub server_started_at_unix_ns: u64,
     pub active: Vec<RunSummary>,
-    pub telemetry: TelemetrySnapshot,
 }
 
 /// Agent-side wait condition: which event makes `wait_active` return.

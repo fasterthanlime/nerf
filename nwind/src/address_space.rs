@@ -9,10 +9,7 @@ use std::str;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-#[cfg(feature = "addr2line")]
-use addr2line;
 use byteorder::{self, ByteOrder};
-use gimli;
 use lru::LruCache;
 
 use proc_maps::Region;
@@ -261,7 +258,7 @@ pub fn lookup_binary<'a, A: Architecture, M: MemoryReader<A>>(
         region.binary().decode_symbol_once(address)
     );
 
-    Some(&region.binary())
+    Some(region.binary())
 }
 
 fn process_frame<R: gimli::Reader>(raw_frame: addr2line::Frame<R>, frame: &mut Frame) {
@@ -331,9 +328,9 @@ impl SymbolDecodeCache {
 
     pub fn get(&mut self, address: u64) -> Option<(&str, Option<&str>)> {
         let cache = self.cache.as_mut()?;
-        cache.get(&address).map(|&(ref raw_name, ref name)| {
-            (raw_name.as_str(), name.as_ref().map(|name| name.as_str()))
-        })
+        cache
+            .get(&address)
+            .map(|(raw_name, name)| (raw_name.as_str(), name.as_ref().map(|name| name.as_str())))
     }
 
     pub fn put(&mut self, address: u64, raw_name: String, name: Option<String>) {
@@ -371,13 +368,12 @@ impl<A: Architecture> Binary<A> {
     ) -> Option<MachOCompactUnwindEntry> {
         let binary_data = self.data.as_ref()?;
         let unwind_info = macho_unwind_info::UnwindInfo::parse(binary_data.macho_unwind_info()?)
-            .map_err(|error| {
+            .inspect_err(|&error| {
                 debug!(
                     "Failed to parse __unwind_info for '{}': {}",
                     self.name(),
                     error
                 );
-                error
             })
             .ok()?;
         let image_base = self
@@ -395,14 +391,13 @@ impl<A: Architecture> Binary<A> {
         let compact_pc = compact_offset as u32;
         let function = unwind_info
             .lookup(compact_pc)
-            .map_err(|error| {
+            .inspect_err(|&error| {
                 debug!(
                     "Failed to look up __unwind_info entry for '{}' at 0x{:016X}: {}",
                     self.name(),
                     absolute_address,
                     error
                 );
-                error
             })
             .ok()??;
         let initial_declared_address = image_base.saturating_add(function.start_address as u64);
@@ -949,10 +944,10 @@ impl<'a> fmt::Debug for Frame<'a> {
             self.absolute_address,
             self.demangled_name
                 .as_ref()
-                .or_else(|| self.name.as_ref())
+                .or(self.name.as_ref())
                 .map(|name| name.deref()),
             self.library,
-            self.file.as_ref().map(|path| path.deref()),
+            self.file.as_deref(),
             self.line,
             self.column
         )
@@ -1046,7 +1041,7 @@ fn align_down(value: u64, alignment: u64) -> u64 {
 }
 
 fn align_up(value: u64, alignment: u64) -> u64 {
-    if value & alignment - 1 == 0 {
+    if value & (alignment - 1) == 0 {
         value
     } else {
         (value + alignment) & !(alignment - 1)
@@ -1429,11 +1424,11 @@ pub fn reload<A: Architecture>(
             // file's symtab alongside dynsym is safe.
             if symbols.is_empty() {
                 if let Some(binary_data) = data.binary_data.as_ref() {
-                    symbols.push(Symbols::load_from_binary_data(&binary_data));
+                    symbols.push(Symbols::load_from_binary_data(binary_data));
                 }
             }
             if let Some(debug_binary_data) = data.debug_binary_data.as_ref() {
-                symbols.push(Symbols::load_from_binary_data(&debug_binary_data));
+                symbols.push(Symbols::load_from_binary_data(debug_binary_data));
             }
             let binary_data = data
                 .debug_binary_data
@@ -1461,7 +1456,7 @@ pub fn reload<A: Architecture>(
                     // back as freshly-allocated owned bytes. Both end up
                     // as `Arc<[u8]>` in the gimli reader so the context
                     // doesn't depend on the mmap staying mapped.
-                    match build_addr2line_context(&binary_data) {
+                    match build_addr2line_context(binary_data) {
                         Ok(ctx) => context = Some(Mutex::new(ctx)),
                         Err(error) => {
                             warn!(
@@ -1480,7 +1475,7 @@ pub fn reload<A: Architecture>(
             Some(frame_descriptions) => Some(frame_descriptions),
             None if data.load_frame_descriptions => {
                 if let Some(binary_data) = data.binary_data.as_ref() {
-                    FrameDescriptions::new(&binary_data)
+                    FrameDescriptions::new(binary_data)
                         .should_use_eh_frame_hdr(data.use_eh_frame_hdr)
                         .should_load_eh_frame(data.load_eh_frame)
                         .should_load_debug_frame(data.load_debug_frame)
@@ -1614,6 +1609,12 @@ where
     }
 }
 
+impl<A: Architecture> Default for AddressSpace<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<A: Architecture> AddressSpace<A> {
     pub fn new() -> Self {
         AddressSpace {
@@ -1702,7 +1703,7 @@ fn test_reload() {
 
     fn region(start: u64, inode: u64, name: &str) -> Region {
         Region {
-            start: start,
+            start,
             end: start + 4096,
             is_read: true,
             is_write: false,
@@ -2164,7 +2165,7 @@ fn test_match_mapping_3() {
     ][..];
 
     let mapping = match_mapping(
-        &load_headers,
+        load_headers,
         &Region {
             start: 94266316427264,
             end: 94266316619776,
@@ -2217,7 +2218,7 @@ fn test_match_mapping_4() {
     ][..];
 
     let mapping = match_mapping(
-        &load_headers,
+        load_headers,
         &Region {
             start: 139634006765568,
             end: 139634006769664,

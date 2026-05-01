@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 description = "Shared Vox runtime observer logging for stax components."
 
 [dependencies]
-metrix = { path = "../../metrix" }
 tokio = { version = "1", features = ["rt", "signal"] }
 tracing = "0.1"
 vox = { path = "/Users/amos/bearcove/vox/rust/vox" }
