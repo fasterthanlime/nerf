@@ -3,16 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use metrix::{
-    CounterHandle, GaugeHandle, HistogramHandle, HistogramSnapshot, TelemetryRegistry,
-    TelemetrySnapshot,
-};
-
 const SLOW_CHANNEL_SEND: Duration = Duration::from_millis(10);
 const SLOW_REQUEST: Duration = Duration::from_millis(10);
 
 static GLOBAL_DEBUG_REGISTRY: OnceLock<VoxDebugRegistry> = OnceLock::new();
-static GLOBAL_TELEMETRY_REGISTRY: OnceLock<TelemetryDebugRegistry> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct VoxDebugRegistry {
@@ -25,16 +19,6 @@ struct VoxDebugRegistryInner {
 }
 
 #[derive(Clone)]
-pub struct TelemetryDebugRegistry {
-    inner: Arc<TelemetryDebugRegistryInner>,
-}
-
-struct TelemetryDebugRegistryInner {
-    next_id: AtomicU64,
-    entries: Mutex<Vec<TelemetryDebugEntry>>,
-}
-
-#[derive(Clone)]
 struct VoxDebugEntry {
     id: u64,
     component: &'static str,
@@ -43,22 +27,9 @@ struct VoxDebugEntry {
     caller: vox::Caller,
 }
 
-#[derive(Clone)]
-struct TelemetryDebugEntry {
-    id: u64,
-    component: &'static str,
-    role: &'static str,
-    registry: TelemetryRegistry,
-}
-
 pub struct VoxDebugRegistration {
     id: u64,
     inner: Weak<VoxDebugRegistryInner>,
-}
-
-pub struct TelemetryDebugRegistration {
-    id: u64,
-    inner: Weak<TelemetryDebugRegistryInner>,
 }
 
 #[derive(Clone)]
@@ -66,53 +37,10 @@ pub struct VoxObserverLogger {
     component: &'static str,
     surface: &'static str,
     pid: Option<u32>,
-    telemetry: Option<VoxObserverTelemetry>,
-}
-
-#[derive(Clone)]
-struct VoxObserverTelemetry {
-    registry: TelemetryRegistry,
-    rpc_started: CounterHandle,
-    rpc_finished: CounterHandle,
-    rpc_failed: CounterHandle,
-    rpc_elapsed: HistogramHandle,
-    connections_opened: CounterHandle,
-    connections_closed: CounterHandle,
-    active_connections: GaugeHandle,
-    driver_requests_started: CounterHandle,
-    driver_requests_finished: CounterHandle,
-    driver_requests_failed: CounterHandle,
-    driver_request_elapsed: HistogramHandle,
-    outbound_queue_full: CounterHandle,
-    outbound_queue_closed: CounterHandle,
-    driver_frame_read_bytes: CounterHandle,
-    driver_frame_written_bytes: CounterHandle,
-    driver_errors: CounterHandle,
-    channel_opened: CounterHandle,
-    channel_closed: CounterHandle,
-    channel_reset: CounterHandle,
-    channel_send_started: CounterHandle,
-    channel_send_waiting_for_credit: CounterHandle,
-    channel_send_finished: CounterHandle,
-    channel_send_failed: CounterHandle,
-    channel_send_elapsed: HistogramHandle,
-    channel_try_send: CounterHandle,
-    channel_try_send_failed: CounterHandle,
-    channel_credit_grants: CounterHandle,
-    channel_credit_granted: CounterHandle,
-    channel_item_received: CounterHandle,
-    channel_item_consumed: CounterHandle,
-    transport_frame_read_bytes: CounterHandle,
-    transport_frame_written_bytes: CounterHandle,
-    transport_closed: CounterHandle,
 }
 
 pub fn global_debug_registry() -> &'static VoxDebugRegistry {
     GLOBAL_DEBUG_REGISTRY.get_or_init(VoxDebugRegistry::new)
-}
-
-pub fn global_telemetry_registry() -> &'static TelemetryDebugRegistry {
-    GLOBAL_TELEMETRY_REGISTRY.get_or_init(TelemetryDebugRegistry::new)
 }
 
 pub fn register_global_caller(
@@ -122,14 +50,6 @@ pub fn register_global_caller(
     caller: &vox::Caller,
 ) -> VoxDebugRegistration {
     global_debug_registry().register_caller(component, surface, role, caller)
-}
-
-pub fn register_global_telemetry(
-    component: &'static str,
-    role: &'static str,
-    registry: TelemetryRegistry,
-) -> TelemetryDebugRegistration {
-    global_telemetry_registry().register(component, role, registry)
 }
 
 #[must_use]
@@ -206,7 +126,6 @@ impl VoxDebugRegistry {
     }
 
     pub fn dump_all(&self, process_name: &'static str, reason: &'static str) {
-        global_telemetry_registry().dump_telemetry_snapshots(process_name, reason);
         self.dump_debug_snapshots(process_name, reason);
     }
 
@@ -280,79 +199,6 @@ impl VoxDebugRegistry {
         {
             let _ = process_name;
             None
-        }
-    }
-}
-
-impl TelemetryDebugRegistry {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(TelemetryDebugRegistryInner {
-                next_id: AtomicU64::new(1),
-                entries: Mutex::new(Vec::new()),
-            }),
-        }
-    }
-
-    pub fn register(
-        &self,
-        component: &'static str,
-        role: &'static str,
-        registry: TelemetryRegistry,
-    ) -> TelemetryDebugRegistration {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .entries
-            .lock()
-            .expect("telemetry debug registry mutex poisoned")
-            .push(TelemetryDebugEntry {
-                id,
-                component,
-                role,
-                registry,
-            });
-        TelemetryDebugRegistration {
-            id,
-            inner: Arc::downgrade(&self.inner),
-        }
-    }
-
-    pub fn dump_telemetry_snapshots(&self, process_name: &'static str, reason: &'static str) {
-        let entries = self
-            .inner
-            .entries
-            .lock()
-            .expect("telemetry debug registry mutex poisoned")
-            .clone();
-        tracing::info!(
-            process = process_name,
-            reason,
-            handles = entries.len(),
-            "dumping registered telemetry snapshots"
-        );
-        for entry in entries {
-            let snapshot = entry.registry.snapshot();
-            let formatted = format_telemetry_snapshot(&snapshot);
-            tracing::info!(
-                process = process_name,
-                reason,
-                component = entry.component,
-                role = entry.role,
-                registration_id = entry.id,
-                "\n{formatted}"
-            );
-            for histogram in &snapshot.histograms {
-                let formatted = format_histogram_snapshot(histogram);
-                tracing::info!(
-                    process = process_name,
-                    reason,
-                    component = entry.component,
-                    role = entry.role,
-                    registration_id = entry.id,
-                    histogram = histogram.name.as_str(),
-                    "\n{formatted}"
-                );
-            }
         }
     }
 }
@@ -549,132 +395,6 @@ fn format_channel_ids(ids: &[vox::ChannelId]) -> String {
     out
 }
 
-fn format_telemetry_snapshot(snapshot: &TelemetrySnapshot) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "# Telemetry Snapshot\n\n- component: {}\n- generated_at_unix_ns: {}",
-        snapshot.component, snapshot.generated_at_unix_ns
-    );
-
-    if !snapshot.phases.is_empty() {
-        let _ = writeln!(out, "\n## Phases");
-        for phase in &snapshot.phases {
-            let _ = writeln!(
-                out,
-                "\n### `{}`\n\n- state: {}\n- elapsed: {}\n- entered_at_unix_ns: {}\n- detail: {}",
-                phase.name,
-                phase.state,
-                format_duration(Duration::from_nanos(phase.elapsed_ns)),
-                phase.entered_at_unix_ns,
-                empty_as_dash(&phase.detail)
-            );
-        }
-    }
-
-    if !snapshot.gauges.is_empty() {
-        let _ = writeln!(out, "\n## Gauges");
-        for gauge in &snapshot.gauges {
-            let _ = writeln!(out, "- `{}`: {}", gauge.name, gauge.value);
-        }
-    }
-
-    if !snapshot.histograms.is_empty() {
-        let _ = writeln!(out, "\n## Histograms");
-        for histogram in &snapshot.histograms {
-            format_histogram(&mut out, histogram);
-        }
-    }
-
-    if !snapshot.counters.is_empty() {
-        let _ = writeln!(out, "\n## Counters");
-        for counter in &snapshot.counters {
-            let _ = writeln!(out, "- `{}`: {}", counter.name, counter.value);
-        }
-    }
-
-    if !snapshot.recent_events.is_empty() {
-        let _ = writeln!(out, "\n## Recent Events");
-        for event in &snapshot.recent_events {
-            let _ = writeln!(
-                out,
-                "- `{}` `{}` {}",
-                event.at_unix_ns,
-                event.name,
-                empty_as_dash(&event.detail)
-            );
-        }
-    }
-
-    out
-}
-
-fn format_histogram_snapshot(histogram: &HistogramSnapshot) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "# Telemetry Histogram");
-    format_histogram(&mut out, histogram);
-    out
-}
-
-fn format_histogram(out: &mut String, histogram: &HistogramSnapshot) {
-    let avg = if histogram.count == 0 {
-        0
-    } else {
-        histogram.sum / histogram.count
-    };
-    let _ = writeln!(
-        out,
-        "\n### `{}`\n\n- count: {}\n- avg: {}\n- max: {}\n- overflow: {}",
-        histogram.name,
-        histogram.count,
-        format_histogram_value(histogram, avg),
-        format_histogram_value(histogram, histogram.max),
-        histogram.overflow
-    );
-    if histogram.buckets.iter().any(|bucket| bucket.count != 0) {
-        let _ = writeln!(out, "- buckets:");
-        let mut previous_le = None;
-        let mut previous_count = 0;
-        for bucket in &histogram.buckets {
-            let range_count = bucket.count.saturating_sub(previous_count);
-            if range_count != 0 {
-                let _ = writeln!(
-                    out,
-                    "  - {}: {} (cum {})",
-                    format_histogram_bucket_range(histogram, previous_le, bucket.le),
-                    range_count,
-                    bucket.count,
-                );
-            }
-            previous_le = Some(bucket.le);
-            previous_count = bucket.count;
-        }
-    }
-}
-
-fn format_histogram_bucket_range(
-    histogram: &HistogramSnapshot,
-    previous_le: Option<u64>,
-    le: u64,
-) -> String {
-    match previous_le {
-        Some(previous_le) => format!(
-            "{}..{}",
-            format_histogram_value(histogram, previous_le),
-            format_histogram_value(histogram, le)
-        ),
-        None => format!("<= {}", format_histogram_value(histogram, le)),
-    }
-}
-
-fn format_histogram_value(histogram: &HistogramSnapshot, value: u64) -> String {
-    if histogram.name.ends_with("_ns") || histogram.name.ends_with(".ns") {
-        format_duration(Duration::from_nanos(value))
-    } else {
-        value.to_string()
-    }
-}
-
 fn empty_as_dash(value: &str) -> &str {
     if value.is_empty() { "-" } else { value }
 }
@@ -750,12 +470,6 @@ impl Default for VoxDebugRegistry {
     }
 }
 
-impl Default for TelemetryDebugRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for VoxDebugRegistration {
     fn drop(&mut self) {
         let Some(inner) = self.inner.upgrade() else {
@@ -769,237 +483,18 @@ impl Drop for VoxDebugRegistration {
     }
 }
 
-impl Drop for TelemetryDebugRegistration {
-    fn drop(&mut self) {
-        let Some(inner) = self.inner.upgrade() else {
-            return;
-        };
-        inner
-            .entries
-            .lock()
-            .expect("telemetry debug registry mutex poisoned")
-            .retain(|entry| entry.id != self.id);
-    }
-}
-
 impl VoxObserverLogger {
-    pub const fn new(component: &'static str, surface: &'static str) -> Self {
+    pub fn new(component: &'static str, surface: &'static str) -> Self {
         Self {
             component,
             surface,
             pid: None,
-            telemetry: None,
         }
     }
 
-    pub const fn with_pid(mut self, pid: u32) -> Self {
+    pub fn with_pid(mut self, pid: u32) -> Self {
         self.pid = Some(pid);
         self
-    }
-
-    pub fn with_telemetry(mut self, registry: TelemetryRegistry) -> Self {
-        self.telemetry = Some(VoxObserverTelemetry::new(registry));
-        self
-    }
-}
-
-impl VoxObserverTelemetry {
-    fn new(registry: TelemetryRegistry) -> Self {
-        Self {
-            rpc_started: registry.counter("vox.rpc.started"),
-            rpc_finished: registry.counter("vox.rpc.finished"),
-            rpc_failed: registry.counter("vox.rpc.failed"),
-            rpc_elapsed: registry.histogram("vox.rpc.elapsed_ns"),
-            connections_opened: registry.counter("vox.connection.opened"),
-            connections_closed: registry.counter("vox.connection.closed"),
-            active_connections: registry.gauge("vox.connection.active"),
-            driver_requests_started: registry.counter("vox.driver.request.started"),
-            driver_requests_finished: registry.counter("vox.driver.request.finished"),
-            driver_requests_failed: registry.counter("vox.driver.request.failed"),
-            driver_request_elapsed: registry.histogram("vox.driver.request.elapsed_ns"),
-            outbound_queue_full: registry.counter("vox.driver.outbound_queue.full"),
-            outbound_queue_closed: registry.counter("vox.driver.outbound_queue.closed"),
-            driver_frame_read_bytes: registry.counter("vox.driver.frame_read.bytes"),
-            driver_frame_written_bytes: registry.counter("vox.driver.frame_written.bytes"),
-            driver_errors: registry.counter("vox.driver.errors"),
-            channel_opened: registry.counter("vox.channel.opened"),
-            channel_closed: registry.counter("vox.channel.closed"),
-            channel_reset: registry.counter("vox.channel.reset"),
-            channel_send_started: registry.counter("vox.channel.send.started"),
-            channel_send_waiting_for_credit: registry
-                .counter("vox.channel.send.waiting_for_credit"),
-            channel_send_finished: registry.counter("vox.channel.send.finished"),
-            channel_send_failed: registry.counter("vox.channel.send.failed"),
-            channel_send_elapsed: registry.histogram("vox.channel.send.elapsed_ns"),
-            channel_try_send: registry.counter("vox.channel.try_send"),
-            channel_try_send_failed: registry.counter("vox.channel.try_send.failed"),
-            channel_credit_grants: registry.counter("vox.channel.credit_grants"),
-            channel_credit_granted: registry.counter("vox.channel.credit_granted"),
-            channel_item_received: registry.counter("vox.channel.item_received"),
-            channel_item_consumed: registry.counter("vox.channel.item_consumed"),
-            transport_frame_read_bytes: registry.counter("vox.transport.frame_read.bytes"),
-            transport_frame_written_bytes: registry.counter("vox.transport.frame_written.bytes"),
-            transport_closed: registry.counter("vox.transport.closed"),
-            registry,
-        }
-    }
-
-    fn rpc_event(&self, surface: &'static str, event: vox::RpcEvent) {
-        match event {
-            vox::RpcEvent::Started { .. } => self.rpc_started.inc(1),
-            vox::RpcEvent::Finished {
-                outcome, elapsed, ..
-            } => {
-                self.rpc_finished.inc(1);
-                self.rpc_elapsed.record_duration(elapsed);
-                if outcome != vox::RpcOutcome::Ok {
-                    self.rpc_failed.inc(1);
-                    self.registry.event(
-                        "vox.rpc.failed",
-                        format!("surface={surface} outcome={outcome:?}"),
-                    );
-                }
-            }
-        }
-    }
-
-    fn channel_event(&self, surface: &'static str, event: vox::ChannelEvent) {
-        match event {
-            vox::ChannelEvent::Opened { .. } => self.channel_opened.inc(1),
-            vox::ChannelEvent::SendStarted { .. } => self.channel_send_started.inc(1),
-            vox::ChannelEvent::SendWaitingForCredit { channel } => {
-                self.channel_send_waiting_for_credit.inc(1);
-                self.registry.event(
-                    "vox.channel.waiting_for_credit",
-                    channel_detail(surface, channel),
-                );
-            }
-            vox::ChannelEvent::SendFinished {
-                channel,
-                outcome,
-                elapsed,
-            } => {
-                self.channel_send_finished.inc(1);
-                self.channel_send_elapsed.record_duration(elapsed);
-                if outcome != vox::ChannelSendOutcome::Sent {
-                    self.channel_send_failed.inc(1);
-                    self.registry.event(
-                        "vox.channel.send_failed",
-                        format!("{} outcome={outcome:?}", channel_detail(surface, channel)),
-                    );
-                }
-            }
-            vox::ChannelEvent::TrySend { channel, outcome } => {
-                self.channel_try_send.inc(1);
-                if outcome != vox::ChannelTrySendOutcome::Sent {
-                    self.channel_try_send_failed.inc(1);
-                    self.registry.event(
-                        "vox.channel.try_send_failed",
-                        format!("{} outcome={outcome:?}", channel_detail(surface, channel)),
-                    );
-                }
-            }
-            vox::ChannelEvent::CreditGranted { amount, .. } => {
-                self.channel_credit_grants.inc(1);
-                self.channel_credit_granted.inc(u64::from(amount));
-            }
-            vox::ChannelEvent::ItemReceived { .. } => self.channel_item_received.inc(1),
-            vox::ChannelEvent::ItemConsumed { .. } => self.channel_item_consumed.inc(1),
-            vox::ChannelEvent::Closed { channel, reason } => {
-                self.channel_closed.inc(1);
-                self.registry.event(
-                    "vox.channel.closed",
-                    format!("{} reason={reason:?}", channel_detail(surface, channel)),
-                );
-            }
-            vox::ChannelEvent::Reset { channel, reason } => {
-                self.channel_reset.inc(1);
-                self.registry.event(
-                    "vox.channel.reset",
-                    format!("{} reason={reason:?}", channel_detail(surface, channel)),
-                );
-            }
-        }
-    }
-
-    fn driver_event(&self, surface: &'static str, event: vox::DriverEvent) {
-        match event {
-            vox::DriverEvent::ConnectionOpened { connection_id } => {
-                self.connections_opened.inc(1);
-                self.active_connections.inc(1);
-                self.registry.event(
-                    "vox.connection.opened",
-                    format!("surface={surface} connection_id={connection_id:?}"),
-                );
-            }
-            vox::DriverEvent::ConnectionClosed {
-                connection_id,
-                reason,
-            } => {
-                self.connections_closed.inc(1);
-                self.active_connections.dec(1);
-                self.registry.event(
-                    "vox.connection.closed",
-                    format!("surface={surface} connection_id={connection_id:?} reason={reason:?}"),
-                );
-            }
-            vox::DriverEvent::RequestStarted { .. } => self.driver_requests_started.inc(1),
-            vox::DriverEvent::RequestFinished {
-                outcome, elapsed, ..
-            } => {
-                self.driver_requests_finished.inc(1);
-                self.driver_request_elapsed.record_duration(elapsed);
-                if outcome != vox::RpcOutcome::Ok {
-                    self.driver_requests_failed.inc(1);
-                }
-            }
-            vox::DriverEvent::OutboundQueueFull { connection_id } => {
-                self.outbound_queue_full.inc(1);
-                self.registry.event(
-                    "vox.outbound_queue.full",
-                    format!("surface={surface} connection_id={connection_id:?}"),
-                );
-            }
-            vox::DriverEvent::OutboundQueueClosed { connection_id } => {
-                self.outbound_queue_closed.inc(1);
-                self.registry.event(
-                    "vox.outbound_queue.closed",
-                    format!("surface={surface} connection_id={connection_id:?}"),
-                );
-            }
-            vox::DriverEvent::FrameRead { bytes, .. } => {
-                self.driver_frame_read_bytes.inc(bytes as u64);
-            }
-            vox::DriverEvent::FrameWritten { bytes, .. } => {
-                self.driver_frame_written_bytes.inc(bytes as u64);
-            }
-            vox::DriverEvent::DecodeError { .. }
-            | vox::DriverEvent::EncodeError { .. }
-            | vox::DriverEvent::ProtocolError { .. } => {
-                self.driver_errors.inc(1);
-            }
-        }
-    }
-
-    fn transport_event(&self, surface: &'static str, event: vox::TransportEvent) {
-        match event {
-            vox::TransportEvent::FrameRead { bytes, .. } => {
-                self.transport_frame_read_bytes.inc(bytes as u64);
-            }
-            vox::TransportEvent::FrameWritten { bytes, .. } => {
-                self.transport_frame_written_bytes.inc(bytes as u64);
-            }
-            vox::TransportEvent::Closed {
-                connection_id,
-                reason,
-            } => {
-                self.transport_closed.inc(1);
-                self.registry.event(
-                    "vox.transport.closed",
-                    format!("surface={surface} connection_id={connection_id:?} reason={reason:?}"),
-                );
-            }
-        }
     }
 }
 
@@ -1014,16 +509,7 @@ fn channel_detail(surface: &'static str, channel: vox::ChannelEventContext) -> S
 }
 
 impl vox::VoxObserver for VoxObserverLogger {
-    fn telemetry_registry(&self) -> Option<metrix::TelemetryRegistry> {
-        self.telemetry
-            .as_ref()
-            .map(|telemetry| telemetry.registry.clone())
-    }
-
     fn rpc_event(&self, event: vox::RpcEvent) {
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.rpc_event(self.surface, event);
-        }
         match event {
             vox::RpcEvent::Started {
                 service,
@@ -1079,9 +565,6 @@ impl vox::VoxObserver for VoxObserverLogger {
     }
 
     fn channel_event(&self, event: vox::ChannelEvent) {
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.channel_event(self.surface, event);
-        }
         match event {
             vox::ChannelEvent::Opened {
                 channel,
@@ -1229,9 +712,6 @@ impl vox::VoxObserver for VoxObserverLogger {
     }
 
     fn driver_event(&self, event: vox::DriverEvent) {
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.driver_event(self.surface, event);
-        }
         match event {
             vox::DriverEvent::ConnectionOpened { connection_id } => {
                 tracing::info!(
@@ -1387,9 +867,6 @@ impl vox::VoxObserver for VoxObserverLogger {
     }
 
     fn transport_event(&self, event: vox::TransportEvent) {
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.transport_event(self.surface, event);
-        }
         tracing::trace!(
             component = self.component,
             surface = self.surface,

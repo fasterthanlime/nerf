@@ -18,7 +18,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use mach2::mach_time::mach_absolute_time;
-use metrix::{HistogramHandle, TelemetryRegistry};
 use stax_mac_capture::SampleSink;
 use stax_mac_kperf_parse::pipeline::{Pipeline, PipelineConfig};
 use stax_mac_kperf_sys::bindings::sampler;
@@ -48,9 +47,7 @@ pub struct RemoteOptions {
     pub duration: Option<Duration>,
     /// kdebug ringbuffer size in records. Mirrors the in-process default.
     pub buf_records: u32,
-    /// Optional process-wide telemetry registry to receive Vox transport
-    /// counters for the staxd records stream.
-    pub telemetry: Option<TelemetryRegistry>,
+
     /// Optional Mach task port for the target process. When set,
     /// the image scanner uses `task_info(TASK_DYLD_INFO)` to detect
     /// dlopen/dlclose without walking proc_pidinfo every tick.
@@ -65,7 +62,6 @@ impl std::fmt::Debug for RemoteOptions {
             .field("frequency_hz", &self.frequency_hz)
             .field("duration", &self.duration)
             .field("buf_records", &self.buf_records)
-            .field("telemetry", &self.telemetry.is_some())
             .field("task", &self.task.is_some())
             .finish()
     }
@@ -96,39 +92,7 @@ impl Default for RemoteOptions {
             frequency_hz: 1000,
             duration: None,
             buf_records: 1_000_000,
-            telemetry: None,
             task: None,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RecordReceiveTelemetry {
-    recv_await_ns: HistogramHandle,
-    batch_drain_to_recv_ns: HistogramHandle,
-    batch_queued_to_recv_ns: HistogramHandle,
-    batch_send_to_recv_ns: HistogramHandle,
-    batch_handle_ns: HistogramHandle,
-    sref_map_ns: HistogramHandle,
-    scanner_enqueue_ns: HistogramHandle,
-    parser_enqueue_ns: HistogramHandle,
-    records_per_batch: HistogramHandle,
-}
-
-impl RecordReceiveTelemetry {
-    fn new(registry: &TelemetryRegistry) -> Self {
-        Self {
-            recv_await_ns: registry.histogram("staxd_client.records.recv.await_ns"),
-            batch_drain_to_recv_ns: registry
-                .histogram("staxd_client.records.batch.drain_to_recv_ns"),
-            batch_queued_to_recv_ns: registry
-                .histogram("staxd_client.records.batch.queued_to_recv_ns"),
-            batch_send_to_recv_ns: registry.histogram("staxd_client.records.batch.send_to_recv_ns"),
-            batch_handle_ns: registry.histogram("staxd_client.records.batch.handle_ns"),
-            sref_map_ns: registry.histogram("staxd_client.records.sref.map_ns"),
-            scanner_enqueue_ns: registry.histogram("staxd_client.records.enqueue.scanner_ns"),
-            parser_enqueue_ns: registry.histogram("staxd_client.records.enqueue.parser_ns"),
-            records_per_batch: registry.histogram("staxd_client.records.batch.records"),
         }
     }
 }
@@ -198,11 +162,8 @@ where
     );
     let phase_start = Instant::now();
     info!("staxd-client: connecting to {url} channel_capacity={STAXD_RECORD_CHANNEL_CAPACITY}");
-    let mut observer = stax_vox_observe::VoxObserverLogger::new("staxd-client", "staxd-records")
+    let observer = stax_vox_observe::VoxObserverLogger::new("staxd-client", "staxd-records")
         .with_pid(opts.pid);
-    if let Some(telemetry) = opts.telemetry.clone() {
-        observer = observer.with_telemetry(telemetry);
-    }
 
     let client: StaxdClient = match vox::connect(&url)
         .channel_capacity(STAXD_RECORD_CHANNEL_CAPACITY)
@@ -235,7 +196,6 @@ where
         "Staxd",
         &client.caller,
     );
-    let receive_telemetry = opts.telemetry.as_ref().map(RecordReceiveTelemetry::new);
     info!(
         "staxd-client: connected to daemon elapsed={:?}",
         phase_start.elapsed()
@@ -369,14 +329,7 @@ where
         let recv_timeout = Duration::from_millis(50);
         let recv_started = Instant::now();
         let batch_sref = match tokio::time::timeout(recv_timeout, rx.recv()).await {
-            Ok(Ok(Some(value))) => {
-                if let Some(telemetry) = &receive_telemetry {
-                    telemetry
-                        .recv_await_ns
-                        .record_duration(recv_started.elapsed());
-                }
-                value
-            }
+            Ok(Ok(Some(value))) => value,
             Ok(Ok(None)) => {
                 info!("staxd-client: daemon closed records channel");
                 break;
@@ -393,23 +346,6 @@ where
         let client_received_unix_ns = unix_ns_now();
         let sref_map_started = Instant::now();
         let _ = batch_sref.map(|batch| {
-            if let Some(telemetry) = &receive_telemetry {
-                telemetry.records_per_batch.record(batch.records.len() as u64);
-                telemetry.batch_drain_to_recv_ns.record(elapsed_ticks_to_ns(
-                    client_received_mach_ticks,
-                    batch.drained_mach_ticks,
-                ));
-                telemetry.batch_queued_to_recv_ns.record(elapsed_ticks_to_ns(
-                    client_received_mach_ticks,
-                    batch.queued_for_send_mach_ticks,
-                ));
-                if batch.send_started_mach_ticks != 0 {
-                    telemetry.batch_send_to_recv_ns.record(elapsed_ticks_to_ns(
-                        client_received_mach_ticks,
-                        batch.send_started_mach_ticks,
-                    ));
-                }
-            }
             if !seen_first_batch {
                 seen_first_batch = true;
                 info!(
@@ -460,27 +396,11 @@ where
                     client_received: client_received_mach_ticks,
                 },
             });
-            if let Some(telemetry) = &receive_telemetry {
-                telemetry
-                    .scanner_enqueue_ns
-                    .record_duration(scanner_enqueue_started.elapsed());
-            }
+
             let parser_enqueue_started = Instant::now();
             parser_queue.enqueue_records(records);
-            if let Some(telemetry) = &receive_telemetry {
-                telemetry
-                    .parser_enqueue_ns
-                    .record_duration(parser_enqueue_started.elapsed());
-            }
+
         });
-        if let Some(telemetry) = &receive_telemetry {
-            telemetry
-                .sref_map_ns
-                .record_duration(sref_map_started.elapsed());
-            telemetry
-                .batch_handle_ns
-                .record_duration(batch_handle_started.elapsed());
-        }
     }
 
     // Drop our `Rx`. With vox propagating per-channel close to the

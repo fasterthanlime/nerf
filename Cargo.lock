@@ -2135,7 +2135,6 @@ dependencies = [
  "libc",
  "log",
  "mach2",
- "metrix",
  "nwind",
  "stax-live-proto",
  "stax-mac-capture",
@@ -2184,7 +2183,6 @@ name = "stax-live-proto"
 version = "0.1.0"
 dependencies = [
  "facet",
- "metrix",
  "vox",
 ]
 
@@ -2233,7 +2231,6 @@ dependencies = [
  "eyre",
  "libc",
  "log",
- "metrix",
  "parking_lot",
  "stax-live",
  "stax-live-proto",
@@ -2258,7 +2255,6 @@ dependencies = [
  "libc",
  "log",
  "mach2",
- "metrix",
  "nwind",
  "stax-core",
  "stax-live-proto",
@@ -2297,7 +2293,6 @@ dependencies = [
 name = "stax-vox-observe"
 version = "0.1.0"
 dependencies = [
- "metrix",
  "tokio",
  "tracing",
  "vox",
@@ -2311,7 +2306,6 @@ dependencies = [
  "flume",
  "libc",
  "mach2",
- "metrix",
  "stax-mac-kperf-sys",
  "stax-vox-observe",
  "staxd-proto",
@@ -2329,7 +2323,6 @@ dependencies = [
  "flume",
  "log",
  "mach2",
- "metrix",
  "stax-mac-capture",
  "stax-mac-kperf-parse",
  "stax-mac-kperf-sys",
