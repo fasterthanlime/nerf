@@ -66,7 +66,7 @@ mod addr2line {
     pub struct Function {}
 
     impl Function {
-        pub fn raw_name(self) -> Result<Cow<str>, ()> {
+        pub fn raw_name(self) -> Result<Cow<'static, str>, ()> {
             Err(())
         }
     }

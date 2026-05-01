@@ -23,7 +23,13 @@ pub struct RangeMap<T> {
 }
 
 fn sort<T>(vec: &mut Vec<(Range<u64>, T)>) {
-    vec.sort_by_key(|&(ref range, _)| (range.start, range.end));
+    vec.sort_by_key(|(range, _)| (range.start, range.end));
+}
+
+impl<T> Default for RangeMap<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> RangeMap<T> {
@@ -38,7 +44,7 @@ impl<T> RangeMap<T> {
 
         debug_assert!(values
             .iter()
-            .all(|&(ref range, _)| range.start <= range.end));
+            .all(|(range, _)| range.start <= range.end));
         sort(&mut values);
 
         let mut map = RangeMap {
@@ -61,7 +67,7 @@ impl<T> RangeMap<T> {
                 if !map
                     .values
                     .iter()
-                    .all(|&(ref existing_range, _)| range.is_outside_of(existing_range))
+                    .all(|(existing_range, _)| range.is_outside_of(existing_range))
                 {
                     continue;
                 }
@@ -75,7 +81,7 @@ impl<T> RangeMap<T> {
     }
 
     fn get_index_linear_search(&self, key: u64) -> Option<usize> {
-        for (index, &(ref range, _)) in self.values.iter().enumerate() {
+        for (index, (range, _)) in self.values.iter().enumerate() {
             if key >= range.start && key < range.end {
                 return Some(index);
             }
@@ -86,7 +92,7 @@ impl<T> RangeMap<T> {
 
     fn get_index_binary_search(&self, key: u64) -> Option<usize> {
         self.values
-            .binary_search_by(|&(ref range, _)| {
+            .binary_search_by(|(range, _)| {
                 if key >= range.start && key < range.end {
                     Ordering::Equal
                 } else if key < range.start {
@@ -109,19 +115,19 @@ impl<T> RangeMap<T> {
     pub fn get_index_by_any_point(&self, range: &Range<u64>) -> Option<usize> {
         self.values
             .iter()
-            .position(|&(ref existing_range, _)| !range.is_outside_of(existing_range))
+            .position(|(existing_range, _)| !range.is_outside_of(existing_range))
     }
 
     #[inline]
     pub fn get_by_index(&self, index: usize) -> Option<(Range<u64>, &T)> {
         self.values
             .get(index)
-            .map(|&(ref range, ref value)| (range.clone(), value))
+            .map(|(range, value)| (range.clone(), value))
     }
 
     #[inline]
     pub fn get_value_by_index(&self, index: usize) -> Option<&T> {
-        self.values.get(index).map(|&(_, ref value)| value)
+        self.values.get(index).map(|(_, value)| value)
     }
 
     #[inline]
@@ -141,14 +147,14 @@ impl<T> RangeMap<T> {
 
     #[inline]
     pub fn values(&self) -> impl ExactSizeIterator<Item = &T> {
-        self.values.iter().map(|&(_, ref value)| value)
+        self.values.iter().map(|(_, value)| value)
     }
 
     #[inline]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (Range<u64>, &T)> {
         self.values
             .iter()
-            .map(|&(ref range, ref value)| (range.clone(), value))
+            .map(|(range, value)| (range.clone(), value))
     }
 
     #[inline]
@@ -166,7 +172,7 @@ impl<T> RangeMap<T> {
         if let Some(position) = self
             .values
             .iter()
-            .position(|&(ref existing_range, _)| !range.is_outside_of(existing_range))
+            .position(|(existing_range, _)| !range.is_outside_of(existing_range))
         {
             return Err(position);
         }
@@ -182,7 +188,7 @@ impl<T> RangeMap<T> {
         if let Some(index) = self
             .values
             .iter()
-            .position(|&(ref item_range, _)| range == *item_range)
+            .position(|(item_range, _)| range == *item_range)
         {
             Some(self.values.remove(index).1)
         } else {
@@ -197,7 +203,7 @@ impl<T> RangeMap<T> {
 
     #[inline]
     pub fn retain<F: FnMut(&T) -> bool>(&mut self, mut callback: F) {
-        self.values.retain(|&(_, ref value)| callback(value))
+        self.values.retain(|(_, value)| callback(value))
     }
 }
 

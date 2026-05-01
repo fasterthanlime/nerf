@@ -95,18 +95,15 @@ impl UnwindInfoCache {
 
     pub fn lookup<E: Endianity>(&mut self, absolute_address: u64) -> Option<UnwindInfo<'_, E>> {
         let cache = self.cache.as_mut()?;
-        let info = match cache.get(&absolute_address) {
-            Some(info) => info,
-            None => return None,
-        };
+        let info = cache.get(&absolute_address)?;
 
-        return Some(UnwindInfo {
+        Some(UnwindInfo {
             initial_address: info.initial_address,
             address: info.address,
             absolute_address,
             is_signal_frame: info.is_signal_frame,
             kind: UnwindInfoKind::Cached(info),
-        });
+        })
     }
 }
 
@@ -129,9 +126,9 @@ struct CachedUnwindInfo {
     is_signal_frame: bool,
 }
 
-impl<T: ::gimli::Reader> Into<RegisterRule<T>> for SimpleRegisterRule {
-    fn into(self) -> RegisterRule<T> {
-        match self {
+impl<T: ::gimli::Reader> From<SimpleRegisterRule> for RegisterRule<T> {
+    fn from(val: SimpleRegisterRule) -> Self {
+        match val {
             SimpleRegisterRule::Undefined => RegisterRule::Undefined,
             SimpleRegisterRule::SameValue => RegisterRule::SameValue,
             SimpleRegisterRule::Offset(arg) => RegisterRule::Offset(arg),
@@ -179,7 +176,7 @@ impl<E: Endianity> FrameDescriptionsBuilder<E> {
 }
 
 // TODO: This will be unnecessary once Polonius lands; remove it once it does.
-unsafe fn launder_lifetime<'a, 'b, T>(reference: &'a mut T) -> &'b mut T {
+unsafe fn launder_lifetime<'b, T>(reference: &mut T) -> &'b mut T {
     &mut *(reference as *mut _)
 }
 
@@ -301,8 +298,8 @@ impl<E: Endianity> FrameDescriptions<E> {
         None
     }
 
-    fn load_eh_frame_hdr<'a>(
-        binary: &'a Arc<BinaryData>,
+    fn load_eh_frame_hdr(
+        binary: &Arc<BinaryData>,
     ) -> Option<(BaseAddresses, ParsedEhFrameHdr<DataReader<E>>)> {
         let mut bases = BaseAddresses::default();
 
@@ -330,17 +327,14 @@ impl<E: Endianity> FrameDescriptions<E> {
             }
         };
 
-        match eh_frame_hdr.eh_frame_ptr() {
-            gimli::Pointer::Direct(pointer) => {
-                debug!(
-                    "Extracted .eh_frame address from .eh_frame_hdr for {}: 0x{:016X}",
-                    binary.name(),
-                    pointer
-                );
-                debug!("Actual .eh_frame address: 0x{:016X}", eh_frame_base);
-                debug_assert_eq!(pointer, eh_frame_base);
-            }
-            _ => {}
+        if let gimli::Pointer::Direct(pointer) = eh_frame_hdr.eh_frame_ptr() {
+            debug!(
+                "Extracted .eh_frame address from .eh_frame_hdr for {}: 0x{:016X}",
+                binary.name(),
+                pointer
+            );
+            debug!("Actual .eh_frame address: 0x{:016X}", eh_frame_base);
+            debug_assert_eq!(pointer, eh_frame_base);
         }
 
         eh_frame_hdr.table()?;
@@ -411,7 +405,7 @@ impl<E: Endianity> FrameDescriptions<E> {
 
                 let (bases, debug_frame) = &self.debug_frame.as_ref().unwrap();
                 let ctx = unsafe { launder_lifetime(ctx) };
-                if let Ok(mut table) = UnwindTable::new(debug_frame, bases, ctx, &fde) {
+                if let Ok(mut table) = UnwindTable::new(debug_frame, bases, ctx, fde) {
                     loop {
                         match table.next_row() {
                             Ok(Some(row)) => {
@@ -444,7 +438,7 @@ impl<E: Endianity> FrameDescriptions<E> {
 
                 let (bases, eh_frame) = &self.eh_frame.as_ref().unwrap();
                 let ctx = unsafe { launder_lifetime(ctx) };
-                if let Ok(mut table) = UnwindTable::new(eh_frame, bases, ctx, &fde) {
+                if let Ok(mut table) = UnwindTable::new(eh_frame, bases, ctx, fde) {
                     loop {
                         match table.next_row() {
                             Ok(Some(row)) => {
@@ -471,25 +465,22 @@ impl<E: Endianity> FrameDescriptions<E> {
             }
         }
 
-        if let Some(&(ref bases, ref eh_frame_hdr)) = self.eh_frame_hdr.as_ref() {
+        if let Some((bases, eh_frame_hdr)) = self.eh_frame_hdr.as_ref() {
             let eh_frame = &self.eh_frame.as_ref().unwrap().1;
 
             if debug_logs_enabled!() {
-                match eh_frame_hdr.table().unwrap().lookup(address, bases) {
-                    Ok(gimli::Pointer::Direct(pointer)) => {
-                        let base = bases.eh_frame_hdr.section.unwrap();
-                        if pointer < base {
-                            warn!( "FDE pointer for {:016X} from .eh_frame_hdr: {:016X} (relative: -0x{:X})", address, pointer, base - pointer );
-                        } else {
-                            debug!( "FDE pointer for {:016X} from .eh_frame_hdr: {:016X} (relative: 0x{:X})", address, pointer, pointer - base );
-                        }
+                if let Ok(gimli::Pointer::Direct(pointer)) = eh_frame_hdr.table().unwrap().lookup(address, bases) {
+                    let base = bases.eh_frame_hdr.section.unwrap();
+                    if pointer < base {
+                        warn!( "FDE pointer for {:016X} from .eh_frame_hdr: {:016X} (relative: -0x{:X})", address, pointer, base - pointer );
+                    } else {
+                        debug!( "FDE pointer for {:016X} from .eh_frame_hdr: {:016X} (relative: 0x{:X})", address, pointer, pointer - base );
                     }
-                    _ => {}
                 }
             }
 
             let fde = eh_frame_hdr.table().unwrap().fde_for_address(
-                &eh_frame,
+                eh_frame,
                 bases,
                 address,
                 |_, _, offset| eh_frame.cie_from_offset(bases, offset),
@@ -557,12 +548,11 @@ impl<E: Endianity> FrameDescriptions<E> {
             .fde_from_offset(bases, offset, |_, _, offset| {
                 eh_frame.cie_from_offset(bases, offset)
             })
-            .map_err(|error| {
+            .inspect_err(|&error| {
                 debug!(
                     "FDE not found in .eh_frame at offset 0x{:X} for 0x{:016X}: {}",
                     fde_offset, absolute_address, error
                 );
-                error
             })
             .ok()?;
 
@@ -624,25 +614,25 @@ impl<'a, E: Endianity> UnwindInfo<'a, E> {
     #[inline]
     pub fn cfa(&self) -> CfaRule<DataReader<E>> {
         match self.kind {
-            UnwindInfoKind::Cached(ref info) => CfaRule::RegisterAndOffset {
+            UnwindInfoKind::Cached(info) => CfaRule::RegisterAndOffset {
                 register: info.cfa.0,
                 offset: info.cfa.1,
             },
-            UnwindInfoKind::Uncached(ref row) => row.cfa().clone(),
+            UnwindInfoKind::Uncached(row) => row.cfa().clone(),
         }
     }
 
     #[inline]
     pub fn register(&self, register: Register) -> RegisterRule<DataReader<E>> {
         match self.kind {
-            UnwindInfoKind::Cached(ref info) => {
-                if let Some(&(_, ref rule)) = info.rules.iter().find(|rule| rule.0 == register) {
+            UnwindInfoKind::Cached(info) => {
+                if let Some((_, rule)) = info.rules.iter().find(|rule| rule.0 == register) {
                     rule.clone().into()
                 } else {
                     RegisterRule::Undefined
                 }
             }
-            UnwindInfoKind::Uncached(ref row) => row.register(register),
+            UnwindInfoKind::Uncached(row) => row.register(register),
         }
     }
 
@@ -652,12 +642,12 @@ impl<'a, E: Endianity> UnwindInfo<'a, E> {
         mut callback: F,
     ) {
         match self.kind {
-            UnwindInfoKind::Uncached(ref row) => {
+            UnwindInfoKind::Uncached(row) => {
                 for &(register, ref rule) in row.registers() {
                     callback((register, rule));
                 }
             }
-            UnwindInfoKind::Cached(ref info) => {
+            UnwindInfoKind::Cached(info) => {
                 for &(register, ref rule) in &info.rules {
                     let rule = rule.clone().into();
                     callback((register, &rule));
@@ -775,7 +765,7 @@ where
                 let initial_address = fde.initial_address();
 
                 let ctx = unsafe { launder_lifetime(ctx) };
-                if let Ok(mut table) = UnwindTable::new(&table.section, &table.bases, ctx, &fde) {
+                if let Ok(mut table) = UnwindTable::new(&table.section, &table.bases, ctx, fde) {
                     loop {
                         match table.next_row() {
                             Ok(Some(row)) => {

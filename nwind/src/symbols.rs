@@ -49,17 +49,17 @@ fn load_symbols<'a, F: FnMut(Range<u64>, &'a str)>(
             continue;
         }
         if let Some(Ok(name)) = strtab.get(sym.st_name) {
-            let mut start = sym.st_value as u64;
+            let mut start = sym.st_value;
             if is_arm {
                 // On ARM the lowest bit of the symbol value specifies
                 // whether the instruction it points at is an ARM or a
                 // Thumb one, so we mask it out.
                 // Source: ELF for the ARM Architecture
                 //         http://infocenter.arm.com/help/topic/com.arm.doc.ihi0044f/IHI0044F_aaelf.pdf
-                start = start & !1;
+                start &= !1;
             }
 
-            let end = start + sym.st_size as u64;
+            let end = start + sym.st_size;
             callback(start..end, name);
         }
     }
@@ -68,7 +68,7 @@ fn load_symbols<'a, F: FnMut(Range<u64>, &'a str)>(
 impl Symbols {
     pub fn load_from_binary_data(data: &Arc<BinaryData>) -> Self {
         Symbols::load(
-            &data.name(),
+            data.name(),
             data.architecture(),
             data.bitness(),
             data.endianness(),
@@ -159,7 +159,7 @@ impl Symbols {
     }
 
     #[inline]
-    fn as_range_map<'a>(&'a self) -> &'a RangeMap<&'a str> {
+    fn as_range_map(&self) -> &RangeMap<&str> {
         &self.symbols
     }
 

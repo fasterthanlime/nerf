@@ -107,7 +107,7 @@ where
 
     if debug_logs_enabled!() {
         debug!("Evaluating DWARF expression:");
-        let mut iter = expr.clone().operations(encoding.clone());
+        let mut iter = expr.clone().operations(encoding);
         while let Ok(Some(op)) = iter.next() {
             debug!("  {:?}", op);
         }

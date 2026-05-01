@@ -25,11 +25,9 @@ impl fmt::Debug for DwarfRegs {
 
 impl Default for DwarfRegs {
     fn default() -> Self {
-        let mut regs = Vec::new();
-        regs.resize(64, 0);
+        let mut regs = vec![0; 64];
 
-        let mut regs_list = Vec::new();
-        regs_list.resize(64, 0);
+        let mut regs_list = vec![0; 64];
 
         DwarfRegs {
             regs: regs.into_boxed_slice(),

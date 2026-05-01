@@ -371,18 +371,18 @@ impl CapturedStackUnwinder<arch::native::Arch> {
     ) -> Result<CapturedUnwindOutcome, CapturedUnwindFailure> {
         match self.unwind_callers_once(state, stack, scratch, options.mode, options.max_frames) {
             Ok(callers) => {
-                return Ok(CapturedUnwindOutcome {
+                Ok(CapturedUnwindOutcome {
                     callers,
                     bridge_attempted: false,
                     bridge_steps: 0,
-                });
+                })
             }
             Err(error) if !options.bridge.should_bridge(&error) => {
-                return Err(CapturedUnwindFailure {
+                Err(CapturedUnwindFailure {
                     error,
                     bridge_attempted: false,
                     bridge_steps: 0,
-                });
+                })
             }
             Err(error) => {
                 let mut last_error = error;

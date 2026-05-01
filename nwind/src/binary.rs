@@ -8,7 +8,6 @@ use std::path::Path;
 use std::str;
 use std::sync::Arc;
 
-use gimli;
 use memmap2::Mmap;
 use object::elf::{self as elf_header, PT_LOAD, SHT_DYNSYM, SHT_STRTAB, SHT_SYMTAB};
 use speedy::{Readable, Writable};
@@ -29,9 +28,9 @@ impl Deref for Blob {
     #[inline]
     fn deref(&self) -> &Self::Target {
         match *self {
-            Blob::Mmap(ref mmap) => &mmap,
+            Blob::Mmap(ref mmap) => mmap,
             Blob::StaticSlice(slice) => slice,
-            Blob::Owned(ref bytes) => &bytes,
+            Blob::Owned(ref bytes) => bytes,
         }
     }
 }
@@ -166,8 +165,7 @@ impl BinaryData {
 
     pub fn check_inode(&self, expected_inode: Inode) -> io::Result<()> {
         if self.inode != Some(expected_inode) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!(
                     "major/minor/inode of {:?} doesn't match the expected value: {:?} != {:?}",
                     self.name, self.inode, expected_inode
@@ -210,7 +208,7 @@ impl BinaryData {
         let mut architecture = "";
 
         {
-            let elf = elf::parse(&blob).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            let elf = elf::parse(&blob).map_err(|err| io::Error::other(err))?;
             let result: io::Result<()> = (|| {
                 endianness = match elf.endianness() {
                     Endian::Little => Endianness::LittleEndian,
@@ -227,8 +225,7 @@ impl BinaryData {
                     elf_header::ET_EXEC => false,
                     elf_header::ET_DYN => true,
                     _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
+                        return Err(io::Error::other(
                             format!("unknown ELF type '{}' for {:?}", elf.header().e_type, path),
                         ));
                     }
@@ -247,8 +244,7 @@ impl BinaryData {
                     }
                     elf_header::EM_AARCH64 => "aarch64",
                     kind => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
+                        return Err(io::Error::other(
                             format!("unknown machine type '{}' for {:?}", kind, path),
                         ));
                     }
@@ -257,8 +253,7 @@ impl BinaryData {
                 let name_strtab_header = elf
                     .get_section_header(elf.header().e_shstrndx as usize)
                     .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!(
                             "missing section header for section names strtab for {:?}",
                             path
@@ -267,19 +262,18 @@ impl BinaryData {
                 })?;
 
                 let name_strtab = elf.get_strtab(&name_strtab_header).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("missing strtab for section names strtab for {:?}", path),
                     )
                 })?;
 
                 for header in elf.section_headers() {
-                    let ty = header.sh_type as u32;
+                    let ty = header.sh_type;
                     if ty == SHT_SYMTAB || ty == SHT_DYNSYM {
                         let is_dynamic = ty == SHT_DYNSYM;
                         let strtab_key = header.sh_link as usize;
                         if let Some(strtab_header) = elf.get_section_header(strtab_key) {
-                            if strtab_header.sh_type as u32 == SHT_STRTAB {
+                            if strtab_header.sh_type == SHT_STRTAB {
                                 let strtab_range = elf.get_section_body_range(&strtab_header);
                                 let symtab_range = elf.get_section_body_range(&header);
                                 symbol_tables.push(SymbolTable {
@@ -312,7 +306,7 @@ impl BinaryData {
                     let offset = header.sh_offset as usize;
                     let length = header.sh_size as usize;
                     let range = offset..offset + length;
-                    if let Some(_) = blob.get(range.clone()) {
+                    if blob.get(range.clone()).is_some() {
                         if let Some(out_range) = out_range {
                             *out_range = Some(range.clone());
                         }
@@ -530,7 +524,7 @@ impl BinaryData {
 
     fn get_section_range(&self, name: &str) -> Option<Range<usize>> {
         let elf = elf::parse(&self.blob)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+            .map_err(|err| io::Error::other(err))
             .unwrap();
         let name_strtab_header = elf
             .get_section_header(elf.header().e_shstrndx as usize)
@@ -550,7 +544,7 @@ impl BinaryData {
             let offset = header.sh_offset as usize;
             let length = header.sh_size as usize;
             let range = offset..offset + length;
-            if let Some(_) = self.blob.get(range.clone()) {
+            if self.blob.get(range.clone()).is_some() {
                 return Some(range);
             }
         }
@@ -583,7 +577,7 @@ impl BinaryData {
             Endianness::BigEndian => gimli::RunTimeEndian::Big,
         };
 
-        gimli::EndianReader::new(Self::subslice(data.clone(), range), endianness).into()
+        gimli::EndianReader::new(Self::subslice(data.clone(), range), endianness)
     }
 
     #[inline]
@@ -593,7 +587,7 @@ impl BinaryData {
 
     #[inline]
     pub fn build_id(&self) -> Option<&[u8]> {
-        self.build_id.as_ref().map(|id| id.as_slice())
+        self.build_id.as_deref()
     }
 
     #[inline]

@@ -850,7 +850,7 @@ where
     M: MemoryReader<arm::Arch>,
     I: IntoIterator<Item = u8>,
 {
-    let decoder = Decoder::new(bytecode.into_iter());
+    let decoder = Decoder::new(bytecode);
     let mut link_register_addr = None;
     for instruction in decoder {
         let instruction = instruction?;
@@ -925,10 +925,7 @@ fn find_entry(
         )
     };
 
-    let index = match search(exidx, exidx_base, address) {
-        Some(index) => index,
-        None => return None,
-    };
+    let index = search(exidx, exidx_base, address)?;
 
     let entry = &exidx[index];
 

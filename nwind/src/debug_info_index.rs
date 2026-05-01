@@ -13,9 +13,15 @@ pub struct DebugInfoIndex {
     auto_load: bool,
 }
 
-fn check_build_id<'a>(data: &'a Arc<BinaryData>, expected_build_id: Option<&[u8]>) -> bool {
+fn check_build_id(data: &Arc<BinaryData>, expected_build_id: Option<&[u8]>) -> bool {
     let build_id = data.build_id();
     expected_build_id.is_none() || build_id.is_none() || build_id == expected_build_id
+}
+
+impl Default for DebugInfoIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DebugInfoIndex {
@@ -183,7 +189,7 @@ impl DebugInfoIndex {
             match BinaryData::load_from_fs(original_path) {
                 Ok(binary) => {
                     let actual = binary.build_id();
-                    if actual.map_or(false, |id| id == build_id) {
+                    if actual == Some(build_id) {
                         trace!(
                             "try_auto_load({:?}): loaded original binary, build_id matches",
                             path
@@ -222,7 +228,7 @@ impl DebugInfoIndex {
         if debug_path.exists() && debug_path != original_path {
             match BinaryData::load_from_fs(&debug_path) {
                 Ok(debug_binary) => {
-                    if debug_binary.build_id().map_or(false, |id| id == build_id) {
+                    if debug_binary.build_id() == Some(build_id) {
                         let debug_binary = Arc::new(debug_binary);
                         debug!("Loaded debug symbols from .build-id path: {:?}", debug_path);
                         self.by_build_id
@@ -266,7 +272,7 @@ impl DebugInfoIndex {
                 {
                     match BinaryData::load_from_fs(&debuglink_path) {
                         Ok(debug_binary) => {
-                            if debug_binary.build_id().map_or(false, |id| id == build_id) {
+                            if debug_binary.build_id() == Some(build_id) {
                                 let debug_binary = Arc::new(debug_binary);
                                 debug!(
                                     "Loaded debug symbols from debuglink path: {:?}",
@@ -339,7 +345,7 @@ impl DebugInfoIndex {
         }
 
         let owned_path;
-        let mut path: &Path = &path;
+        let mut path: &Path = path;
 
         if let Ok(target) = path.read_link() {
             // Resolve relative symlink targets against the symlink's
@@ -370,11 +376,9 @@ impl DebugInfoIndex {
                 }
             };
 
-            for entry in dir {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    self.add_impl(done, &path, false);
-                }
+            for entry in dir.flatten() {
+                let path = entry.path();
+                self.add_impl(done, &path, false);
             }
         } else if path.is_file() {
             match path.metadata() {
@@ -389,7 +393,7 @@ impl DebugInfoIndex {
                 }
             };
 
-            let is_elf = File::open(&path)
+            let is_elf = File::open(path)
                 .and_then(|mut fp| {
                     let mut buffer = [0; 4];
                     fp.read_exact(&mut buffer)?;
@@ -397,14 +401,12 @@ impl DebugInfoIndex {
                 })
                 .map(|buffer| &buffer == b"\x7FELF");
             match is_elf {
-                Ok(false) => return,
-                Ok(true) => self.add_file(&path),
+                Ok(false) => (),
+                Ok(true) => self.add_file(path),
                 Err(error) => {
                     if is_toplevel {
                         warn!("Cannot read the first four bytes of {:?}: {}", path, error);
                     }
-
-                    return;
                 }
             }
         }
@@ -432,7 +434,6 @@ impl DebugInfoIndex {
             }
             Err(error) => {
                 warn!("Cannot read debug symbols from {:?}: {}", path, error);
-                return;
             }
         }
     }
