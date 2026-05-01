@@ -791,7 +791,7 @@ fn interpret_bytecode(
     output: &mut UnwindInfo,
     bytecode: impl IntoIterator<Item = u8>,
 ) -> Result<(), Error> {
-    let decoder = Decoder::new(bytecode.into_iter());
+    let decoder = Decoder::new(bytecode);
     let mut vsp_offset = 0;
 
     output.rules.clear();

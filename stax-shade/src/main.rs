@@ -221,7 +221,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
                 terminal,
                 launched_pid,
             )
-            .await?;
+            .await
         }
         (Some(_), None) => {
             eyre::bail!("--server-socket requires --run-id; stax-server owns run allocation")
@@ -234,6 +234,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
                 pre_resume.resume()?;
             }
             park_until_signal().await;
+            Ok(())
         }
     }
 }
