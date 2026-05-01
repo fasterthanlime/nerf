@@ -148,6 +148,6 @@ Raw-stack capture for deferred unwinding. Independent of M3a.
   `Packet::RawSample`.
 - Unwinding raw mac samples in `data_reader.rs`: dispatch to framehop with
   a reader that pulls `__unwind_info` / `__eh_frame` from `BinaryBlob`-stored
-  Mach-O bytes. Do **not** teach `nwind` Mach-O. nwind stays ELF/DWARF.
+  Mach-O bytes.
 
 Stop and review.

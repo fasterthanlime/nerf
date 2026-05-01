@@ -9,10 +9,6 @@ cd perf_event_open
 cargo test --verbose
 cd ..
 
-cd proc-maps
-cargo test --verbose
-cd ..
-
 cargo test --verbose
 
 cd cli

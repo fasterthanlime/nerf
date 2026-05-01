@@ -1,5 +1,4 @@
-//! Shared symbol demangler used by `nwind` (the offline report path)
-//! and `stax-live` (the live RPC path).
+//! Shared symbol demangler used by the offline and live symbolication paths.
 //!
 //! The toolchain feeds us mangled bytes coming from a few different
 //! object-format conventions:
