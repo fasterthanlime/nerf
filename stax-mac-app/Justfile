@@ -7,11 +7,8 @@ release_config := "Release"
 # (`-showBuildSettings` re-loads the project + SwiftPM graph and is
 # multi-second).
 derived := "./DerivedData"
-app := derived + "/Build/Products/" + config + "/stax.app"
-release_app := derived + "/Build/Products/" + release_config + "/stax.app"
 
-xcodebuild_flags := "-project " + project + " -scheme " + scheme + " -configuration " + config + " -derivedDataPath " + derived + " -destination 'platform=macOS'"
-release_xcodebuild_flags := "-project " + project + " -scheme " + scheme + " -configuration " + release_config + " -derivedDataPath " + derived + " -destination 'platform=macOS'"
+xcodebuild_flags := "-project " + project + " -scheme " + scheme + " -derivedDataPath " + derived + " -destination 'platform=macOS'"
 
 list:
     just --list
@@ -23,57 +20,46 @@ gen:
 # Resolve package dependencies (do this once after gen)
 resolve: gen
     xcodebuild {{ xcodebuild_flags }} \
+        -configuration {{ config }} \
         -resolvePackageDependencies
 
 # Build the app (no project regeneration, no package resolution)
-build:
+build build_config=config:
     set -o pipefail; \
     xcodebuild {{ xcodebuild_flags }} \
+        -configuration {{ build_config }} \
         -disableAutomaticPackageResolution \
         -skipPackageUpdates \
         COMPILER_INDEX_STORE_ENABLE=NO \
         ONLY_ACTIVE_ARCH=YES \
         build 2>&1 | xcbeautify
 
-build-release:
-    set -o pipefail; \
-    xcodebuild {{ release_xcodebuild_flags }} \
-        -disableAutomaticPackageResolution \
-        -skipPackageUpdates \
-        COMPILER_INDEX_STORE_ENABLE=NO \
-        ONLY_ACTIVE_ARCH=YES \
-        build 2>&1 | xcbeautify
+build-release: (build release_config)
 
 # Build, then launch from DerivedData (kills any prior instance first)
-run: build
+run build_config=config: (build build_config)
     pkill -f /stax.app/Contents/MacOS/stax || true
     @sleep 0.2
-    just only-run
+    open "{{ derived }}/Build/Products/{{ build_config }}/stax.app"
 
-only-run:
-    open {{ app }}
+only-run build_config=config:
+    open "{{ derived }}/Build/Products/{{ build_config }}/stax.app"
 
 # Build, copy to /Applications, launch from there
-install: build
+install build_config=config: (build build_config)
     pkill -f /stax.app/Contents/MacOS/stax || true
     @sleep 0.2
     rm -rf /Applications/stax.app
-    cp -R {{ app }} /Applications/stax.app
+    cp -R "{{ derived }}/Build/Products/{{ build_config }}/stax.app" /Applications/stax.app
     @echo "installed to /Applications/stax.app"
     open /Applications/stax.app
 
-install-release: build-release
-    pkill -f /stax.app/Contents/MacOS/stax || true
-    @sleep 0.2
-    rm -rf /Applications/stax.app
-    cp -R {{ release_app }} /Applications/stax.app
-    @echo "installed to /Applications/stax.app"
-    open /Applications/stax.app
+install-release: (install release_config)
 
 # Open the project in Xcode
 xcode: gen
     open {{ project }}
 
 clean:
-    xcodebuild -project {{ project }} -scheme {{ scheme }} -configuration {{ config }} -derivedDataPath {{ derived }} clean
+    xcodebuild {{ xcodebuild_flags }} -configuration {{ config }} clean
     rm -rf .build build {{ derived }}
