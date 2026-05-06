@@ -1355,14 +1355,27 @@ fn compute_flame_update(aggregation: &Aggregation, binaries: &BinaryRegistry) ->
     }
 }
 
-/// Collapse runs of same-symbol parent→child into a single node.
-/// Recursive functions (and inlined call chains that share a name)
-/// otherwise produce towers of identical boxes that eat vertical
-/// space without adding information.
+/// Pull up any child whose symbol matches its parent: legitimately
+/// recursive Rust functions, *and* the JIT-on-ARM64 case where kperf's
+/// user-stack walker emits the live LR register as a phantom frame of
+/// the same symbol any time a sample lands between two BL/BLR call
+/// sites without a frame push. Either way, the same activation showing
+/// up multiple times in the call tree is noise — flame graphs are
+/// about flat per-symbol time, not per-PC. Splice the child's
+/// children up so they sit directly under the parent, preserving the
+/// surviving siblings' order. The cumulative `on_cpu_ns` on each
+/// surviving node is unchanged; the folded child's contribution
+/// becomes part of the parent's self-time.
 fn fold_recursion(node: &mut FlameNode) {
-    while node.children.len() == 1 && symbol_eq(&node.children[0], node) {
-        let child = node.children.remove(0);
-        node.children = child.children;
+    let mut i = 0;
+    while i < node.children.len() {
+        if symbol_eq(&node.children[i], node) {
+            let child = node.children.remove(i);
+            node.children.splice(i..i, child.children);
+            // Re-examine at i — a spliced grandchild may itself match.
+        } else {
+            i += 1;
+        }
     }
     for c in &mut node.children {
         fold_recursion(c);
